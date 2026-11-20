@@ -18,4 +18,6 @@ macro_rules! architecture_component {
 }
 
 pub mod architecture;
+pub mod archive;
 pub mod model;
+pub mod transport;
