@@ -16,10 +16,11 @@ uv tool install --managed-python adfontes
 
 ### Standalone Binary
 
-NOTE: crates.io publishing is pending initial crate bootstrap; until `adfontes` is live on crates.io, install temporarily from [GitHub Releases](https://github.com/Kajiih/adfontes/releases) or Git:
+Install with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), or compile from [crates.io](https://crates.io/crates/adfontes):
 
 ```bash
-cargo install --git https://github.com/Kajiih/adfontes --locked
+cargo binstall adfontes          # prebuilt GitHub Release binary
+cargo install adfontes --locked  # compile from source
 ```
 
 ---
