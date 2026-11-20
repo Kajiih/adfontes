@@ -2340,6 +2340,36 @@ fn is_truthy_env(value: &str) -> bool {
 }
 
 #[cfg(test)]
+impl StagingPolicy {
+    pub(crate) fn for_sandbox(root: &Path) -> Self {
+        Self {
+            temp_dir: root.to_path_buf(),
+            system_tmp_dir: PathBuf::from("/tmp"),
+            home_dir: Some(root.join("home")),
+            configured_staging_dir: None,
+            extra_allowed_roots: Vec::new(),
+            forbidden_path_prefixes: Vec::new(),
+            disable_pdf_slice: false,
+            #[cfg(unix)]
+            effective_uid: rustix::process::geteuid().as_raw(),
+        }
+    }
+
+    pub(crate) fn write_test_pdf(
+        &self,
+        dir: &Path,
+        file_name: &str,
+        page_texts: &[&str],
+    ) -> Result<PathBuf, AdfontesError> {
+        let staging_dir = resolve_confined_staging_dir(Some(dir), self)?;
+        let pdf_path = staging_dir.join(file_name);
+        let bytes = crate::pdf::build_test_pdf(page_texts);
+        write_file_atomic(&pdf_path, &bytes)?;
+        Ok(pdf_path)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
     #[cfg(unix)]

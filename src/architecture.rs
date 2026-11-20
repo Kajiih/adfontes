@@ -120,6 +120,12 @@ define_architecture! {
     Resolve      => [Extract, Pdf, Transport, Model],
     /// Confined filesystem staging, TOC/page indexing, PDF slicing, and compact manifests (`stage`).
     Stage        => [Extract, Pdf, Model] (owns_external: ["sha2", "tempfile", "rustix"]),
+    /// Newline-delimited JSON-RPC 2.0 stdio MCP server exposing `fetch` and `slice_pdf` (`mcp`).
+    Mcp          => [Stage, Resolve, Transport, Model],
+    /// Command-line interface parsing, startup env binding, and EPIPE-safe dispatch (`cli`).
+    Cli          => [Mcp, Stage, Resolve, Transport, Model] (owns_external: ["clap"]),
+    /// Thin binary executable entrypoint (`src/bin/adfontes.rs`).
+    Bin          => [Cli],
 }
 
 impl ArchitectureComponent {

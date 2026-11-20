@@ -1,0 +1,36 @@
+[project]
+name = "adfontes"
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
+dynamic = ["description", "keywords", "license", "readme", "urls", "version"]
+
+[project.scripts]
+adfontes = "adfontes._cli:main"
+
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+bindings = "pyo3"
+include = [
+    { path = "Cargo.lock", format = "sdist" },
+    { path = "LICENSE", format = "sdist" },
+    { path = "README.md", format = "sdist" },
+    { path = "clippy.toml", format = "sdist" },
+]
+manifest-path = "crates/adfontes-py/Cargo.toml"
+module-name = "adfontes._adfontes"
+python-source = "crates/adfontes-py/python"

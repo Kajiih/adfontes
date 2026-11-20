@@ -9,10 +9,25 @@ license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 include = ["/LICENSE", "/README.md", "/src/**"]
+default-run = "adfontes"
 autobins = false
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-x86_64-unknown-linux-musl{ archive-suffix }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-aarch64-unknown-linux-musl{ archive-suffix }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [workspace]
-members = ["."]
+members = [".", "crates/adfontes-py"]
 default-members = ["."]
 
 [workspace.package]
@@ -55,7 +70,12 @@ private_intra_doc_links = "deny"
 name = "adfontes"
 path = "src/lib.rs"
 
+[[bin]]
+name = "adfontes"
+path = "src/bin/adfontes.rs"
+
 [dependencies]
+clap = { version = "4.6", features = ["derive"] }
 encoding_rs = "0.8"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 lopdf = { version = "0.46", default-features = false }
@@ -83,6 +103,7 @@ rstest = "0.27"
 workspace = true
 
 [profile.release]
-# Preserve Mach-O linker ad-hoc LC_CODE_SIGNATURE on Apple Silicon cdylib wheels;
-# standalone Linux release binaries strip symbols explicitly in release.yml.
+# Preserve Mach-O linker ad-hoc LC_CODE_SIGNATURE on Apple Silicon binaries and cdylib wheels;
+# Linux standalone binaries (`strip`) and Linux manylinux_2_28 wheels (`maturin --strip`) strip
+# symbols explicitly in `.github/workflows/release.yml`.
 lto = "fat"

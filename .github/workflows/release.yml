@@ -1,0 +1,288 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions: {}
+
+# Never cancel a release midway: a partially published version cannot be re-uploaded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Publishing workflows build from scratch with no shared caches (`zizmor` cache-poisoning rule).
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist --strip
+          manylinux: "2_28"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        target: [aarch64, x86_64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Never strip macOS wheels: Apple Silicon cdylibs require an intact linker LC_CODE_SIGNATURE.
+      # Pin MACOSX_DEPLOYMENT_TARGET so wheel platform tags stay stable across GitHub runner upgrades.
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target == 'aarch64' && '11.0' || '10.12' }}
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist
+      - name: Verify aarch64 wheel code signature
+        if: matrix.target == 'aarch64'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, subprocess, tempfile, zipfile
+          wheels = sorted(pathlib.Path("dist").glob("*.whl"))
+          assert len(wheels) == 1, f"expected 1 wheel, found {wheels}"
+          with tempfile.TemporaryDirectory() as tmp:
+              with zipfile.ZipFile(wheels[0]) as zf:
+                  extracted = pathlib.Path(zf.extract("adfontes/_adfontes.abi3.so", tmp))
+              subprocess.run(["codesign", "--verify", "--strict", str(extracted)], check=True)
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        target: [x64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-sdist
+          path: dist
+
+  binaries:
+    name: Standalone Binary (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_TERM_COLOR: always
+      RUSTUP_MAX_RETRIES: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15
+            target: x86_64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install musl toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools musl-dev linux-libc-dev
+      - name: Install Rust toolchain
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup toolchain install stable --profile minimal --target "$TARGET" && rustup default stable
+      - name: Build standalone binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --locked --release --bin adfontes --target "$TARGET"
+      - name: Strip standalone binary (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: strip "target/$TARGET/release/adfontes"
+      - name: Verify static musl linkage (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if readelf -d "target/$TARGET/release/adfontes" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo "Expected statically linked musl binary without NEEDED shared libraries" >&2
+            exit 1
+          fi
+      - name: Ad-hoc sign x86_64 macOS binary
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: codesign --force --sign - "target/$TARGET/release/adfontes"
+      - name: Verify macOS code signature
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: codesign --verify --strict "target/$TARGET/release/adfontes"
+      - name: Smoke-test standalone binary
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: ./target/"$TARGET"/release/adfontes --version
+      - name: Package standalone archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist
+          tar -C "target/$TARGET/release" -czf "dist/adfontes-$TARGET.tar.gz" adfontes
+      - name: Package standalone archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "target/$env:TARGET/release/adfontes.exe" -DestinationPath "dist/adfontes-$env:TARGET.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist
+
+  github-release:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, windows, sdist, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binaries-*
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --generate-notes --title "$TAG"
+          fi
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, windows, sdist, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          skip-existing: true
+
+  publish-crates:
+    name: Publish to crates.io
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, windows, sdist, binaries, github-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Authenticate with crates.io (OIDC)
+        id: auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked

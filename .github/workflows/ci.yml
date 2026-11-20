@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  RUSTDOCFLAGS: -D warnings
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --workspace --locked
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: uv
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo doc --workspace --no-deps --locked
+      - run: cargo doc --workspace --no-deps --document-private-items --locked
+      - run: uvx --from 'omnicoach>=0.4,<0.5' omnicoach code
+      - run: cargo publish --dry-run --locked
+
+  wheel:
+    name: Wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: uv
+      - run: cargo build --locked --release --bin adfontes
+      - run: uvx --from 'maturin>=1.15,<2.0' maturin build --release --locked --out dist/wheels
+      - name: Verify wheel
+        if: runner.os != 'Linux'
+        run: uv run --no-project scripts/verify_wheel.py --wheel-dir dist/wheels --reference-binary target/release/adfontes --python 3.10 --python 3.13
+      - name: Verify wheel and sdist
+        if: runner.os == 'Linux'
+        run: |
+          uvx --from 'maturin>=1.15,<2.0' maturin sdist --out dist/sdist
+          uv run --no-project scripts/verify_wheel.py --wheel-dir dist/wheels --sdist-dir dist/sdist --reference-binary target/release/adfontes --python 3.10 --python 3.13
+
+  zizmor:
+    name: Audit workflows (zizmor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          advanced-security: false

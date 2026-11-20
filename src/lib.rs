@@ -19,7 +19,9 @@ macro_rules! architecture_component {
 
 pub mod architecture;
 pub mod archive;
+pub mod cli;
 pub mod extract;
+pub mod mcp;
 pub mod model;
 pub mod pdf;
 pub mod resolve;
