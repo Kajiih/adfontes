@@ -1,0 +1,30 @@
+# Domain proper nouns and PDF/web specification identifiers valid in rustdoc prose without backticks.
+doc-valid-idents = [
+    "..",
+    "AcroForm",
+    "ArXiv",
+    "CropBox",
+    "DataCite",
+    "GitHub",
+    "KaTeX",
+    "LaTeX",
+    "LaTeXML",
+    "MarkInfo",
+    "MathJax",
+    "MathML",
+    "MediaBox",
+    "OpenAlex",
+    "OpenReview",
+    "PageLabels",
+    "PubMed",
+    "PyO3",
+    "StructParents",
+    "StructTreeRoot",
+    "ToUnicode",
+    "macOS",
+]
+
+# In tests, panicking is the expected failure mechanism.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

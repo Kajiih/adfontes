@@ -1,0 +1,75 @@
+[package]
+name = "adfontes"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+readme = "README.md"
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["/LICENSE", "/README.md", "/src/**"]
+autobins = false
+
+[workspace]
+members = ["."]
+default-members = ["."]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+description = "Full-text academic and technical literature reader CLI and stdio MCP server for coding agents"
+repository = "https://github.com/Kajiih/adfontes"
+license = "MIT"
+keywords = ["agent", "arxiv", "literature", "mcp", "research"]
+categories = ["command-line-utilities", "development-tools", "science"]
+
+[workspace.lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+cargo = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+expect_used = "deny"
+multiple_crate_versions = "allow"
+nursery = { level = "deny", priority = -1 }
+panic = "deny"
+pedantic = { level = "deny", priority = -1 }
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+
+[workspace.lints.rust]
+dead_code = "deny"
+missing_docs = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unsafe_code = "deny"
+unused = { level = "deny", priority = -1 }
+unused_qualifications = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+
+[lib]
+name = "adfontes"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
+thiserror = "2.0"
+url = "2.5"
+
+[dev-dependencies]
+indoc = "2.0"
+pretty_assertions = "1.4"
+rstest = "0.27"
+
+[lints]
+workspace = true
+
+[profile.release]
+# Preserve Mach-O linker ad-hoc LC_CODE_SIGNATURE on Apple Silicon cdylib wheels;
+# standalone Linux release binaries strip symbols explicitly in release.yml.
+lto = "fat"
