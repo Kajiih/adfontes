@@ -22,4 +22,6 @@ pub mod archive;
 pub mod extract;
 pub mod model;
 pub mod pdf;
+pub mod resolve;
+pub mod stage;
 pub mod transport;

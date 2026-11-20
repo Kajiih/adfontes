@@ -774,6 +774,11 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn build_test_pdf(page_texts: &[&str]) -> Vec<u8> {
+    tests::build_inherited_multipage_pdf(page_texts)
+}
+
+#[cfg(test)]
 mod tests {
     use lopdf::content::{Content, Operation};
     use lopdf::{Dictionary, Document, Object, Stream, StringFormat};
@@ -783,7 +788,7 @@ mod tests {
     /// Builds a hermetic multi-page PDF whose `/MediaBox` and `/Resources` live ONLY on the
     /// parent `/Pages` node and whose `Catalog` has nested `/Outlines`, `/StructTreeRoot`,
     /// `/OpenAction`, and stale trailer `/Prev`.
-    fn build_inherited_multipage_pdf(page_texts: &[&str]) -> Vec<u8> {
+    pub(super) fn build_inherited_multipage_pdf(page_texts: &[&str]) -> Vec<u8> {
         let mut doc = Document::with_version("1.5");
         let pages_root_id = doc.new_object_id();
 
