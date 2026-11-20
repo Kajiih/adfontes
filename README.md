@@ -8,19 +8,15 @@ Given a paper identifier (`arXiv`, `DOI`, `PMCID`, `PMID`), specification (`IETF
 
 ## Installation
 
-NOTE: PyPI and crates.io publishing is pending initial registry setup. Until `adfontes` is live on both registries, install temporarily from [GitHub Releases](https://github.com/Kajiih/adfontes/releases) or Git.
-
 ### Python (`uv`)
 
-Download a prebuilt wheel from [GitHub Releases](https://github.com/Kajiih/adfontes/releases) and install it with `uv`:
-
 ```bash
-uv tool install ./adfontes-*.whl
+uv tool install --managed-python adfontes
 ```
 
 ### Standalone Binary
 
-Download a prebuilt archive from [GitHub Releases](https://github.com/Kajiih/adfontes/releases) for Linux, macOS, or Windows, or build from Git:
+NOTE: crates.io publishing is pending initial crate bootstrap; until `adfontes` is live on crates.io, install temporarily from [GitHub Releases](https://github.com/Kajiih/adfontes/releases) or Git:
 
 ```bash
 cargo install --git https://github.com/Kajiih/adfontes --locked
