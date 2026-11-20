@@ -106,6 +106,16 @@ define_architecture! {
     Archive      => [Model] (owns_external: ["flate2", "tar"]),
     /// SSRF-pinned synchronous HTTP(S) client and charset decoder (`transport`).
     Transport    => [Archive, Model] (owns_external: ["ureq", "encoding_rs"]),
+    /// Pure-Rust PDF page indexing and lossless vector page slicing (`pdf`).
+    Pdf          => [Model] (owns_external: ["lopdf"]),
+    /// Math-preserving HTML5, JATS/RFCXML/Atom XML, RFC, TeX, and title extractors (`extract`).
+    Extract      => [Archive, Model] (owns_external: ["scraper", "roxmltree"]) (modules: {
+        title => [],
+        html  => [title],
+        xml   => [title],
+        rfc   => [title],
+        tex   => [title],
+    }),
 }
 
 impl ArchitectureComponent {

@@ -1,0 +1,1208 @@
+//! Pure-Rust PDF page indexing and lossless vector page slicing powered by `lopdf`.
+//!
+//! Eliminates external C++ `poppler` requirements while ensuring sliced PDFs materialize
+//! ancestor-inherited `/Pages` attributes (`Resources`, `MediaBox`, `CropBox`, `Rotate`), build a
+//! fresh spec-clean flat `/Pages` tree without `lopdf::Document::delete_pages` $O(P \times V^2)$
+//! hazards, strip cross-page `Catalog`/`Page`/trailer keys, and enforce cumulative decompression
+//! budgets during both loading and indexing.
+
+architecture_component!(Pdf);
+
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::io::Read;
+use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+use lopdf::{
+    DecompressError, Dictionary, Document, Error as LopdfError, LoadOptions, Object, ObjectId,
+    decode_text_string,
+};
+
+use crate::model::{AdfontesError, PageSpan, PdfIndex, PdfPageSummary};
+
+const PDF_FORMAT_LABEL: &str = "PDF";
+const KEY_FIRST: &[u8] = b"First";
+const PDF_MAGIC: &[u8] = b"%PDF-";
+const PDF_MAGIC_SCAN_WINDOW: usize = 1024;
+const MAX_PDF_LOAD_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PDF_PAGE_DECOMPRESSED_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PDF_CMAP_BYTES: usize = 1024 * 1024;
+const MAX_PURE_RUST_INDEXED_PAGES: usize = 250;
+const MAX_PDFTOTEXT_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
+const PDFTOTEXT_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_PARENT_TREE_DEPTH: usize = 64;
+const MAX_OUTLINE_ITEMS: usize = 200;
+const MAX_OUTLINE_DEPTH: usize = 8;
+const MAX_HEADINGS_PER_PAGE: usize = 4;
+const MAX_PREVIEW_CHARS: usize = 160;
+const MIN_HEADING_LEN: usize = 4;
+const MAX_HEADING_LEN: usize = 110;
+
+const INHERITABLE_PAGE_KEYS: &[&[u8]] = &[b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+const STRIPPED_PAGE_KEYS: &[&[u8]] = &[b"Annots", b"StructParents", b"B", b"AA"];
+const STRIPPED_CATALOG_KEYS: &[&[u8]] = &[
+    b"Outlines",
+    b"StructTreeRoot",
+    b"MarkInfo",
+    b"Names",
+    b"Dests",
+    b"PageLabels",
+    b"Threads",
+    b"AcroForm",
+    b"OpenAction",
+    b"AA",
+];
+const STRIPPED_TRAILER_KEYS: &[&[u8]] = &[
+    b"Encrypt",
+    b"Prev",
+    b"XRefStm",
+    b"DecodeParms",
+    b"Filter",
+    b"W",
+    b"Index",
+    b"Type",
+    b"Length",
+];
+
+thread_local! {
+    static PDF_LOAD_BUDGET_REMAINING: Cell<usize> = const { Cell::new(MAX_PDF_LOAD_DECOMPRESSED_BYTES) };
+    static PDF_LOAD_SAFETY_TRIPPED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Lossless vector PDF slice emitted by [`slice_pdf_bytes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlicedPdf {
+    /// Total page count of the source PDF.
+    pub total_pages: u32,
+    /// Effective clamped 1-indexed page span present in [`Self::bytes`].
+    pub effective_span: PageSpan,
+    /// Validated standalone PDF bytes for the retained pages.
+    pub bytes: Vec<u8>,
+}
+
+/// Returns `true` if `bytes` contains the `%PDF-` signature within its first 1,024 bytes.
+#[must_use]
+pub fn is_pdf_magic(bytes: &[u8]) -> bool {
+    let window_len = bytes.len().min(PDF_MAGIC_SCAN_WINDOW);
+    let prefix = bytes.get(..window_len).unwrap_or_default();
+    prefix
+        .windows(PDF_MAGIC.len())
+        .any(|window| window == PDF_MAGIC)
+}
+
+/// Indexes a PDF's page count, nested outline bookmarks, and bounded per-page text hints.
+///
+/// When `pdf_path_for_pdftotext` is supplied and `pdftotext` is present on `PATH`, layout-aware
+/// text hints are enriched automatically (with a `15 s` deadline, `16 MiB` output cap, and strict
+/// page-count alignment check); otherwise pure-Rust `lopdf` generates bounded page summaries with
+/// zero external binaries.
+///
+/// # Errors
+///
+/// Returns [`AdfontesError::SafetyBlock`] if a PDF decompression bomb exceeds memory budgets, or
+/// [`AdfontesError::Extraction`] if `bytes` is not a readable PDF or requires a user password.
+pub fn index_pdf_bytes(
+    bytes: &[u8],
+    pdf_path_for_pdftotext: Option<&Path>,
+) -> Result<PdfIndex, AdfontesError> {
+    let mut doc = load_decrypted_pdf(bytes)?;
+    let page_ids = doc.get_pages();
+    let page_count = u32::try_from(page_ids.len()).unwrap_or(u32::MAX);
+    let outline_titles = extract_outline_titles(&doc);
+
+    // Enforce pure-Rust page and font CMap decompression bounds BEFORE spawning any external
+    // `pdftotext` helper so malicious PDF bombs fail closed without touching poppler.
+    let mut pure_rust_texts = Vec::with_capacity(page_ids.len());
+    let mut remaining_decompressed = MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES;
+    let mut cmap_sizes: BTreeMap<ObjectId, usize> = BTreeMap::new();
+
+    for (index, (&page_number, &page_id)) in page_ids.iter().enumerate() {
+        let page_text = if index >= MAX_PURE_RUST_INDEXED_PAGES {
+            String::new()
+        } else {
+            extract_bounded_page_text(
+                &mut doc,
+                page_number,
+                page_id,
+                &mut remaining_decompressed,
+                &mut cmap_sizes,
+            )?
+        };
+        pure_rust_texts.push(page_text);
+    }
+
+    let aligned_pdftotext = pdf_path_for_pdftotext
+        .map(try_pdftotext_pages)
+        .filter(|pages| pages.len() == page_ids.len());
+
+    let mut pages = Vec::with_capacity(page_ids.len());
+    for (index, (&page_number, _)) in page_ids.iter().enumerate() {
+        let page_text = aligned_pdftotext
+            .as_ref()
+            .and_then(|external_pages| external_pages.get(index))
+            .map_or_else(
+                || pure_rust_texts.get(index).cloned().unwrap_or_default(),
+                String::clone,
+            );
+
+        let Some(page_nz) = NonZeroU32::new(page_number) else {
+            continue;
+        };
+        pages.push(summarize_page_text(page_nz, &page_text));
+    }
+
+    Ok(PdfIndex {
+        page_count,
+        outline_titles,
+        pages,
+    })
+}
+
+/// Losslessly slices an inclusive [`PageSpan`] (`1..=8` pages) into a self-contained PDF.
+///
+/// Materializes inherited `/Pages` attributes (`Resources`, `MediaBox`, `CropBox`, `Rotate`) onto
+/// each retained `/Page`, wires them into a fresh flat `/Pages` root (preventing `/Parent` cycle
+/// hangs, $O(P \times V^2)$ `delete_pages` stalls, and empty intermediate `/Pages` nodes), strips
+/// cross-page `Catalog`/page/trailer state, prunes unreachable objects in $O(V)$, and serializes.
+///
+/// # Errors
+///
+/// Returns [`AdfontesError::InvalidTarget`] if `span` starts past the PDF's page count,
+/// [`AdfontesError::SafetyBlock`] on decompression bombs, or [`AdfontesError::Extraction`] if the PDF
+/// is malformed or user-password-encrypted.
+pub fn slice_pdf_bytes(raw_bytes: &[u8], span: PageSpan) -> Result<SlicedPdf, AdfontesError> {
+    let mut doc = load_decrypted_pdf(raw_bytes)?;
+    let page_ids = doc.get_pages();
+    let total_pages = u32::try_from(page_ids.len()).unwrap_or(u32::MAX);
+    let effective_span = span.clamp_to_total(total_pages)?;
+
+    let mut retained_ids = Vec::new();
+    for (&page_number, &page_id) in &page_ids {
+        if page_number >= effective_span.start() && page_number <= effective_span.end() {
+            materialize_inherited_page_attributes(&mut doc, page_id);
+            strip_cross_page_page_keys(&mut doc, page_id);
+            retained_ids.push(page_id);
+        }
+    }
+
+    let retained_count = i64::try_from(retained_ids.len()).unwrap_or(i64::MAX);
+    let kids: Vec<Object> = retained_ids
+        .iter()
+        .copied()
+        .map(Object::Reference)
+        .collect();
+    let new_pages_id = doc.add_object(Dictionary::from_iter([
+        ("Type", Object::Name(b"Pages".to_vec())),
+        ("Kids", Object::Array(kids)),
+        ("Count", Object::Integer(retained_count)),
+    ]));
+
+    for &page_id in &retained_ids {
+        if let Ok(Object::Dictionary(page_mut)) = doc.get_object_mut(page_id) {
+            page_mut.set("Parent", Object::Reference(new_pages_id));
+        }
+    }
+
+    if let Ok(catalog) = doc.catalog_mut() {
+        catalog.set("Pages", Object::Reference(new_pages_id));
+        for &key in STRIPPED_CATALOG_KEYS {
+            catalog.remove(key);
+        }
+    }
+
+    for &key in STRIPPED_TRAILER_KEYS {
+        doc.trailer.remove(key);
+    }
+    doc.encryption_state = None;
+    doc.xref_start = 0;
+    doc.bookmarks.clear();
+    doc.bookmark_table.clear();
+
+    prune_unreachable_objects_linear(&mut doc);
+    doc.renumber_objects();
+
+    let mut out_bytes = Vec::new();
+    doc.save_to(&mut out_bytes)
+        .map_err(|io_error| AdfontesError::Extraction {
+            format: PDF_FORMAT_LABEL,
+            detail: format!("failed serializing sliced PDF: {io_error}"),
+        })?;
+
+    Ok(SlicedPdf {
+        total_pages,
+        effective_span,
+        bytes: out_bytes,
+    })
+}
+
+fn load_decrypted_pdf(bytes: &[u8]) -> Result<Document, AdfontesError> {
+    if !is_pdf_magic(bytes) {
+        return Err(AdfontesError::Extraction {
+            format: PDF_FORMAT_LABEL,
+            detail: "input bytes do not begin with `%PDF-` signature".to_owned(),
+        });
+    }
+
+    let _budget_guard = PdfLoadBudgetGuard::new(MAX_PDF_LOAD_DECOMPRESSED_BYTES);
+    let options = LoadOptions {
+        max_decompressed_size: Some(MAX_PDF_LOAD_DECOMPRESSED_BYTES),
+        filter: Some(filter_pdf_load_object),
+        ..Default::default()
+    };
+    let load_result = Document::load_mem_with_options(bytes, options);
+    if PDF_LOAD_SAFETY_TRIPPED.with(Cell::get) {
+        return Err(AdfontesError::SafetyBlock {
+            reason: format!(
+                "PDF object stream decompression exceeded {MAX_PDF_LOAD_DECOMPRESSED_BYTES}-byte ceiling"
+            ),
+        });
+    }
+
+    let doc = load_result.map_err(|pdf_error| match pdf_error {
+        LopdfError::Decompress(DecompressError::MemoryLimitExceeded { limit }) => {
+            AdfontesError::SafetyBlock {
+                reason: format!("PDF stream decompression exceeded {limit}-byte ceiling"),
+            }
+        }
+        other => AdfontesError::Extraction {
+            format: PDF_FORMAT_LABEL,
+            detail: format!("failed to parse PDF: {other}"),
+        },
+    })?;
+
+    if (doc.is_encrypted() || doc.trailer.has(b"Encrypt")) && doc.encryption_state.is_none() {
+        return Err(AdfontesError::Extraction {
+            format: PDF_FORMAT_LABEL,
+            detail: "PDF is password-encrypted and cannot be opened".to_owned(),
+        });
+    }
+    Ok(doc)
+}
+
+// omni:ignore [positional-tuple-return] -- signature mandated by lopdf::FilterFunc
+fn filter_pdf_load_object(object_id: ObjectId, object: &mut Object) -> Option<(ObjectId, Object)> {
+    if PDF_LOAD_SAFETY_TRIPPED.with(Cell::get) {
+        return None;
+    }
+    if let Object::Stream(stream) = object
+        && stream.dict.has_type(b"ObjStm")
+    {
+        let remaining = PDF_LOAD_BUDGET_REMAINING.with(Cell::get);
+        match stream.decompressed_content_with_limit(remaining) {
+            Ok(data) => {
+                PDF_LOAD_BUDGET_REMAINING.with(|cell| {
+                    cell.set(remaining.saturating_sub(data.len()));
+                });
+            }
+            Err(LopdfError::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+                PDF_LOAD_SAFETY_TRIPPED.with(|cell| cell.set(true));
+                return None;
+            }
+            Err(_) => {}
+        }
+    }
+    if matches!(object, Object::Stream(_)) {
+        // Streams are always top-level indirect objects (ISO 32000-1 §7.5.7 forbids streams inside
+        // ObjStm), and `lopdf` discards the returned `Object` for top-level objects while keeping
+        // `object` intact; returning `Object::Null` avoids deep-cloning multi-MiB image streams.
+        return Some((object_id, Object::Null));
+    }
+    Some((object_id, object.clone()))
+}
+
+struct PdfLoadBudgetGuard;
+
+impl PdfLoadBudgetGuard {
+    fn new(limit: usize) -> Self {
+        PDF_LOAD_BUDGET_REMAINING.with(|cell| cell.set(limit));
+        PDF_LOAD_SAFETY_TRIPPED.with(|cell| cell.set(false));
+        Self
+    }
+}
+
+impl Drop for PdfLoadBudgetGuard {
+    fn drop(&mut self) {
+        PDF_LOAD_BUDGET_REMAINING.with(|cell| cell.set(MAX_PDF_LOAD_DECOMPRESSED_BYTES));
+        PDF_LOAD_SAFETY_TRIPPED.with(|cell| cell.set(false));
+    }
+}
+
+fn extract_bounded_page_text(
+    doc: &mut Document,
+    page_number: u32,
+    page_id: ObjectId,
+    remaining_decompressed: &mut usize,
+    cmap_sizes: &mut BTreeMap<ObjectId, usize>,
+) -> Result<String, AdfontesError> {
+    if *remaining_decompressed == 0 {
+        return Err(AdfontesError::SafetyBlock {
+            reason: format!(
+                "PDF indexing exceeded cumulative {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte decompression ceiling"
+            ),
+        });
+    }
+
+    materialize_inherited_page_attributes(doc, page_id);
+    charge_page_font_cmaps(
+        doc,
+        page_number,
+        page_id,
+        remaining_decompressed,
+        cmap_sizes,
+    )?;
+
+    let content_limit = (*remaining_decompressed).min(MAX_PDF_PAGE_DECOMPRESSED_BYTES);
+    let content_bytes = match doc.get_page_content_with_limit(page_id, content_limit) {
+        Ok(bytes) => bytes,
+        Err(LopdfError::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+            return Err(AdfontesError::SafetyBlock {
+                reason: format!(
+                    "PDF page {page_number} decompressed content exceeded cumulative {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte ceiling"
+                ),
+            });
+        }
+        Err(_) => return Ok(String::new()),
+    };
+
+    if content_bytes.len() > *remaining_decompressed {
+        return Err(AdfontesError::SafetyBlock {
+            reason: format!(
+                "PDF page {page_number} decompressed content exceeded cumulative {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte ceiling"
+            ),
+        });
+    }
+    let page_budget = (*remaining_decompressed).min(MAX_PDF_PAGE_DECOMPRESSED_BYTES);
+    *remaining_decompressed = remaining_decompressed.saturating_sub(content_bytes.len());
+
+    match doc.extract_text_with_limit(&[page_number], page_budget) {
+        Ok(text) => Ok(text),
+        Err(LopdfError::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+            Err(AdfontesError::SafetyBlock {
+                reason: format!(
+                    "PDF page {page_number} text extraction exceeded {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte ceiling"
+                ),
+            })
+        }
+        Err(_) => Ok(String::new()),
+    }
+}
+
+fn charge_page_font_cmaps(
+    doc: &Document,
+    page_number: u32,
+    page_id: ObjectId,
+    remaining_decompressed: &mut usize,
+    cmap_sizes: &mut BTreeMap<ObjectId, usize>,
+) -> Result<(), AdfontesError> {
+    let Ok(fonts) = doc.get_page_fonts(page_id) else {
+        return Ok(());
+    };
+
+    for font in fonts.into_values() {
+        let Ok(to_unicode_raw) = font.get(b"ToUnicode") else {
+            continue;
+        };
+        let Ok((resolved_id, resolved_object)) = doc.dereference(to_unicode_raw) else {
+            continue;
+        };
+        let Object::Stream(stream) = resolved_object else {
+            continue;
+        };
+        let cmap_len = if let Some(cmap_id) = resolved_id {
+            if let Some(&cached_len) = cmap_sizes.get(&cmap_id) {
+                cached_len
+            } else {
+                let measured = measure_direct_stream_bytes(stream, page_number)?;
+                cmap_sizes.insert(cmap_id, measured);
+                measured
+            }
+        } else {
+            measure_direct_stream_bytes(stream, page_number)?
+        };
+        if cmap_len > *remaining_decompressed {
+            return Err(AdfontesError::SafetyBlock {
+                reason: format!(
+                    "PDF page {page_number} font ToUnicode CMap decompression exceeded cumulative {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte ceiling"
+                ),
+            });
+        }
+        *remaining_decompressed = remaining_decompressed.saturating_sub(cmap_len);
+    }
+    Ok(())
+}
+
+fn measure_direct_stream_bytes(
+    stream: &lopdf::Stream,
+    page_number: u32,
+) -> Result<usize, AdfontesError> {
+    match stream.decompressed_content_with_limit(MAX_PDF_CMAP_BYTES) {
+        Ok(data) => Ok(data.len()),
+        Err(LopdfError::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+            Err(AdfontesError::SafetyBlock {
+                reason: format!(
+                    "PDF page {page_number} font ToUnicode CMap exceeded {MAX_PDF_CMAP_BYTES}-byte safety ceiling"
+                ),
+            })
+        }
+        Err(_) => Ok(stream.content.len()),
+    }
+}
+
+fn materialize_inherited_page_attributes(doc: &mut Document, page_id: ObjectId) {
+    let mut inherited: Vec<(&[u8], Object)> = Vec::new();
+    let Ok(page) = doc.get_dictionary(page_id) else {
+        return;
+    };
+
+    for &key in INHERITABLE_PAGE_KEYS {
+        if page.has(key) {
+            continue;
+        }
+        if let Some(found) = lookup_inherited_key(doc, page_id, key) {
+            inherited.push((key, found));
+        }
+    }
+
+    if let Ok(Object::Dictionary(page_mut)) = doc.get_object_mut(page_id) {
+        for (key, value) in inherited {
+            page_mut.set(key, value);
+        }
+    }
+}
+
+fn lookup_inherited_key(doc: &Document, start_id: ObjectId, key: &[u8]) -> Option<Object> {
+    let mut visited = BTreeSet::new();
+    let mut current_id = start_id;
+    for _ in 0..MAX_PARENT_TREE_DEPTH {
+        if !visited.insert(current_id) {
+            break;
+        }
+        let current_node = doc.get_dictionary(current_id).ok()?;
+        let parent_ref = current_node.get(b"Parent").ok()?;
+        let Object::Reference(parent_id) = *parent_ref else {
+            break;
+        };
+        let parent = doc.get_dictionary(parent_id).ok()?;
+        if let Ok(value) = parent.get(key) {
+            return Some(value.clone());
+        }
+        current_id = parent_id;
+    }
+    None
+}
+
+fn strip_cross_page_page_keys(doc: &mut Document, page_id: ObjectId) {
+    if let Ok(Object::Dictionary(page_mut)) = doc.get_object_mut(page_id) {
+        for &key in STRIPPED_PAGE_KEYS {
+            page_mut.remove(key);
+        }
+    }
+}
+
+fn prune_unreachable_objects_linear(doc: &mut Document) {
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::new();
+    enqueue_dict_refs(&doc.trailer, &mut reachable, &mut queue);
+
+    while let Some(obj_id) = queue.pop_front() {
+        if let Some(obj) = doc.objects.get(&obj_id) {
+            enqueue_object_refs(obj, &mut reachable, &mut queue);
+        }
+    }
+
+    doc.objects.retain(|id, _| reachable.contains(id));
+}
+
+fn enqueue_dict_refs(
+    dict: &Dictionary,
+    reachable: &mut HashSet<ObjectId>,
+    queue: &mut VecDeque<ObjectId>,
+) {
+    for (_, value) in dict {
+        enqueue_object_refs(value, reachable, queue);
+    }
+}
+
+fn enqueue_object_refs(
+    root: &Object,
+    reachable: &mut HashSet<ObjectId>,
+    queue: &mut VecDeque<ObjectId>,
+) {
+    let mut stack: Vec<&Object> = vec![root];
+    while let Some(obj) = stack.pop() {
+        match obj {
+            Object::Reference(id) => {
+                if reachable.insert(*id) {
+                    queue.push_back(*id);
+                }
+            }
+            Object::Array(items) => {
+                for item in items {
+                    stack.push(item);
+                }
+            }
+            Object::Dictionary(dict) => {
+                for (_, val) in dict {
+                    stack.push(val);
+                }
+            }
+            Object::Stream(stream) => {
+                for (_, val) in &stream.dict {
+                    stack.push(val);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extract_outline_titles(doc: &Document) -> Vec<String> {
+    let Ok(catalog) = doc.catalog() else {
+        return Vec::new();
+    };
+    let Ok(outlines_ref) = catalog.get(b"Outlines") else {
+        return Vec::new();
+    };
+    let Some(outlines) = resolve_dictionary(doc, outlines_ref) else {
+        return Vec::new();
+    };
+    let Some(first_id) = outlines
+        .get(KEY_FIRST)
+        .ok()
+        .and_then(|obj| obj.as_reference().ok())
+    else {
+        return Vec::new();
+    };
+
+    let mut titles = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut stack: Vec<(ObjectId, usize)> = vec![(first_id, 0)];
+
+    while let Some((node_id, depth)) = stack.pop() {
+        if titles.len() >= MAX_OUTLINE_ITEMS
+            || depth > MAX_OUTLINE_DEPTH
+            || !visited.insert(node_id)
+        {
+            continue;
+        }
+        let Ok(node) = doc.get_dictionary(node_id) else {
+            continue;
+        };
+        if let Ok(raw_title) = node.get(b"Title")
+            && let Ok((_, resolved)) = doc.dereference(raw_title)
+            && let Ok(decoded) = decode_text_string(resolved)
+        {
+            let trimmed = decoded.trim();
+            if !trimmed.is_empty() {
+                titles.push(trimmed.to_owned());
+            }
+        }
+        // Push `/Next` first so `/First` children are popped and visited immediately in pre-order.
+        if let Ok(Object::Reference(next_id)) = node.get(b"Next") {
+            stack.push((*next_id, depth));
+        }
+        if depth < MAX_OUTLINE_DEPTH
+            && let Ok(Object::Reference(child_id)) = node.get(KEY_FIRST)
+        {
+            stack.push((*child_id, depth + 1));
+        }
+    }
+
+    titles
+}
+
+fn resolve_dictionary<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dictionary> {
+    match obj {
+        Object::Dictionary(table) => Some(table),
+        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        _ => None,
+    }
+}
+
+fn try_pdftotext_pages(path: &Path) -> Vec<String> {
+    let safe_path: PathBuf =
+        if !path.is_absolute() && path.as_os_str().as_encoded_bytes().starts_with(b"-") {
+            Path::new(".").join(path)
+        } else {
+            path.to_path_buf()
+        };
+
+    let Ok(mut child) = Command::new("pdftotext")
+        .arg("-layout")
+        .arg(&safe_path)
+        .arg("-")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return Vec::new();
+    };
+
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    };
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let ok = stdout
+            .take(MAX_PDFTOTEXT_OUTPUT_BYTES + 1)
+            .read_to_end(&mut buf)
+            .is_ok();
+        let _ = tx.send((ok, buf));
+    });
+
+    let Ok((read_ok, raw_stdout)) = rx.recv_timeout(PDFTOTEXT_TIMEOUT) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    };
+
+    if raw_stdout.len() as u64 > MAX_PDFTOTEXT_OUTPUT_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    }
+    let Ok(status) = child.wait() else {
+        return Vec::new();
+    };
+    if !read_ok || !status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&raw_stdout);
+    let mut pages: Vec<String> = text.split('\x0c').map(str::to_owned).collect();
+    if pages.last().is_some_and(|tail| tail.trim().is_empty()) {
+        let _ = pages.pop();
+    }
+    pages
+}
+
+fn summarize_page_text(page_number: NonZeroU32, text: &str) -> PdfPageSummary {
+    let mut headings = Vec::new();
+    let mut preview = String::new();
+
+    for raw_line in text.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if preview.is_empty() {
+            preview = truncate_chars(trimmed, MAX_PREVIEW_CHARS);
+        }
+        if headings.len() < MAX_HEADINGS_PER_PAGE && looks_like_pdf_heading(trimmed) {
+            headings.push(truncate_chars(trimmed, MAX_HEADING_LEN));
+        }
+    }
+
+    PdfPageSummary {
+        page_number,
+        char_count: text.chars().count(),
+        headings,
+        preview,
+    }
+}
+
+fn looks_like_pdf_heading(line: &str) -> bool {
+    let len = line.chars().count();
+    if !(MIN_HEADING_LEN..=MAX_HEADING_LEN).contains(&len) {
+        return false;
+    }
+    let lower = line.to_ascii_lowercase();
+    let starts_section_keyword = [
+        "abstract",
+        "introduction",
+        "background",
+        "method",
+        "experiment",
+        "result",
+        "discussion",
+        "conclusion",
+        "appendix",
+        "references",
+        "theorem",
+        "lemma",
+        "proposition",
+        "figure ",
+        "table ",
+        "algorithm ",
+    ]
+    .iter()
+    .any(|keyword| lower.starts_with(keyword));
+
+    starts_section_keyword || starts_like_numbered_heading(line)
+}
+
+fn starts_like_numbered_heading(line: &str) -> bool {
+    if line.ends_with('.') {
+        return false;
+    }
+    let Some((prefix, rest)) = line.split_once(char::is_whitespace) else {
+        return false;
+    };
+    let clean_prefix = prefix.trim_end_matches('.');
+    let valid_number = !clean_prefix.is_empty()
+        && clean_prefix
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    let starts_capitalized = rest
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_uppercase());
+    valid_number && starts_capitalized
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (count, character) in input.chars().enumerate() {
+        if count >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(character);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{Dictionary, Document, Object, Stream, StringFormat};
+
+    use super::*;
+
+    /// Builds a hermetic multi-page PDF whose `/MediaBox` and `/Resources` live ONLY on the
+    /// parent `/Pages` node and whose `Catalog` has nested `/Outlines`, `/StructTreeRoot`,
+    /// `/OpenAction`, and stale trailer `/Prev`.
+    fn build_inherited_multipage_pdf(page_texts: &[&str]) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let pages_root_id = doc.new_object_id();
+
+        let font_id = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Font".to_vec())),
+            ("Subtype", Object::Name(b"Type1".to_vec())),
+            ("BaseFont", Object::Name(b"Helvetica".to_vec())),
+        ]));
+        let resources = Dictionary::from_iter([(
+            "Font",
+            Object::Dictionary(Dictionary::from_iter([("F1", Object::Reference(font_id))])),
+        )]);
+
+        let mut kid_refs = Vec::new();
+        for text in page_texts {
+            let content = Content {
+                operations: vec![
+                    Operation::new("BT", vec![]),
+                    Operation::new(
+                        "Tf",
+                        vec![Object::Name(b"F1".to_vec()), Object::Integer(12)],
+                    ),
+                    Operation::new("Td", vec![Object::Integer(72), Object::Integer(720)]),
+                    Operation::new("Tj", vec![Object::string_literal(*text)]),
+                    Operation::new("ET", vec![]),
+                ],
+            };
+            let stream_id =
+                doc.add_object(Stream::new(Dictionary::new(), content.encode().unwrap()));
+            let page_id = doc.add_object(Dictionary::from_iter([
+                ("Type", Object::Name(b"Page".to_vec())),
+                ("Parent", Object::Reference(pages_root_id)),
+                ("Contents", Object::Reference(stream_id)),
+            ]));
+            kid_refs.push(Object::Reference(page_id));
+        }
+
+        let pages_node = Dictionary::from_iter([
+            ("Type", Object::Name(b"Pages".to_vec())),
+            ("Kids", Object::Array(kid_refs.clone())),
+            (
+                "Count",
+                Object::Integer(i64::try_from(page_texts.len()).unwrap()),
+            ),
+            ("Resources", Object::Dictionary(resources)),
+            (
+                "MediaBox",
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(612),
+                    Object::Integer(792),
+                ]),
+            ),
+        ]);
+        doc.objects
+            .insert(pages_root_id, Object::Dictionary(pages_node));
+
+        // Indirect PDFDocEncoding title (`é` = 0xE9) nested under parent outline item.
+        let child_title_ref = doc.add_object(Object::String(
+            vec![b'1', b'.', b'1', b' ', b'R', 0xE9, b's', b'u', b'm', 0xE9],
+            StringFormat::Literal,
+        ));
+        let child_outline = doc.add_object(Dictionary::from_iter([(
+            "Title",
+            Object::Reference(child_title_ref),
+        )]));
+        let outline_item = doc.add_object(Dictionary::from_iter([
+            (
+                "Title",
+                Object::String(b"1 Introduction".to_vec(), StringFormat::Literal),
+            ),
+            ("First", Object::Reference(child_outline)),
+            ("Last", Object::Reference(child_outline)),
+            (
+                "Dest",
+                Object::Array(vec![kid_refs[0].clone(), Object::Name(b"Fit".to_vec())]),
+            ),
+        ]));
+        let outlines_id = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Outlines".to_vec())),
+            ("First", Object::Reference(outline_item)),
+            ("Last", Object::Reference(outline_item)),
+            ("Count", Object::Integer(2)),
+        ]));
+        let struct_root = doc.add_object(Dictionary::from_iter([(
+            "Type",
+            Object::Name(b"StructTreeRoot".to_vec()),
+        )]));
+
+        let catalog_id = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Catalog".to_vec())),
+            ("Pages", Object::Reference(pages_root_id)),
+            ("Outlines", Object::Reference(outlines_id)),
+            ("StructTreeRoot", Object::Reference(struct_root)),
+            (
+                "OpenAction",
+                Object::Array(vec![kid_refs[0].clone(), Object::Name(b"Fit".to_vec())]),
+            ),
+        ]));
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc.trailer.set("Prev", Object::Integer(12345));
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn indexes_pages_nested_outlines_and_pdfdoc_encoding_in_pure_rust() {
+        let pdf_bytes = build_inherited_multipage_pdf(&[
+            "1 Introduction overview",
+            "2 Methods and derivations",
+            "3 Results summary",
+        ]);
+        let index = index_pdf_bytes(&pdf_bytes, None).unwrap();
+        assert_eq!(index.page_count, 3);
+        assert_eq!(index.outline_titles, vec!["1 Introduction", "1.1 Résumé"]);
+        assert!(index.pages[1].preview.contains("2 Methods"));
+    }
+
+    #[test]
+    fn distinguishes_numbered_pdf_headings_from_numeric_rows_and_prose() {
+        assert!(!looks_like_pdf_heading("12 34 56 78"));
+        assert!(!looks_like_pdf_heading("100 samples were tested without"));
+        assert!(looks_like_pdf_heading("2.1 Experimental Setup"));
+    }
+
+    #[test]
+    fn slices_pdf_preserving_inherited_mediabox_and_resources() {
+        let pdf_bytes = build_inherited_multipage_pdf(&[
+            "Page One",
+            "Page Two Target",
+            "Page Three Target",
+            "Page Four",
+        ]);
+        let span = PageSpan::new(2, 3).unwrap();
+        let sliced = slice_pdf_bytes(&pdf_bytes, span).unwrap();
+        let reloaded = Document::load_mem(&sliced.bytes).unwrap();
+        let retained_pages = reloaded.get_pages();
+        let first_retained = reloaded
+            .get_dictionary(*retained_pages.get(&1).unwrap())
+            .unwrap();
+
+        assert_eq!(sliced.total_pages, 4);
+        assert_eq!(retained_pages.len(), 2);
+        assert!(first_retained.has(b"MediaBox"));
+        assert!(first_retained.has(b"Resources"));
+    }
+
+    #[test]
+    fn strips_cross_page_catalog_structures_and_stale_trailer_keys() {
+        let pdf_bytes = build_inherited_multipage_pdf(&["Page One", "Page Two", "Page Three"]);
+        let sliced = slice_pdf_bytes(&pdf_bytes, PageSpan::new(2, 2).unwrap()).unwrap();
+        let reloaded = Document::load_mem(&sliced.bytes).unwrap();
+        let catalog = reloaded.catalog().unwrap();
+
+        assert!(!catalog.has(b"Outlines"));
+        assert!(!catalog.has(b"StructTreeRoot"));
+        assert!(!catalog.has(b"OpenAction"));
+        assert!(!reloaded.trailer.has(b"Prev"));
+    }
+
+    #[test]
+    fn slices_nested_pages_tree_with_parent_cycle_without_hanging_or_empty_nodes() {
+        let mut doc = Document::with_version("1.5");
+        let root_pages = doc.new_object_id();
+        let left_branch = doc.new_object_id();
+        let right_branch = doc.new_object_id();
+
+        let p1 = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Page".to_vec())),
+            ("Parent", Object::Reference(left_branch)),
+        ]));
+        let p2 = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Page".to_vec())),
+            ("Parent", Object::Reference(right_branch)),
+        ]));
+
+        doc.objects.insert(
+            left_branch,
+            Object::Dictionary(Dictionary::from_iter([
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Parent", Object::Reference(root_pages)),
+                ("Kids", Object::Array(vec![Object::Reference(p1)])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        doc.objects.insert(
+            right_branch,
+            Object::Dictionary(Dictionary::from_iter([
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Parent", Object::Reference(root_pages)),
+                ("Kids", Object::Array(vec![Object::Reference(p2)])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        // Deliberately introduce a `/Parent` self-cycle on root `/Pages`.
+        doc.objects.insert(
+            root_pages,
+            Object::Dictionary(Dictionary::from_iter([
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Parent", Object::Reference(root_pages)),
+                (
+                    "Kids",
+                    Object::Array(vec![
+                        Object::Reference(left_branch),
+                        Object::Reference(right_branch),
+                    ]),
+                ),
+                ("Count", Object::Integer(2)),
+                (
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                ),
+            ])),
+        );
+        let catalog = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Catalog".to_vec())),
+            ("Pages", Object::Reference(root_pages)),
+        ]));
+        doc.trailer.set("Root", Object::Reference(catalog));
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        let sliced = slice_pdf_bytes(&bytes, PageSpan::new(2, 2).unwrap()).unwrap();
+        let reloaded = Document::load_mem(&sliced.bytes).unwrap();
+        let page_count = reloaded.get_pages().len();
+        let zero_count_pages_nodes = reloaded
+            .objects
+            .values()
+            .filter_map(|obj| obj.as_dict().ok())
+            .filter(|dict| {
+                dict.get_type().is_ok_and(|kind| kind == b"Pages")
+                    && dict.get(b"Count").and_then(Object::as_i64).ok() == Some(0)
+            })
+            .count();
+        assert_eq!(page_count, 1);
+        assert_eq!(zero_count_pages_nodes, 0);
+    }
+
+    #[test]
+    fn rejects_non_pdf_bytes() {
+        assert!(matches!(
+            index_pdf_bytes(b"<html>not a pdf</html>", None).unwrap_err(),
+            AdfontesError::Extraction { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_inline_encrypt_dictionary() {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Pages".to_vec())),
+            ("Kids", Object::Array(vec![])),
+            ("Count", Object::Integer(0)),
+        ]));
+        let catalog = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Catalog".to_vec())),
+            ("Pages", Object::Reference(pages_id)),
+        ]));
+        doc.trailer.set("Root", Object::Reference(catalog));
+        doc.trailer.set(
+            "Encrypt",
+            Object::Dictionary(Dictionary::from_iter([
+                ("Filter", Object::Name(b"Standard".to_vec())),
+                ("V", Object::Integer(2)),
+            ])),
+        );
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        assert!(matches!(
+            index_pdf_bytes(&bytes, None).unwrap_err(),
+            AdfontesError::Extraction { .. }
+        ));
+    }
+
+    #[test]
+    fn blocks_compressed_pdf_page_content_bomb() {
+        let mut doc = Document::with_version("1.5");
+        let pages_root = doc.new_object_id();
+        let huge_payload = vec![b' '; MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES + 4096];
+        let mut stream = Stream::new(Dictionary::new(), huge_payload);
+        stream.compress().unwrap();
+        let stream_id = doc.add_object(stream);
+        let page_id = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Page".to_vec())),
+            ("Parent", Object::Reference(pages_root)),
+            ("Contents", Object::Reference(stream_id)),
+        ]));
+        doc.objects.insert(
+            pages_root,
+            Object::Dictionary(Dictionary::from_iter([
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(vec![Object::Reference(page_id)])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        let catalog = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Catalog".to_vec())),
+            ("Pages", Object::Reference(pages_root)),
+        ]));
+        doc.trailer.set("Root", Object::Reference(catalog));
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        assert!(matches!(
+            index_pdf_bytes(&bytes, None).unwrap_err(),
+            AdfontesError::SafetyBlock { .. }
+        ));
+    }
+
+    #[test]
+    fn blocks_compressed_font_to_unicode_cmap_bomb() {
+        let mut doc = Document::with_version("1.5");
+        let pages_root = doc.new_object_id();
+        let huge_cmap = vec![b' '; MAX_PDF_CMAP_BYTES + 4096];
+        let mut cmap_stream = Stream::new(Dictionary::new(), huge_cmap);
+        cmap_stream.compress().unwrap();
+        let cmap_id = doc.add_object(cmap_stream);
+        let font_id = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Font".to_vec())),
+            ("Subtype", Object::Name(b"Type1".to_vec())),
+            ("ToUnicode", Object::Reference(cmap_id)),
+        ]));
+        let resources_id = doc.add_object(Dictionary::from_iter([(
+            "Font",
+            Object::Dictionary(Dictionary::from_iter([("F1", Object::Reference(font_id))])),
+        )]));
+        let content_id = doc.add_object(Stream::new(
+            Dictionary::new(),
+            b"BT /F1 12 Tf (hi) Tj ET".to_vec(),
+        ));
+        let page_id = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Page".to_vec())),
+            ("Parent", Object::Reference(pages_root)),
+            ("Resources", Object::Reference(resources_id)),
+            ("Contents", Object::Reference(content_id)),
+        ]));
+        doc.objects.insert(
+            pages_root,
+            Object::Dictionary(Dictionary::from_iter([
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(vec![Object::Reference(page_id)])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        let catalog = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Catalog".to_vec())),
+            ("Pages", Object::Reference(pages_root)),
+        ]));
+        doc.trailer.set("Root", Object::Reference(catalog));
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        assert!(matches!(
+            index_pdf_bytes(&bytes, None).unwrap_err(),
+            AdfontesError::SafetyBlock { .. }
+        ));
+    }
+
+    #[test]
+    fn blocks_inherited_parent_font_chained_to_unicode_cmap_bomb() {
+        let mut doc = Document::with_version("1.5");
+        let pages_root = doc.new_object_id();
+        let huge_cmap = vec![b' '; MAX_PDF_CMAP_BYTES + 4096];
+        let mut cmap_stream = Stream::new(Dictionary::new(), huge_cmap);
+        cmap_stream.compress().unwrap();
+        let cmap_id = doc.add_object(cmap_stream);
+        let chained_cmap_ref = doc.add_object(Object::Reference(cmap_id));
+        let font_id = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Font".to_vec())),
+            ("Subtype", Object::Name(b"Type1".to_vec())),
+            ("ToUnicode", Object::Reference(chained_cmap_ref)),
+        ]));
+        let inherited_resources = doc.add_object(Dictionary::from_iter([(
+            "Font",
+            Object::Dictionary(Dictionary::from_iter([("F1", Object::Reference(font_id))])),
+        )]));
+        let content_id = doc.add_object(Stream::new(
+            Dictionary::new(),
+            b"BT /F1 12 Tf (hi) Tj ET".to_vec(),
+        ));
+        let page_id = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Page".to_vec())),
+            ("Parent", Object::Reference(pages_root)),
+            ("Resources", Object::Dictionary(Dictionary::new())),
+            ("Contents", Object::Reference(content_id)),
+        ]));
+        doc.objects.insert(
+            pages_root,
+            Object::Dictionary(Dictionary::from_iter([
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(vec![Object::Reference(page_id)])),
+                ("Count", Object::Integer(1)),
+                ("Resources", Object::Reference(inherited_resources)),
+            ])),
+        );
+        let catalog = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Catalog".to_vec())),
+            ("Pages", Object::Reference(pages_root)),
+        ]));
+        doc.trailer.set("Root", Object::Reference(catalog));
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        assert!(matches!(
+            index_pdf_bytes(&bytes, None).unwrap_err(),
+            AdfontesError::SafetyBlock { .. }
+        ));
+    }
+}
