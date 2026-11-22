@@ -3,3 +3,9 @@
 *.egg-info/
 __pycache__/
 .venv/
+
+# Jujutsu state directory
+.jj/
+
+# Local scratch scripts and temporary outputs
+scratch/

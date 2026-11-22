@@ -10,3 +10,16 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+
+  # Keeps Cargo workspace dependencies and Cargo.lock current with a supply-chain cooldown.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-compatible:
+        update-types:
+          - minor
+          - patch
