@@ -272,17 +272,42 @@ jobs:
     environment: crates-io
     permissions:
       contents: read
-      id-token: write
+      id-token: write # crates.io trusted publishing (OIDC)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Check whether version is already published on crates.io
+        id: check
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, tomllib, urllib.error, urllib.parse, urllib.request
+          version = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]
+          url = f"https://crates.io/api/v1/crates/adfontes/{urllib.parse.quote(version, safe='')}"
+          req = urllib.request.Request(url, headers={"User-Agent": "adfontes-release (https://github.com/Kajiih/adfontes)"})
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  if resp.status != 200:
+                      raise SystemExit(f"Unexpected crates.io HTTP status {resp.status} for adfontes@{version}")
+                  already_published = True
+          except urllib.error.HTTPError as err:
+              if err.code != 404:
+                  raise SystemExit(f"Unexpected crates.io HTTP status {err.code} for adfontes@{version}") from err
+              already_published = False
+          if already_published:
+              print(f"adfontes@{version} already exists on crates.io; skipping publish")
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as out:
+              out.write(f"skip={'true' if already_published else 'false'}\n")
+          PY
+      - if: steps.check.outputs.skip != 'true'
+        run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Authenticate with crates.io (OIDC)
+        if: steps.check.outputs.skip != 'true'
         id: auth
-        continue-on-error: true
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
       - name: Publish to crates.io
+        if: steps.check.outputs.skip != 'true'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked
