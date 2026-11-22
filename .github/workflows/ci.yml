@@ -61,7 +61,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo doc --workspace --no-deps --locked
       - run: cargo doc --workspace --no-deps --document-private-items --locked
-      - run: uvx --from 'omnicoach>=0.5,<0.6' omnicoach code
+      - run: uvx omnicoach code
       - run: cargo publish --dry-run --locked
 
   wheel:
