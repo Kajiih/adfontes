@@ -2,28 +2,22 @@
 //!
 //! Eliminates external C++ `poppler` requirements while ensuring sliced PDFs materialize
 //! ancestor-inherited `/Pages` attributes (`Resources`, `MediaBox`, `CropBox`, `Rotate`), build a
-//! fresh spec-clean flat `/Pages` tree without `lopdf::Document::delete_pages` $O(P \times V^2)$
-//! hazards, strip cross-page `Catalog`/`Page`/trailer keys, and enforce cumulative decompression
-//! budgets during both loading and indexing.
+//! fresh spec-clean flat `/Pages` tree without `lopdf::Document::delete_pages` `/Parent`-cycle
+//! hangs or empty intermediate `/Pages` nodes, strip cross-page `Catalog`/`Page`/trailer keys, and
+//! enforce cumulative decompression budgets during both loading and indexing.
 
 architecture_component!(Pdf);
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::io::Read;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use lopdf::{
     DecompressError, Dictionary, Document, Error as LopdfError, LoadOptions, Object, ObjectId,
     decode_text_string,
 };
 
-use crate::model::{AdfontesError, PageSpan, PdfIndex, PdfPageSummary};
+use crate::model::{AdfontesError, PageSpan, PdfIndex, PdfPageSummary, truncate_chars};
 
 const PDF_FORMAT_LABEL: &str = "PDF";
 const KEY_FIRST: &[u8] = b"First";
@@ -33,9 +27,7 @@ const MAX_PDF_LOAD_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PDF_PAGE_DECOMPRESSED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PDF_CMAP_BYTES: usize = 1024 * 1024;
-const MAX_PURE_RUST_INDEXED_PAGES: usize = 250;
-const MAX_PDFTOTEXT_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
-const PDFTOTEXT_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_INDEXED_PDF_PAGES: usize = 250;
 const MAX_PARENT_TREE_DEPTH: usize = 64;
 const MAX_OUTLINE_ITEMS: usize = 200;
 const MAX_OUTLINE_DEPTH: usize = 8;
@@ -98,32 +90,25 @@ pub fn is_pdf_magic(bytes: &[u8]) -> bool {
 
 /// Indexes a PDF's page count, nested outline bookmarks, and bounded per-page text hints.
 ///
-/// When `pdf_path_for_pdftotext` is supplied and `pdftotext` is present on `PATH`, layout-aware
-/// text hints are enriched automatically (with a `15 s` deadline, `16 MiB` output cap, and strict
-/// page-count alignment check); otherwise pure-Rust `lopdf` generates bounded page summaries with
-/// zero external binaries.
+/// Uses pure-Rust `lopdf` under strict decompression and font-CMap byte budgets without spawning
+/// external binaries.
 ///
 /// # Errors
 ///
 /// Returns [`AdfontesError::SafetyBlock`] if a PDF decompression bomb exceeds memory budgets, or
 /// [`AdfontesError::Extraction`] if `bytes` is not a readable PDF or requires a user password.
-pub fn index_pdf_bytes(
-    bytes: &[u8],
-    pdf_path_for_pdftotext: Option<&Path>,
-) -> Result<PdfIndex, AdfontesError> {
+pub fn index_pdf_bytes(bytes: &[u8]) -> Result<PdfIndex, AdfontesError> {
     let mut doc = load_decrypted_pdf(bytes)?;
     let page_ids = doc.get_pages();
     let page_count = u32::try_from(page_ids.len()).unwrap_or(u32::MAX);
     let outline_titles = extract_outline_titles(&doc);
 
-    // Enforce pure-Rust page and font CMap decompression bounds BEFORE spawning any external
-    // `pdftotext` helper so malicious PDF bombs fail closed without touching poppler.
-    let mut pure_rust_texts = Vec::with_capacity(page_ids.len());
     let mut remaining_decompressed = MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES;
     let mut cmap_sizes: BTreeMap<ObjectId, usize> = BTreeMap::new();
+    let mut pages = Vec::with_capacity(page_ids.len());
 
     for (index, (&page_number, &page_id)) in page_ids.iter().enumerate() {
-        let page_text = if index >= MAX_PURE_RUST_INDEXED_PAGES {
+        let page_text = if index >= MAX_INDEXED_PDF_PAGES {
             String::new()
         } else {
             extract_bounded_page_text(
@@ -134,23 +119,6 @@ pub fn index_pdf_bytes(
                 &mut cmap_sizes,
             )?
         };
-        pure_rust_texts.push(page_text);
-    }
-
-    let aligned_pdftotext = pdf_path_for_pdftotext
-        .map(try_pdftotext_pages)
-        .filter(|pages| pages.len() == page_ids.len());
-
-    let mut pages = Vec::with_capacity(page_ids.len());
-    for (index, (&page_number, _)) in page_ids.iter().enumerate() {
-        let page_text = aligned_pdftotext
-            .as_ref()
-            .and_then(|external_pages| external_pages.get(index))
-            .map_or_else(
-                || pure_rust_texts.get(index).cloned().unwrap_or_default(),
-                String::clone,
-            );
-
         let Some(page_nz) = NonZeroU32::new(page_number) else {
             continue;
         };
@@ -167,9 +135,9 @@ pub fn index_pdf_bytes(
 /// Losslessly slices an inclusive [`PageSpan`] (`1..=8` pages) into a self-contained PDF.
 ///
 /// Materializes inherited `/Pages` attributes (`Resources`, `MediaBox`, `CropBox`, `Rotate`) onto
-/// each retained `/Page`, wires them into a fresh flat `/Pages` root (preventing `/Parent` cycle
-/// hangs, $O(P \times V^2)$ `delete_pages` stalls, and empty intermediate `/Pages` nodes), strips
-/// cross-page `Catalog`/page/trailer state, prunes unreachable objects in $O(V)$, and serializes.
+/// each retained `/Page`, wires them into a fresh flat `/Pages` root (avoiding
+/// `lopdf::Document::delete_pages` `/Parent`-cycle hangs and empty intermediate `/Pages` nodes),
+/// strips cross-page `Catalog`/page/trailer state, prunes unreachable objects, and serializes.
 ///
 /// # Errors
 ///
@@ -224,7 +192,7 @@ pub fn slice_pdf_bytes(raw_bytes: &[u8], span: PageSpan) -> Result<SlicedPdf, Ad
     doc.bookmarks.clear();
     doc.bookmark_table.clear();
 
-    prune_unreachable_objects_linear(&mut doc);
+    let _ = doc.prune_objects();
     doc.renumber_objects();
 
     let mut out_bytes = Vec::new();
@@ -505,63 +473,6 @@ fn strip_cross_page_page_keys(doc: &mut Document, page_id: ObjectId) {
     }
 }
 
-fn prune_unreachable_objects_linear(doc: &mut Document) {
-    let mut reachable = HashSet::new();
-    let mut queue = VecDeque::new();
-    enqueue_dict_refs(&doc.trailer, &mut reachable, &mut queue);
-
-    while let Some(obj_id) = queue.pop_front() {
-        if let Some(obj) = doc.objects.get(&obj_id) {
-            enqueue_object_refs(obj, &mut reachable, &mut queue);
-        }
-    }
-
-    doc.objects.retain(|id, _| reachable.contains(id));
-}
-
-fn enqueue_dict_refs(
-    dict: &Dictionary,
-    reachable: &mut HashSet<ObjectId>,
-    queue: &mut VecDeque<ObjectId>,
-) {
-    for (_, value) in dict {
-        enqueue_object_refs(value, reachable, queue);
-    }
-}
-
-fn enqueue_object_refs(
-    root: &Object,
-    reachable: &mut HashSet<ObjectId>,
-    queue: &mut VecDeque<ObjectId>,
-) {
-    let mut stack: Vec<&Object> = vec![root];
-    while let Some(obj) = stack.pop() {
-        match obj {
-            Object::Reference(id) => {
-                if reachable.insert(*id) {
-                    queue.push_back(*id);
-                }
-            }
-            Object::Array(items) => {
-                for item in items {
-                    stack.push(item);
-                }
-            }
-            Object::Dictionary(dict) => {
-                for (_, val) in dict {
-                    stack.push(val);
-                }
-            }
-            Object::Stream(stream) => {
-                for (_, val) in &stream.dict {
-                    stack.push(val);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 fn extract_outline_titles(doc: &Document) -> Vec<String> {
     let Ok(catalog) = doc.catalog() else {
         return Vec::new();
@@ -623,67 +534,6 @@ fn resolve_dictionary<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dict
         Object::Reference(id) => doc.get_dictionary(*id).ok(),
         _ => None,
     }
-}
-
-fn try_pdftotext_pages(path: &Path) -> Vec<String> {
-    let safe_path: PathBuf =
-        if !path.is_absolute() && path.as_os_str().as_encoded_bytes().starts_with(b"-") {
-            Path::new(".").join(path)
-        } else {
-            path.to_path_buf()
-        };
-
-    let Ok(mut child) = Command::new("pdftotext")
-        .arg("-layout")
-        .arg(&safe_path)
-        .arg("-")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return Vec::new();
-    };
-
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Vec::new();
-    };
-
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut buf = Vec::new();
-        let ok = stdout
-            .take(MAX_PDFTOTEXT_OUTPUT_BYTES + 1)
-            .read_to_end(&mut buf)
-            .is_ok();
-        let _ = tx.send((ok, buf));
-    });
-
-    let Ok((read_ok, raw_stdout)) = rx.recv_timeout(PDFTOTEXT_TIMEOUT) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Vec::new();
-    };
-
-    if raw_stdout.len() as u64 > MAX_PDFTOTEXT_OUTPUT_BYTES {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Vec::new();
-    }
-    let Ok(status) = child.wait() else {
-        return Vec::new();
-    };
-    if !read_ok || !status.success() {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&raw_stdout);
-    let mut pages: Vec<String> = text.split('\x0c').map(str::to_owned).collect();
-    if pages.last().is_some_and(|tail| tail.trim().is_empty()) {
-        let _ = pages.pop();
-    }
-    pages
 }
 
 fn summarize_page_text(page_number: NonZeroU32, text: &str) -> PdfPageSummary {
@@ -761,20 +611,10 @@ fn starts_like_numbered_heading(line: &str) -> bool {
     valid_number && starts_capitalized
 }
 
-fn truncate_chars(input: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (count, character) in input.chars().enumerate() {
-        if count >= max_chars {
-            out.push('…');
-            break;
-        }
-        out.push(character);
-    }
-    out
-}
-
+/// Builds a synthetic multi-page PDF with `page_texts` for cross-module tests.
 #[cfg(test)]
-pub(crate) fn build_test_pdf(page_texts: &[&str]) -> Vec<u8> {
+#[must_use]
+pub fn build_test_pdf(page_texts: &[&str]) -> Vec<u8> {
     tests::build_inherited_multipage_pdf(page_texts)
 }
 
@@ -904,7 +744,7 @@ mod tests {
             "2 Methods and derivations",
             "3 Results summary",
         ]);
-        let index = index_pdf_bytes(&pdf_bytes, None).unwrap();
+        let index = index_pdf_bytes(&pdf_bytes).unwrap();
         assert_eq!(index.page_count, 3);
         assert_eq!(index.outline_titles, vec!["1 Introduction", "1.1 Résumé"]);
         assert!(index.pages[1].preview.contains("2 Methods"));
@@ -1039,7 +879,7 @@ mod tests {
     #[test]
     fn rejects_non_pdf_bytes() {
         assert!(matches!(
-            index_pdf_bytes(b"<html>not a pdf</html>", None).unwrap_err(),
+            index_pdf_bytes(b"<html>not a pdf</html>").unwrap_err(),
             AdfontesError::Extraction { .. }
         ));
     }
@@ -1068,7 +908,7 @@ mod tests {
         doc.save_to(&mut bytes).unwrap();
 
         assert!(matches!(
-            index_pdf_bytes(&bytes, None).unwrap_err(),
+            index_pdf_bytes(&bytes).unwrap_err(),
             AdfontesError::Extraction { .. }
         ));
     }
@@ -1104,7 +944,7 @@ mod tests {
         doc.save_to(&mut bytes).unwrap();
 
         assert!(matches!(
-            index_pdf_bytes(&bytes, None).unwrap_err(),
+            index_pdf_bytes(&bytes).unwrap_err(),
             AdfontesError::SafetyBlock { .. }
         ));
     }
@@ -1154,7 +994,7 @@ mod tests {
         doc.save_to(&mut bytes).unwrap();
 
         assert!(matches!(
-            index_pdf_bytes(&bytes, None).unwrap_err(),
+            index_pdf_bytes(&bytes).unwrap_err(),
             AdfontesError::SafetyBlock { .. }
         ));
     }
@@ -1206,7 +1046,7 @@ mod tests {
         doc.save_to(&mut bytes).unwrap();
 
         assert!(matches!(
-            index_pdf_bytes(&bytes, None).unwrap_err(),
+            index_pdf_bytes(&bytes).unwrap_err(),
             AdfontesError::SafetyBlock { .. }
         ));
     }

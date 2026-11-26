@@ -29,7 +29,7 @@ use rustix::fs::{CWD, Mode, OFlags, fchmod, mkdirat, openat};
 #[cfg(unix)]
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
-use tempfile::{Builder as TempFileBuilder, NamedTempFile};
+use tempfile::Builder as TempFileBuilder;
 
 use crate::extract::{extract_markdown_toc, sanitize_inline_text};
 use crate::model::{
@@ -194,12 +194,11 @@ pub fn stage_document(
             }
         }
         ExtractedPayload::Pdf { bytes } => {
+            // Validate and index PDF bytes in memory before writing PDF or index files to disk so
+            // corrupt, encrypted, or bomb PDFs never touch the staging directory.
+            let pdf_index = index_pdf_bytes(&bytes)?;
             let staged_pdf_path = staging_dir.join(format!("{slug}.pdf"));
-            // Write into an owner-only temp file first so corrupt, encrypted, or bomb PDFs
-            // rejected by `index_pdf_bytes` never persist on disk (NamedTempFile cleans up on drop).
-            let temp_pdf = create_staged_temp_file(&staging_dir, &bytes)?;
-            let pdf_index = index_pdf_bytes(&bytes, Some(temp_pdf.path()))?;
-            persist_staged_temp_file(temp_pdf, &staged_pdf_path)?;
+            write_file_atomic(&staged_pdf_path, &bytes)?;
             let page_index_path = if include_pdf_index {
                 let index_path = staging_dir.join(format!("{slug}.pages.md"));
                 let page_doc = format_pdf_page_index_document(&doc.metadata, &pdf_index);
@@ -2229,11 +2228,6 @@ fn write_file_atomic(destination: &Path, bytes: &[u8]) -> Result<(), AdfontesErr
                 destination.display()
             ),
         })?;
-    let temp = create_staged_temp_file(parent, bytes)?;
-    persist_staged_temp_file(temp, destination)
-}
-
-fn create_staged_temp_file(parent: &Path, bytes: &[u8]) -> Result<NamedTempFile, AdfontesError> {
     let mut temp = TempFileBuilder::new()
         .prefix(".adfontes-tmp-")
         .tempfile_in(parent)
@@ -2261,10 +2255,6 @@ fn create_staged_temp_file(parent: &Path, bytes: &[u8]) -> Result<NamedTempFile,
             context: format!("syncing temp file in `{}`", parent.display()),
             source,
         })?;
-    Ok(temp)
-}
-
-fn persist_staged_temp_file(temp: NamedTempFile, destination: &Path) -> Result<(), AdfontesError> {
     temp.persist(destination)
         .map_err(|persist_error| AdfontesError::Io {
             context: format!("persisting `{}`", destination.display()),
