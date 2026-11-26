@@ -1,7 +1,10 @@
-//! Architectural component catalog and Directed Acyclic Graph (DAG) specification.
+//! Architectural component catalog and Directed Acyclic Graph (DAG) contract.
 //!
-//! Defines [`ArchitectureComponent`] and compile-time topological acyclicity assertions for
-//! [`crate::architecture_component!`] declarations across the crate.
+//! Defines [`ArchitectureComponent`] and compile-time topological acyclicity assertions across
+//! the declared catalog. `tests/architecture_conformance.rs` verifies root declarations,
+//! top-level module parity, the narrowed `pub` surface of `src/lib.rs`, and the
+//! `crates/adfontes-py` -> `adfontes::cli` boundary, while intra-crate component edges and
+//! external crate ownership document the structural contract checked via `omnicoach graph`.
 
 architecture_component!(Architecture);
 

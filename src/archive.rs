@@ -290,7 +290,7 @@ fn sanitize_tar_entry_path(path_text: &str) -> Result<String, AdfontesError> {
 }
 
 #[cfg(test)]
-pub(crate) fn test_gzip_bytes(input: &[u8]) -> Vec<u8> {
+pub fn test_gzip_bytes(input: &[u8]) -> Vec<u8> {
     use std::io::Write;
 
     use flate2::Compression;
@@ -302,7 +302,7 @@ pub(crate) fn test_gzip_bytes(input: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-pub(crate) fn test_zlib_bytes(input: &[u8]) -> Vec<u8> {
+pub fn test_zlib_bytes(input: &[u8]) -> Vec<u8> {
     use std::io::Write;
 
     use flate2::Compression;

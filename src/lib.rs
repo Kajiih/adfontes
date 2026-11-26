@@ -17,13 +17,14 @@ macro_rules! architecture_component {
     };
 }
 
+#[doc(hidden)]
 pub mod architecture;
-pub mod archive;
+pub(crate) mod archive;
 pub mod cli;
-pub mod extract;
-pub mod mcp;
-pub mod model;
-pub mod pdf;
-pub mod resolve;
-pub mod stage;
-pub mod transport;
+pub(crate) mod extract;
+pub(crate) mod mcp;
+pub(crate) mod model;
+pub(crate) mod pdf;
+pub(crate) mod resolve;
+pub(crate) mod stage;
+pub(crate) mod transport;
