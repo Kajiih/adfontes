@@ -7,16 +7,16 @@
 
 architecture_component!(Resolve);
 
-use std::collections::{BTreeMap, BTreeSet};
+mod providers;
+
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
-
+use self::providers::{JsonDoc, OaCandidates};
 use crate::extract::{
-    JatsExtraction, XmlDocumentExtraction, clean_html_fragment, clean_rfc_text,
-    extract_arxiv_source_archive, extract_html_to_markdown, extract_jats_xml, extract_markdown_toc,
-    extract_rfc_xml, extract_text_title, extract_xml_document, normalize_markdown_spacing,
-    parse_arxiv_atom_feed, sanitize_inline_text,
+    JatsExtraction, XmlDocumentExtraction, clean_rfc_text, extract_arxiv_source_archive,
+    extract_html_to_markdown, extract_jats_xml, extract_markdown_toc, extract_rfc_xml,
+    extract_text_title, extract_xml_document, normalize_markdown_spacing, parse_arxiv_atom_feed,
 };
 use crate::model::{
     AdfontesError, ArxivId, Doi, ExtractedDocument, ExtractedPayload, HttpUrl, ParsedTarget, PmcId,
@@ -35,11 +35,6 @@ const ACCEPT_WEB_PREFERRED: &str =
 const MIME_PLAIN_TEXT: &str = "text/plain";
 const PDF_MAGIC_PREFIX: &[u8] = b"%PDF-";
 
-const JSON_FIELD_TITLE: &str = "title";
-const JSON_FIELD_ABSTRACT: &str = "abstract";
-const JSON_FIELD_BEST_OA_LOCATION: &str = "best_oa_location";
-const JSON_FIELD_IS_OA: &str = "is_oa";
-
 const HTTP_OK: u16 = 200;
 const MAX_RECLASSIFICATION_DEPTH: u8 = 3;
 const MAX_WATERFALL_HTTP_REQUESTS: usize = 24;
@@ -51,12 +46,9 @@ const MIN_OA_PAYWALL_OVERRIDE_CHARS: usize = 6_000;
 const MIN_OA_BODY_HEADINGS: usize = 2;
 const MIN_OA_PAYWALL_OVERRIDE_HEADINGS: usize = 3;
 const MAX_ARXIV_STUB_CHECK_LEN: usize = 2_500;
-const MAX_INVERTED_ABSTRACT_WORDS: usize = 4_000;
-const MAX_INVERTED_ABSTRACT_ELEMENTS: usize = MAX_INVERTED_ABSTRACT_WORDS * 4;
 const MAX_OA_CANDIDATES: usize = 6;
 const MAX_EMAIL_LOCAL_LEN: usize = 64;
 const MAX_EMAIL_TOTAL_LEN: usize = 254;
-const YEAR_PREFIX_LEN: usize = 4;
 
 const PLACEHOLDER_EMAIL_DOMAINS: &[&str] =
     &["example.com", "example.org", "example.net", "test.com"];
@@ -565,24 +557,22 @@ fn resolve_pmid(
     };
     let mut oa_pdf_urls = Vec::new();
 
-    let Some(search_json) = fetch_optional_json(&search_url, ACCEPT_JSON, budget)? else {
+    let Some(search_doc) = fetch_optional_json(&search_url, ACCEPT_JSON, budget)? else {
         return Err(AdfontesError::Transport {
             url: search_url.as_str().to_owned(),
             detail: budget.append_last_transport_error("Europe PMC PMID lookup failed"),
         });
     };
-    let Some(record) = first_europe_pmc_record(&search_json) else {
+    let Some(ids) = search_doc.extract_europe_pmc_record(&mut metadata, &mut oa_pdf_urls) else {
         return Err(AdfontesError::Transport {
             url: search_url.as_str().to_owned(),
             detail: format!("PMID {} not found in Europe PMC", pmid.as_str()),
         });
     };
-    merge_europe_pmc_record(record, &mut metadata, &mut oa_pdf_urls);
 
     let mut saw_body_restricted = false;
 
-    if let Some(raw_pmcid) = record.get("pmcid").and_then(Value::as_str)
-        && let Ok(pmcid) = PmcId::parse(raw_pmcid)
+    if let Some(pmcid) = ids.pmcid
         && visited.insert(target_visit_key(&ParsedTarget::PmcId(pmcid.clone())))
     {
         match resolve_pmcid(&pmcid, budget, config) {
@@ -600,9 +590,7 @@ fn resolve_pmid(
 
     if depth < MAX_RECLASSIFICATION_DEPTH
         && !budget.is_exhausted()
-        && let Some(raw_doi) = record.get("doi").and_then(Value::as_str)
-        && let Ok(parsed_target) = ParsedTarget::parse(raw_doi)
-        && !matches!(parsed_target, ParsedTarget::Url(_))
+        && let Some(parsed_target) = ids.follow_up_target
         && !visited.contains(&target_visit_key(&parsed_target))
     {
         match resolve_target_inner(&parsed_target, budget, config, depth + 1, visited) {
@@ -656,14 +644,14 @@ fn resolve_doi(
     // 1. CSL-JSON content negotiation via `doi.org`.
     let mut metadata_found = fetch_optional_json(&doi_canonical_url, ACCEPT_CSL_JSON, budget)?
         .is_some_and(|csl_json| {
-            merge_csl_metadata(&csl_json, &mut metadata);
+            csl_json.merge_csl_work(&mut metadata);
             true
         });
 
     // 2. OpenAlex work record (authors, venue, inverted-index abstract, PMCID, OA locations).
     let openalex_url = build_openalex_doi_url(config, &encoded_doi)?;
     if let Some(oa_json) = fetch_optional_json(&openalex_url, ACCEPT_JSON, budget)? {
-        merge_openalex_metadata(&oa_json, &mut metadata, &mut oa_candidates);
+        oa_json.merge_openalex_work(&mut metadata, &mut oa_candidates);
         metadata_found = true;
     }
 
@@ -675,7 +663,7 @@ fn resolve_doi(
         ))?
         .with_query_pairs([("email", email)]);
         if let Some(upw_json) = fetch_optional_json(&unpaywall_url, ACCEPT_JSON, budget)? {
-            merge_unpaywall_metadata(&upw_json, &mut metadata, &mut oa_candidates);
+            upw_json.merge_unpaywall_work(&mut metadata, &mut oa_candidates);
             metadata_found = true;
         }
     }
@@ -683,7 +671,7 @@ fn resolve_doi(
     let mut saw_body_restricted = false;
 
     // 4. Structured full-text preference: discovered PMCID -> Europe PMC JATS XML.
-    if let Some(ref pmcid) = oa_candidates.pmcid
+    if let Some(pmcid) = oa_candidates.pmcid()
         && visited.insert(target_visit_key(&ParsedTarget::PmcId(pmcid.clone())))
     {
         match resolve_pmcid(pmcid, budget, config) {
@@ -744,7 +732,7 @@ fn try_oa_candidates(
     // 1. Prefer OA landing links that point directly to arXiv or PMC structured repositories.
     if depth < MAX_RECLASSIFICATION_DEPTH {
         let mut attempted_targets = 0usize;
-        for landing in &candidates.landing_urls {
+        for landing in candidates.landing_urls() {
             if attempted_targets >= MAX_OA_CANDIDATES || budget.is_exhausted() {
                 break;
             }
@@ -772,13 +760,13 @@ fn try_oa_candidates(
     }
 
     // 2. Try OA PDF URLs while verifying real PDF MIME/magic (rejecting HTML paywall pages).
-    if let Some(pdf_doc) = try_oa_pdf_urls(&candidates.pdf_urls, metadata, budget)? {
+    if let Some(pdf_doc) = try_oa_pdf_urls(candidates.pdf_urls(), metadata, budget)? {
         return Ok(Some(pdf_doc));
     }
 
     // 3. Try OA landing pages only when they yield PDF, Markdown, or substantive non-paywall HTML.
     try_oa_landing_pages(
-        &candidates.landing_urls,
+        candidates.landing_urls(),
         metadata,
         budget,
         config,
@@ -901,15 +889,12 @@ fn resolve_pmcid(
     };
     let mut oa_pdf_urls = Vec::new();
 
-    let mut saw_metadata = if let Some(search_json) =
-        fetch_optional_json(&search_url, ACCEPT_JSON, budget)?
-        && let Some(record) = first_europe_pmc_record(&search_json)
-    {
-        merge_europe_pmc_record(record, &mut metadata, &mut oa_pdf_urls);
-        true
-    } else {
-        false
-    };
+    let mut saw_metadata =
+        fetch_optional_json(&search_url, ACCEPT_JSON, budget)?.is_some_and(|search_json| {
+            search_json
+                .extract_europe_pmc_record(&mut metadata, &mut oa_pdf_urls)
+                .is_some()
+        });
 
     let xml_url = HttpUrl::parse(&format!(
         "{base}/webservices/rest/{}/fullTextXML",
@@ -1026,7 +1011,7 @@ fn resolve_rfc(
     ))?;
     let saw_metadata =
         fetch_optional_json(&tracker_url, ACCEPT_JSON, budget)?.is_some_and(|doc_json| {
-            merge_ietf_datatracker_metadata(&doc_json, &mut metadata);
+            doc_json.merge_ietf_doc(&mut metadata);
             true
         });
 
@@ -1336,9 +1321,9 @@ fn fetch_optional_json(
     url: &HttpUrl,
     accept: &str,
     budget: &mut ResolveBudget<'_>,
-) -> Result<Option<Value>, AdfontesError> {
+) -> Result<Option<JsonDoc>, AdfontesError> {
     match budget.get(url, Some(accept)) {
-        Ok(resp) if resp.status == HTTP_OK => Ok(serde_json::from_slice::<Value>(&resp.body).ok()),
+        Ok(resp) if resp.status == HTTP_OK => Ok(JsonDoc::parse(&resp.body)),
         Err(safety @ AdfontesError::SafetyBlock { .. }) => Err(safety),
         Ok(_) | Err(_) => Ok(None),
     }
@@ -1351,396 +1336,6 @@ fn build_openalex_doi_url(
     let base = config.endpoints.openalex.trim_end_matches('/');
     let url = HttpUrl::parse(&format!("{base}/works/https://doi.org/{encoded_doi}"))?;
     Ok(url.with_query_pairs(config.usable_contact_email().map(|email| ("mailto", email))))
-}
-
-fn merge_csl_metadata(json: &Value, metadata: &mut WorkMetadata) {
-    if metadata.title.is_none() {
-        metadata.title = json
-            .get(JSON_FIELD_TITLE)
-            .and_then(Value::as_str)
-            .map(sanitize_inline_text)
-            .filter(|val| !val.is_empty());
-    }
-    if metadata.authors.is_empty()
-        && let Some(authors) = json.get("author").and_then(Value::as_array)
-    {
-        for author in authors {
-            if let Some(name) = extract_given_family_name(author) {
-                metadata.authors.push(name);
-            }
-        }
-    }
-    if metadata.year.is_none() {
-        metadata.year = json
-            .pointer("/issued/date-parts/0/0")
-            .and_then(parse_json_year)
-            .or_else(|| {
-                json.pointer("/published-print/date-parts/0/0")
-                    .and_then(parse_json_year)
-            })
-            .or_else(|| {
-                json.pointer("/published-online/date-parts/0/0")
-                    .and_then(parse_json_year)
-            });
-    }
-    if metadata.venue_or_source.is_none() {
-        metadata.venue_or_source = json
-            .get("container-title")
-            .and_then(|val| {
-                val.as_str().or_else(|| {
-                    val.as_array()
-                        .and_then(|items| items.first())
-                        .and_then(Value::as_str)
-                })
-            })
-            .map(sanitize_inline_text)
-            .filter(|val| !val.is_empty());
-    }
-    if metadata.abstract_text.is_none() {
-        metadata.abstract_text = json
-            .get(JSON_FIELD_ABSTRACT)
-            .and_then(Value::as_str)
-            .map(clean_html_fragment)
-            .filter(|val| !val.is_empty());
-    }
-}
-
-#[derive(Default)]
-struct OaCandidates {
-    pmcid: Option<PmcId>,
-    pdf_urls: Vec<HttpUrl>,
-    landing_urls: Vec<HttpUrl>,
-    seen: BTreeSet<String>,
-}
-
-impl OaCandidates {
-    fn push_pdf(&mut self, raw: &str) {
-        if let Ok(parsed) = HttpUrl::parse(raw)
-            && self.seen.insert(parsed.as_str().to_owned())
-        {
-            self.pdf_urls.push(parsed);
-        }
-    }
-
-    fn push_landing(&mut self, raw: &str) {
-        if let Ok(parsed) = HttpUrl::parse(raw)
-            && self.seen.insert(parsed.as_str().to_owned())
-        {
-            self.landing_urls.push(parsed);
-        }
-    }
-}
-
-fn merge_openalex_metadata(
-    json: &Value,
-    metadata: &mut WorkMetadata,
-    candidates: &mut OaCandidates,
-) {
-    if metadata.title.is_none() {
-        metadata.title = json
-            .get(JSON_FIELD_TITLE)
-            .and_then(Value::as_str)
-            .map(sanitize_inline_text)
-            .filter(|val| !val.is_empty());
-    }
-    if metadata.authors.is_empty()
-        && let Some(authorships) = json.get("authorships").and_then(Value::as_array)
-    {
-        for entry in authorships {
-            if let Some(name) = entry
-                .pointer("/author/display_name")
-                .and_then(Value::as_str)
-                .map(sanitize_inline_text)
-                .filter(|val| !val.is_empty())
-            {
-                metadata.authors.push(name);
-            }
-        }
-    }
-    if metadata.year.is_none() {
-        metadata.year = json.get("publication_year").and_then(parse_json_year);
-    }
-    if metadata.venue_or_source.is_none() {
-        metadata.venue_or_source = json
-            .pointer("/primary_location/source/display_name")
-            .and_then(Value::as_str)
-            .map(sanitize_inline_text)
-            .filter(|val| !val.is_empty());
-    }
-    if metadata.abstract_text.is_none()
-        && let Some(inverted) = json.get("abstract_inverted_index")
-    {
-        metadata.abstract_text = decode_openalex_inverted_abstract(inverted);
-    }
-    if candidates.pmcid.is_none()
-        && let Some(raw_pmc) = json.pointer("/ids/pmcid").and_then(Value::as_str)
-    {
-        candidates.pmcid = extract_pmcid_from_value(raw_pmc);
-    }
-
-    if let Some(best) = json.get(JSON_FIELD_BEST_OA_LOCATION)
-        && best.get(JSON_FIELD_IS_OA).and_then(Value::as_bool) != Some(false)
-    {
-        collect_openalex_location(best, candidates);
-    }
-    if let Some(locations) = json.get("locations").and_then(Value::as_array) {
-        for loc in locations {
-            if loc.get(JSON_FIELD_IS_OA).and_then(Value::as_bool) == Some(true) {
-                collect_openalex_location(loc, candidates);
-            }
-        }
-    }
-}
-
-fn collect_openalex_location(location: &Value, candidates: &mut OaCandidates) {
-    if let Some(pdf_url) = location.get("pdf_url").and_then(Value::as_str) {
-        candidates.push_pdf(pdf_url);
-    }
-    if let Some(landing_url) = location.get("landing_page_url").and_then(Value::as_str) {
-        candidates.push_landing(landing_url);
-    }
-}
-
-fn merge_unpaywall_metadata(
-    json: &Value,
-    metadata: &mut WorkMetadata,
-    candidates: &mut OaCandidates,
-) {
-    if metadata.title.is_none() {
-        metadata.title = json
-            .get(JSON_FIELD_TITLE)
-            .and_then(Value::as_str)
-            .map(sanitize_inline_text)
-            .filter(|val| !val.is_empty());
-    }
-    if metadata.authors.is_empty()
-        && let Some(authors) = json.get("z_authors").and_then(Value::as_array)
-    {
-        for author in authors {
-            if let Some(name) = extract_given_family_name(author) {
-                metadata.authors.push(name);
-            }
-        }
-    }
-    if metadata.year.is_none() {
-        metadata.year = json.get("year").and_then(parse_json_year);
-    }
-    if metadata.venue_or_source.is_none() {
-        metadata.venue_or_source = json
-            .get("journal_name")
-            .and_then(Value::as_str)
-            .map(sanitize_inline_text)
-            .filter(|val| !val.is_empty());
-    }
-    if json.get(JSON_FIELD_IS_OA).and_then(Value::as_bool) == Some(false) {
-        return;
-    }
-    if let Some(best) = json.get(JSON_FIELD_BEST_OA_LOCATION)
-        && best.get(JSON_FIELD_IS_OA).and_then(Value::as_bool) != Some(false)
-    {
-        collect_unpaywall_location(best, candidates);
-    }
-    if let Some(locations) = json.get("oa_locations").and_then(Value::as_array) {
-        for loc in locations {
-            if loc.get(JSON_FIELD_IS_OA).and_then(Value::as_bool) != Some(false) {
-                collect_unpaywall_location(loc, candidates);
-            }
-        }
-    }
-}
-
-fn collect_unpaywall_location(location: &Value, candidates: &mut OaCandidates) {
-    if let Some(pdf_url) = location.get("url_for_pdf").and_then(Value::as_str) {
-        candidates.push_pdf(pdf_url);
-    }
-    if let Some(landing_url) = location.get("url_for_landing_page").and_then(Value::as_str) {
-        candidates.push_landing(landing_url);
-    }
-}
-
-fn decode_openalex_inverted_abstract(inverted: &Value) -> Option<String> {
-    let map = inverted.as_object()?;
-    let mut positioned: BTreeMap<usize, &str> = BTreeMap::new();
-    let mut scanned_elements = 0usize;
-    'outer: for (word, indices_val) in map {
-        let Some(indices) = indices_val.as_array() else {
-            continue;
-        };
-        for idx_val in indices {
-            scanned_elements += 1;
-            if scanned_elements > MAX_INVERTED_ABSTRACT_ELEMENTS {
-                break 'outer;
-            }
-            if let Some(pos) = idx_val.as_u64().and_then(|raw| usize::try_from(raw).ok())
-                && pos < MAX_INVERTED_ABSTRACT_WORDS
-            {
-                positioned.entry(pos).or_insert(word.as_str());
-            }
-        }
-    }
-    if positioned.is_empty() {
-        return None;
-    }
-    let joined: Vec<&str> = positioned.into_values().collect();
-    let cleaned = sanitize_inline_text(&joined.join(" "));
-    (!cleaned.is_empty()).then_some(cleaned)
-}
-
-fn first_europe_pmc_record(json: &Value) -> Option<&Value> {
-    json.pointer("/resultList/result/0")
-}
-
-fn merge_europe_pmc_record(
-    record: &Value,
-    metadata: &mut WorkMetadata,
-    oa_pdf_urls: &mut Vec<HttpUrl>,
-) {
-    if metadata.title.is_none() {
-        metadata.title = record
-            .get(JSON_FIELD_TITLE)
-            .and_then(Value::as_str)
-            .map(sanitize_inline_text)
-            .filter(|val| !val.is_empty());
-    }
-    if metadata.authors.is_empty() {
-        if let Some(authors) = record
-            .pointer("/authorList/author")
-            .and_then(Value::as_array)
-        {
-            for author in authors {
-                if let Some(name) = author
-                    .get("fullName")
-                    .and_then(Value::as_str)
-                    .map(sanitize_inline_text)
-                    .filter(|val| !val.is_empty())
-                {
-                    metadata.authors.push(name);
-                }
-            }
-        } else if let Some(authors_summary) = record.get("authorString").and_then(Value::as_str) {
-            for part in authors_summary.split(',') {
-                let cleaned = sanitize_inline_text(part.trim_end_matches('.'));
-                if !cleaned.is_empty() {
-                    metadata.authors.push(cleaned);
-                }
-            }
-        }
-    }
-    if metadata.year.is_none() {
-        metadata.year = record.get("pubYear").and_then(parse_json_year);
-    }
-    if let Some(journal) = record
-        .pointer("/journalInfo/journal/title")
-        .and_then(Value::as_str)
-        .or_else(|| record.get("journalTitle").and_then(Value::as_str))
-        .map(sanitize_inline_text)
-        .filter(|val| !val.is_empty())
-    {
-        metadata.venue_or_source = Some(journal);
-    }
-    if metadata.abstract_text.is_none() {
-        metadata.abstract_text = record
-            .get("abstractText")
-            .and_then(Value::as_str)
-            .map(clean_html_fragment)
-            .filter(|val| !val.is_empty());
-    }
-    if let Some(urls) = record
-        .pointer("/fullTextUrlList/fullTextUrl")
-        .and_then(Value::as_array)
-    {
-        for entry in urls {
-            let is_pdf = entry
-                .get("documentStyle")
-                .and_then(Value::as_str)
-                .is_some_and(|style| style.eq_ignore_ascii_case("pdf"));
-            let is_open = entry
-                .get("availabilityCode")
-                .and_then(Value::as_str)
-                .is_some_and(|code| {
-                    code.eq_ignore_ascii_case("oa") || code.eq_ignore_ascii_case("f")
-                });
-            if is_pdf
-                && is_open
-                && let Some(raw_url) = entry.get("url").and_then(Value::as_str)
-                && let Ok(parsed) = HttpUrl::parse(raw_url)
-            {
-                oa_pdf_urls.push(parsed);
-            }
-        }
-    }
-}
-
-fn merge_ietf_datatracker_metadata(json: &Value, metadata: &mut WorkMetadata) {
-    if metadata.title.is_none() {
-        metadata.title = json
-            .get(JSON_FIELD_TITLE)
-            .and_then(Value::as_str)
-            .map(sanitize_inline_text)
-            .filter(|val| !val.is_empty());
-    }
-    if metadata.authors.is_empty()
-        && let Some(authors) = json.get("authors").and_then(Value::as_array)
-    {
-        for author in authors {
-            if let Some(name) = author
-                .get("name")
-                .and_then(Value::as_str)
-                .map(sanitize_inline_text)
-                .filter(|val| !val.is_empty())
-            {
-                metadata.authors.push(name);
-            }
-        }
-    }
-    if metadata.year.is_none() {
-        metadata.year = json
-            .get("time")
-            .and_then(Value::as_str)
-            .and_then(|timestamp| timestamp.trim().get(..YEAR_PREFIX_LEN))
-            .and_then(|digits| digits.parse::<u16>().ok());
-    }
-    if metadata.abstract_text.is_none() {
-        metadata.abstract_text = json
-            .get(JSON_FIELD_ABSTRACT)
-            .and_then(Value::as_str)
-            .map(sanitize_inline_text)
-            .filter(|val| !val.is_empty());
-    }
-    if let Some(level) = json
-        .get("std_level")
-        .and_then(Value::as_str)
-        .map(sanitize_inline_text)
-        .filter(|val| !val.is_empty())
-    {
-        metadata.venue_or_source = Some(format!("IETF ({level})"));
-    }
-    append_ietf_relation_note(json, "obsoleted_by", "Obsoleted by", &mut metadata.notes);
-    append_ietf_relation_note(json, "updated_by", "Updated by", &mut metadata.notes);
-}
-
-fn append_ietf_relation_note(json: &Value, field: &str, label: &str, notes: &mut Vec<String>) {
-    let Some(items) = json.get(field).and_then(Value::as_array) else {
-        return;
-    };
-    let formatted: Vec<String> = items
-        .iter()
-        .filter_map(Value::as_str)
-        .map(format_ietf_doc_slug)
-        .filter(|val| !val.is_empty())
-        .collect();
-    if !formatted.is_empty() {
-        notes.push(format!("{label} {}", formatted.join(", ")));
-    }
-}
-
-fn format_ietf_doc_slug(raw: &str) -> String {
-    let trimmed = raw.trim().trim_end_matches('/');
-    let leaf = trimmed.rsplit('/').next().unwrap_or(trimmed);
-    if let Ok(rfc) = RfcNumber::parse(leaf) {
-        return rfc.to_string();
-    }
-    sanitize_inline_text(leaf)
 }
 
 fn merge_caller_priority_metadata(
@@ -1818,46 +1413,6 @@ fn is_generic_repository_venue(venue: &str) -> bool {
     GENERIC_REPOSITORY_VENUES
         .iter()
         .any(|generic| venue.eq_ignore_ascii_case(generic))
-}
-
-fn extract_given_family_name(author: &Value) -> Option<String> {
-    let given = author
-        .get("given")
-        .and_then(Value::as_str)
-        .map_or_default(sanitize_inline_text);
-    let family = author
-        .get("family")
-        .and_then(Value::as_str)
-        .map_or_default(sanitize_inline_text);
-    let literal = author
-        .get("literal")
-        .and_then(Value::as_str)
-        .map_or_default(sanitize_inline_text);
-    let name = if !given.is_empty() || !family.is_empty() {
-        format!("{given} {family}").trim().to_owned()
-    } else {
-        literal
-    };
-    (!name.is_empty()).then_some(name)
-}
-
-fn parse_json_year(value: &Value) -> Option<u16> {
-    if let Some(year_value) = value.as_u64() {
-        return u16::try_from(year_value).ok();
-    }
-    value
-        .as_str()
-        .and_then(|digits| digits.trim().get(..YEAR_PREFIX_LEN))
-        .and_then(|prefix| prefix.parse::<u16>().ok())
-}
-
-fn extract_pmcid_from_value(raw: &str) -> Option<PmcId> {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if let Ok(direct) = PmcId::parse(trimmed) {
-        return Some(direct);
-    }
-    let tail = trimmed.rsplit('/').next()?;
-    PmcId::parse(tail).ok()
 }
 
 fn target_visit_key(target: &ParsedTarget) -> String {
@@ -2618,19 +2173,6 @@ mod tests {
     }
 
     #[test]
-    fn openalex_inverted_abstract_deduplicates_positions_and_preserves_prefix_order() {
-        let inverted: Value = serde_json::json!({
-            "zebra": [0, 0, 0, 5000],
-            "alpha": [2],
-            "middle": [1],
-        });
-        assert_eq!(
-            decode_openalex_inverted_abstract(&inverted).as_deref(),
-            Some("zebra middle alpha")
-        );
-    }
-
-    #[test]
     fn doi_deduplicates_pmcid_and_preserves_body_restricted_status() {
         let xml_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let xml_hits_clone = Arc::clone(&xml_hits);
@@ -2787,31 +2329,6 @@ mod tests {
         assert_eq!(
             doc.metadata.title.as_deref(),
             Some("Unpaywall Routed Title")
-        );
-    }
-
-    #[test]
-    fn csl_and_europe_pmc_abstracts_preserve_decoded_math_inequalities() {
-        let mut csl_meta = WorkMetadata::default();
-        let csl_json = serde_json::json!({
-            "abstract": "<jats:p>Significance at <i>p</i> &lt; 0.05 and <b>n</b> &gt; 10.</jats:p>"
-        });
-        merge_csl_metadata(&csl_json, &mut csl_meta);
-
-        let mut epmc_meta = WorkMetadata::default();
-        let mut oa_pdfs = Vec::new();
-        let epmc_json = serde_json::json!({
-            "abstractText": "<p>First result.</p><p>Second &lt; 0.01.</p>"
-        });
-        merge_europe_pmc_record(&epmc_json, &mut epmc_meta, &mut oa_pdfs);
-
-        assert_eq!(
-            csl_meta.abstract_text.as_deref(),
-            Some("Significance at p < 0.05 and n > 10.")
-        );
-        assert_eq!(
-            epmc_meta.abstract_text.as_deref(),
-            Some("First result. Second < 0.01.")
         );
     }
 }

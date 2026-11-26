@@ -117,7 +117,9 @@ define_architecture! {
         tex   => [title],
     }),
     /// Keyless scholarly retrieval waterfalls and format dispatch (`resolve`).
-    Resolve      => [Extract, Pdf, Transport, Model],
+    Resolve      => [Extract, Pdf, Transport, Model] (modules: {
+        providers => [],
+    }),
     /// Confined filesystem staging, TOC/page indexing, PDF slicing, and compact manifests (`stage`).
     Stage        => [Extract, Pdf, Model] (owns_external: ["sha2", "tempfile", "rustix", "dunce"]) (modules: {
         manifest => [],
