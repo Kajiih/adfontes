@@ -7,6 +7,7 @@ name = "adfontes"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dunce",
  "encoding_rs",
  "flate2",
  "indoc",
@@ -422,6 +423,12 @@ checksum = "cd1511a7b6a56299bd043a9c167a6d2bfb37bf84a6dfceaba651168adfb43c87"
 dependencies = [
  "dtoa",
 ]
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "ecb"

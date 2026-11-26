@@ -119,7 +119,10 @@ define_architecture! {
     /// Keyless scholarly retrieval waterfalls and format dispatch (`resolve`).
     Resolve      => [Extract, Pdf, Transport, Model],
     /// Confined filesystem staging, TOC/page indexing, PDF slicing, and compact manifests (`stage`).
-    Stage        => [Extract, Pdf, Model] (owns_external: ["sha2", "tempfile", "rustix"]),
+    Stage        => [Extract, Pdf, Model] (owns_external: ["sha2", "tempfile", "rustix", "dunce"]) (modules: {
+        manifest => [],
+        sandbox  => [],
+    }),
     /// Newline-delimited JSON-RPC 2.0 stdio MCP server exposing `fetch` and `slice_pdf` (`mcp`).
     Mcp          => [Stage, Resolve, Transport, Model],
     /// Command-line interface parsing, startup env binding, and EPIPE-safe dispatch (`cli`).
