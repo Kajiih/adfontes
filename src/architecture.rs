@@ -126,7 +126,7 @@ define_architecture! {
         sandbox  => [],
     }),
     /// Newline-delimited JSON-RPC 2.0 stdio MCP server exposing `fetch` and `slice_pdf` (`mcp`).
-    Mcp          => [Stage, Resolve, Transport, Model],
+    Mcp          => [Stage, Model] (owns_external: ["serde"]),
     /// Command-line interface parsing, startup env binding, and EPIPE-safe dispatch (`cli`).
     Cli          => [Mcp, Stage, Resolve, Transport, Model] (owns_external: ["clap"]),
     /// Thin binary executable entrypoint (`src/bin/adfontes.rs`).

@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Parser, Subcommand};
 
-use crate::mcp::{McpRuntime, serve_io_until};
-use crate::model::{AdfontesError, PageSpan, ParsedTarget};
+use crate::mcp::serve_io_until;
+use crate::model::{AdfontesError, ExtractedDocument, PageSpan, ParsedTarget};
 use crate::resolve::{ResolverConfig, resolve_target};
 use crate::stage::{StagingPolicy, slice_staged_pdf, stage_document, validate_staging_dir_policy};
 use crate::transport::{HttpClient, TransportConfig};
@@ -218,12 +218,20 @@ where
             write_output_line_epipe_safe(stdout, &slice.summary)
         }
         CliCommand::Mcp => {
-            let runtime = McpRuntime {
-                http_client: HttpClient::new(env.transport_config.clone()),
-                resolver_config: env.resolver_config.clone(),
-                staging_policy: env.staging_policy.clone(),
+            let client = HttpClient::new(env.transport_config.clone());
+            let resolver_config = &env.resolver_config;
+            let mut fetcher = |target: &ParsedTarget,
+                               _stop: &mut dyn FnMut() -> bool|
+             -> Result<ExtractedDocument, AdfontesError> {
+                resolve_target(target, &client, resolver_config)
             };
-            serve_io_until(stdin, stdout, &runtime, should_stop)
+            serve_io_until(
+                stdin,
+                stdout,
+                &env.staging_policy,
+                &mut fetcher,
+                should_stop,
+            )
         }
     }
 }
@@ -269,6 +277,7 @@ mod tests {
     use indoc::indoc;
 
     use super::*;
+    use crate::stage::TestSandbox;
 
     struct FailingWriter {
         kind: io::ErrorKind,
@@ -294,7 +303,7 @@ mod tests {
 
     #[test]
     fn prints_version_cleanly() {
-        let sandbox = tempfile::tempdir().unwrap();
+        let sandbox = TestSandbox::new();
         let env = test_env(sandbox.path());
         let mut version_stdout = Vec::new();
         let mut version_stderr = Vec::new();
@@ -319,7 +328,7 @@ mod tests {
 
     #[test]
     fn uses_canonical_adfontes_bin_name_for_windows_argv0() {
-        let sandbox = tempfile::tempdir().unwrap();
+        let sandbox = TestSandbox::new();
         let env = test_env(sandbox.path());
         let mut win_help = Vec::new();
 
@@ -342,7 +351,7 @@ mod tests {
 
     #[test]
     fn suppresses_broken_pipe_and_reports_non_pipe_stdout_errors() {
-        let sandbox = tempfile::tempdir().unwrap();
+        let sandbox = TestSandbox::new();
         let env = test_env(sandbox.path());
         let mut io_stderr = Vec::new();
 
@@ -374,7 +383,7 @@ mod tests {
 
     #[test]
     fn returns_exit_2_on_usage_error_and_exit_1_on_invalid_target() {
-        let sandbox = tempfile::tempdir().unwrap();
+        let sandbox = TestSandbox::new();
         let env = test_env(sandbox.path());
         let mut usage_stderr = Vec::new();
         let mut target_stderr = Vec::new();
@@ -407,7 +416,7 @@ mod tests {
 
     #[test]
     fn dispatches_fetch_and_blocks_forbidden_output_dir_before_network() {
-        let sandbox = tempfile::tempdir().unwrap();
+        let sandbox = TestSandbox::new();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -496,7 +505,7 @@ mod tests {
 
     #[test]
     fn dispatches_slice_pdf_using_injected_io() {
-        let sandbox = tempfile::tempdir().unwrap();
+        let sandbox = TestSandbox::new();
         let env = test_env(sandbox.path());
         let pdf_dir = sandbox.path().join("pdfs");
         let pdf_path = env
@@ -533,7 +542,7 @@ mod tests {
 
     #[test]
     fn dispatches_mcp_using_injected_io() {
-        let sandbox = tempfile::tempdir().unwrap();
+        let sandbox = TestSandbox::new();
         let env = test_env(sandbox.path());
         let mut mcp_stdout = Vec::new();
 
