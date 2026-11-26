@@ -101,7 +101,7 @@ define_architecture! {
     /// Architectural component catalog and compile-time DAG assertions (`architecture`).
     Architecture => [] (owns_external: ["strum"]),
     /// Validated scholarly identifiers, URLs, page spans, and document domain models (`model`).
-    Model        => [] (owns_external: ["thiserror", "url"]),
+    Model        => [] (owns_external: ["thiserror", "url", "percent_encoding"]),
     /// Bounded pure-Rust gzip/deflate decompression and `tar` unpacking (`archive`).
     Archive      => [Model] (owns_external: ["flate2", "tar"]),
     /// SSRF-pinned synchronous HTTP(S) client and charset decoder (`transport`).

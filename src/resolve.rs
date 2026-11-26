@@ -8,7 +8,6 @@
 architecture_component!(Resolve);
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -368,13 +367,13 @@ fn fetch_arxiv_atom_metadata(
     metadata: &mut WorkMetadata,
     failures: &mut Vec<String>,
 ) -> Result<(), AdfontesError> {
-    let Ok(atom_url) = HttpUrl::parse(&format!(
-        "{}/api/query?id_list={}",
+    let Ok(atom_base_url) = HttpUrl::parse(&format!(
+        "{}/api/query",
         config.endpoints.export_arxiv_org.trim_end_matches('/'),
-        id.as_str()
     )) else {
         return Ok(());
     };
+    let atom_url = atom_base_url.with_query_pairs([("id_list", id.as_str())]);
     match budget.get(&atom_url, Some(ACCEPT_XML)) {
         Ok(resp) if resp.status == HTTP_OK => {
             let xml = resp.decode_text();
@@ -669,11 +668,11 @@ fn resolve_doi(
 
     // 3. Optional Unpaywall OA lookup when a real non-placeholder contact email is configured.
     if let Some(email) = config.usable_contact_email() {
-        let encoded_email = percent_encode_query_value(email);
         let unpaywall_url = HttpUrl::parse(&format!(
-            "{}/v2/{encoded_doi}?email={encoded_email}",
+            "{}/v2/{encoded_doi}",
             config.endpoints.unpaywall.trim_end_matches('/')
-        ))?;
+        ))?
+        .with_query_pairs([("email", email)]);
         if let Some(upw_json) = fetch_optional_json(&unpaywall_url, ACCEPT_JSON, budget)? {
             merge_unpaywall_metadata(&upw_json, &mut metadata, &mut oa_candidates);
             metadata_found = true;
@@ -1360,14 +1359,8 @@ fn build_openalex_doi_url(
     encoded_doi: &str,
 ) -> Result<HttpUrl, AdfontesError> {
     let base = config.endpoints.openalex.trim_end_matches('/');
-    let raw = config.usable_contact_email().map_or_else(
-        || format!("{base}/works/https://doi.org/{encoded_doi}"),
-        |email| {
-            let encoded_email = percent_encode_query_value(email);
-            format!("{base}/works/https://doi.org/{encoded_doi}?mailto={encoded_email}")
-        },
-    );
-    HttpUrl::parse(&raw)
+    let url = HttpUrl::parse(&format!("{base}/works/https://doi.org/{encoded_doi}"))?;
+    Ok(url.with_query_pairs(config.usable_contact_email().map(|email| ("mailto", email))))
 }
 
 fn merge_csl_metadata(json: &Value, metadata: &mut WorkMetadata) {
@@ -2025,18 +2018,6 @@ fn detect_xml_root_local_name(xml: &str) -> Option<&str> {
     (!local_name.is_empty()).then_some(local_name)
 }
 
-fn percent_encode_query_value(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            let _ = write!(encoded, "%{byte:02X}");
-        }
-    }
-    encoded
-}
-
 fn is_arxiv_abs_url(url: &HttpUrl) -> bool {
     let path = url.path().to_ascii_lowercase();
     path.starts_with("/abs/")
@@ -2139,6 +2120,7 @@ fn is_valid_contact_email_domain(lower_domain: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::sync::Arc;
@@ -2814,5 +2796,60 @@ mod tests {
             total_hits.load(std::sync::atomic::Ordering::SeqCst) <= MAX_WATERFALL_HTTP_REQUESTS
         );
         assert!(matches!(doc.payload, ExtractedPayload::MetadataOnly { .. }));
+    }
+
+    #[test]
+    fn doi_includes_encoded_contact_email_in_openalex_and_unpaywall_queries() {
+        let openalex_seen = Arc::new(std::sync::Mutex::new(None));
+        let unpaywall_seen = Arc::new(std::sync::Mutex::new(None));
+        let openalex_capture = Arc::clone(&openalex_seen);
+        let unpaywall_capture = Arc::clone(&unpaywall_seen);
+
+        let unpaywall_body = indoc! {r#"{
+            "title": "Unpaywall Routed Title",
+            "is_oa": false
+        }"#}
+        .as_bytes()
+        .to_vec();
+
+        let fixture = LoopbackFixture::spawn(4, move |path| {
+            if path.starts_with("/openalex/") {
+                *openalex_capture.lock().unwrap() = Some(path.to_owned());
+                return (200, "application/json".to_owned(), b"{}".to_vec(), vec![]);
+            }
+            if path.starts_with("/unpaywall/") {
+                *unpaywall_capture.lock().unwrap() = Some(path.to_owned());
+                return (
+                    200,
+                    "application/json".to_owned(),
+                    unpaywall_body.clone(),
+                    vec![],
+                );
+            }
+            (404, "text/plain".to_owned(), b"none".to_vec(), vec![])
+        });
+
+        let target = ParsedTarget::parse("10.1000/contact-check").unwrap();
+        let doc = resolve_target(
+            &target,
+            &fixture.http_client(),
+            &fixture.resolver_config(Some("alice+tag@university.edu")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            openalex_seen.lock().unwrap().as_deref(),
+            Some(
+                "/openalex/works/https://doi.org/10.1000/contact-check?mailto=alice%2Btag%40university.edu"
+            )
+        );
+        assert_eq!(
+            unpaywall_seen.lock().unwrap().as_deref(),
+            Some("/unpaywall/v2/10.1000/contact-check?email=alice%2Btag%40university.edu")
+        );
+        assert_eq!(
+            doc.metadata.title.as_deref(),
+            Some("Unpaywall Routed Title")
+        );
     }
 }

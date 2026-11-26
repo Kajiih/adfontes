@@ -5,13 +5,14 @@
 
 architecture_component!(Model);
 
+use std::borrow::Cow;
 use std::fmt;
 use std::net::IpAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use serde::Serialize;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use thiserror::Error;
 use url::{Host, Url};
 
@@ -52,11 +53,19 @@ const RFC_MAX_DIGITS: usize = 5;
 const RFC_MAX_NUMBER: u32 = 99_999;
 const GITHUB_BLOB_MIN_SEGMENTS: usize = 5;
 const GITHUB_BLOB_TAIL_INDEX: usize = 3;
-const PERCENT_ESCAPE_LEN: usize = 3;
-const HEX_HIGH_NIBBLE_SHIFT: u8 = 4;
-const HEX_LOW_NIBBLE_MASK: u8 = 0x0F;
-const HEX_LETTER_OFFSET: u8 = 10;
 const DECIMAL_BASE: u8 = 10;
+const DOI_PATH_ENCODED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b':')
+    .remove(b'(')
+    .remove(b')')
+    .remove(b';')
+    .remove(b',')
+    .remove(b'+');
 
 /// Domain errors returned across `adfontes` subsystems.
 #[derive(Debug, Error)]
@@ -192,21 +201,9 @@ impl ParsedTarget {
     }
 }
 
-impl FromStr for ParsedTarget {
-    type Err = AdfontesError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Self::parse(raw)
-    }
-}
-
 /// Validated `arXiv` identifier (`YYMM.NNNN[N][vV]` or `<archive>/YYMMNNN[vV]`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ArxivId {
-    full: String,
-    base_len: usize,
-    version: Option<u32>,
-}
+pub struct ArxivId(String);
 
 impl ArxivId {
     /// Parses a bare or `arXiv:`-prefixed identifier.
@@ -263,66 +260,57 @@ impl ArxivId {
     }
 
     fn from_base_and_version(base: String, version: Option<u32>) -> Self {
-        let base_len = base.len();
-        let full = match version {
-            Some(number) => format!("{base}v{number}"),
-            None => base,
-        };
-        Self {
-            full,
-            base_len,
-            version,
+        match version {
+            Some(number) => Self(format!("{base}v{number}")),
+            None => Self(base),
         }
     }
 
-    /// Returns the full identifier including any explicit `vN` suffix.
+    /// Returns the canonical `arXiv` identifier string including any explicit `vN` suffix.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.full
-    }
-
-    /// Returns the versionless base identifier (`2409.13740` for `2409.13740v2`).
-    #[must_use]
-    pub fn base_id(&self) -> &str {
-        self.full.get(..self.base_len).unwrap_or(&self.full)
-    }
-
-    /// Returns the explicit version number (`Some(2)` for `2409.13740v2`), if present.
-    #[must_use]
-    pub const fn version(&self) -> Option<u32> {
-        self.version
+        &self.0
     }
 }
 
-impl fmt::Display for ArxivId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.full)
-    }
+macro_rules! impl_from_str {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl FromStr for $ty {
+                type Err = AdfontesError;
+
+                fn from_str(raw: &str) -> Result<Self, Self::Err> {
+                    Self::parse(raw)
+                }
+            }
+        )+
+    };
 }
 
-impl Serialize for ArxivId {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.full)
-    }
+macro_rules! impl_display_as_str {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl fmt::Display for $ty {
+                fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str(self.as_str())
+                }
+            }
+        )+
+    };
 }
 
-impl FromStr for ArxivId {
-    type Err = AdfontesError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Self::parse(raw)
-    }
-}
+impl_from_str!(ParsedTarget, ArxivId, Doi, PmcId, Pmid, RfcNumber, HttpUrl);
+impl_display_as_str!(ArxivId, Doi, PmcId, Pmid, HttpUrl);
 
 /// Validated Digital Object Identifier (`10.<registrant>/<suffix>`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Doi(String);
 
 impl Doi {
     /// Parses and normalizes a bare or `doi:`-prefixed DOI string.
     ///
-    /// Rejects invalid percent-escapes, path-traversal segments (`.` / `..`), backslashes, and
-    /// query/fragment injection characters (`?` / `#`).
+    /// Rejects non-UTF-8 percent-encoded sequences, path-traversal segments (`.` / `..`),
+    /// backslashes, and query/fragment injection characters (`?` / `#`).
     ///
     /// # Errors
     ///
@@ -331,7 +319,10 @@ impl Doi {
         let trimmed = strip_ascii_prefix_ignore_case(raw.trim(), DOI_SCHEME_PREFIX)
             .unwrap_or_else(|| raw.trim())
             .trim();
-        let decoded = percent_decode_utf8(trimmed, raw)?;
+        let decoded = percent_decode_utf8(trimmed).ok_or_else(|| AdfontesError::InvalidTarget {
+            input: raw.to_owned(),
+            reason: "percent-encoded identifier is not valid UTF-8".to_owned(),
+        })?;
         let cleaned = strip_trailing_sentence_punctuation(&decoded);
         if cleaned.len() > DOI_MAX_TOTAL_LEN {
             return Err(AdfontesError::InvalidTarget {
@@ -392,39 +383,12 @@ impl Doi {
     /// alter URL syntax (`%`, `<`, `>`, `"`, `{`, `}`, `|`, `^`, `` ` ``, non-ASCII).
     #[must_use]
     pub fn percent_encoded_path(&self) -> String {
-        let mut encoded = String::with_capacity(self.0.len());
-        for &byte in self.0.as_bytes() {
-            let is_unreserved_path = byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'/' | b'-' | b'.' | b'_' | b'~' | b':' | b'(' | b')' | b';' | b',' | b'+'
-                );
-            if is_unreserved_path {
-                encoded.push(char::from(byte));
-            } else {
-                push_percent_encoded_byte(&mut encoded, byte);
-            }
-        }
-        encoded
-    }
-}
-
-impl fmt::Display for Doi {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl FromStr for Doi {
-    type Err = AdfontesError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Self::parse(raw)
+        utf8_percent_encode(&self.0, DOI_PATH_ENCODED).to_string()
     }
 }
 
 /// Validated PubMed Central identifier (`PMC<digits>`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PmcId(String);
 
 impl PmcId {
@@ -445,11 +409,7 @@ impl PmcId {
                     reason: "PMCID must start with `PMC`".to_owned(),
                 }
             })?;
-        if digits.is_empty()
-            || digits.len() > PMCID_MAX_DIGITS
-            || digits.starts_with('0')
-            || !digits.bytes().all(|byte| byte.is_ascii_digit())
-        {
+        if !is_positive_ascii_digits(digits, Some(PMCID_MAX_DIGITS)) {
             return Err(AdfontesError::InvalidTarget {
                 input: raw.to_owned(),
                 reason: "PMCID must contain 1-to-12 non-zero-leading digits after `PMC`".to_owned(),
@@ -463,30 +423,10 @@ impl PmcId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-
-    /// Returns the numeric digits following `PMC`.
-    #[must_use]
-    pub fn numeric_part(&self) -> &str {
-        self.0.strip_prefix("PMC").unwrap_or(&self.0)
-    }
-}
-
-impl fmt::Display for PmcId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl FromStr for PmcId {
-    type Err = AdfontesError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Self::parse(raw)
-    }
 }
 
 /// Validated PubMed identifier (`<digits>`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Pmid(String);
 
 impl Pmid {
@@ -499,11 +439,7 @@ impl Pmid {
         let digits = strip_ascii_prefix_ignore_case(raw.trim(), PMID_SCHEME_PREFIX)
             .unwrap_or_else(|| raw.trim())
             .trim();
-        if digits.is_empty()
-            || digits.len() > PMID_MAX_DIGITS
-            || digits.starts_with('0')
-            || !digits.bytes().all(|byte| byte.is_ascii_digit())
-        {
+        if !is_positive_ascii_digits(digits, Some(PMID_MAX_DIGITS)) {
             return Err(AdfontesError::InvalidTarget {
                 input: raw.to_owned(),
                 reason: "PMID must be a positive 1-to-12-digit integer without leading zeros"
@@ -520,22 +456,8 @@ impl Pmid {
     }
 }
 
-impl fmt::Display for Pmid {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl FromStr for Pmid {
-    type Err = AdfontesError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Self::parse(raw)
-    }
-}
-
 /// Validated positive IETF RFC number (`RFC 1`..`RFC 99999`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RfcNumber(NonZeroU32);
 
 impl RfcNumber {
@@ -571,11 +493,7 @@ impl RfcNumber {
         let digits = after_prefix
             .strip_prefix([' ', '-', ':'])
             .unwrap_or(after_prefix);
-        if digits.is_empty()
-            || digits.len() > RFC_MAX_DIGITS
-            || digits.starts_with('0')
-            || !digits.bytes().all(|byte| byte.is_ascii_digit())
-        {
+        if !is_positive_ascii_digits(digits, Some(RFC_MAX_DIGITS)) {
             return Err(AdfontesError::InvalidTarget {
                 input: raw.to_owned(),
                 reason: "RFC number must be a 1-to-5-digit positive integer".to_owned(),
@@ -602,14 +520,6 @@ impl RfcNumber {
 impl fmt::Display for RfcNumber {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "RFC {}", self.0.get())
-    }
-}
-
-impl FromStr for RfcNumber {
-    type Err = AdfontesError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Self::parse(raw)
     }
 }
 
@@ -727,10 +637,26 @@ impl HttpUrl {
         self.0.path()
     }
 
-    /// Returns the optional URL query string without leading `?`.
+    /// Returns a copy of this URL with additional `application/x-www-form-urlencoded` query pairs
+    /// appended (encoding spaces as `+` and literal `+` as `%2B`).
     #[must_use]
-    pub fn query(&self) -> Option<&str> {
-        self.0.query()
+    pub fn with_query_pairs<'a>(
+        &self,
+        pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Self {
+        let mut iter = pairs.into_iter();
+        let Some((first_key, first_value)) = iter.next() else {
+            return self.clone();
+        };
+        let mut url = self.0.clone();
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair(first_key, first_value);
+            for (key, value) in iter {
+                query.append_pair(key, value);
+            }
+        }
+        Self(url)
     }
 
     /// Resolves a relative or absolute redirect `Location` reference against `self`.
@@ -797,26 +723,6 @@ impl HttpUrl {
             "https://raw.githubusercontent.com/{owner}/{repo}/{tail}"
         ))
         .ok()
-    }
-}
-
-impl fmt::Display for HttpUrl {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl Serialize for HttpUrl {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl FromStr for HttpUrl {
-    type Err = AdfontesError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Self::parse(raw)
     }
 }
 
@@ -916,12 +822,6 @@ impl PageSpan {
     pub const fn end(self) -> u32 {
         self.end.get()
     }
-
-    /// Returns the number of pages covered by this span (`1..=MAX_PDF_SLICE_PAGES`).
-    #[must_use]
-    pub const fn page_count(self) -> u32 {
-        self.end.get() - self.start.get() + 1
-    }
 }
 
 impl fmt::Display for PageSpan {
@@ -943,7 +843,7 @@ impl FromStr for PageSpan {
 }
 
 /// Digital text source format from which normalized Markdown was extracted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextFormat {
     /// Origin-served Markdown (`text/markdown`, `.md`, or `/llms.txt`).
     Markdown,
@@ -978,7 +878,7 @@ impl TextFormat {
 }
 
 /// Reason why full text or open-access PDF bytes could not be retrieved.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnavailableReason {
     /// Work is closed-access with no legal open-access full-text or PDF location.
     NoOpenAccessCopy,
@@ -1019,7 +919,7 @@ impl fmt::Display for UnavailableReason {
 }
 
 /// Bibliographic provenance metadata attached to a resolved work.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkMetadata {
     /// Work title.
     pub title: Option<String>,
@@ -1040,7 +940,7 @@ pub struct WorkMetadata {
 }
 
 /// Line-numbered Markdown heading entry in a staged document's Table of Contents.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TocEntry {
     /// Markdown heading level (`1..=6`).
     pub level: u8,
@@ -1053,7 +953,7 @@ pub struct TocEntry {
 }
 
 /// Lightweight per-page text hint summary for a staged PDF.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdfPageSummary {
     /// 1-indexed page number.
     pub page_number: NonZeroU32,
@@ -1066,7 +966,7 @@ pub struct PdfPageSummary {
 }
 
 /// Structural index over a staged PDF document.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdfIndex {
     /// Total number of pages in the PDF.
     pub page_count: u32,
@@ -1171,6 +1071,20 @@ pub fn classify_known_scholarly_url(url: &HttpUrl) -> Option<ParsedTarget> {
         .or_else(|| classify_rfc_url(&host, path))
 }
 
+/// Truncates a string to at most `max_chars` Unicode scalar values, appending `…`.
+#[must_use]
+pub fn truncate_chars(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (count, character) in input.chars().enumerate() {
+        if count >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(character);
+    }
+    out
+}
+
 struct ArxivVersionSplit<'a> {
     digits: &'a str,
     version: Option<u32>,
@@ -1186,7 +1100,7 @@ fn classify_arxiv_url(host: &str, path: &str) -> Option<ParsedTarget> {
     for prefix in ["/abs/", "/pdf/", "/html/", "/src/", "/e-print/"] {
         if let Some(rest) = strip_ascii_prefix_ignore_case(path, prefix) {
             let trimmed = rest.trim_end_matches('/');
-            let decoded = percent_decode_utf8(trimmed, trimmed).ok()?;
+            let decoded = percent_decode_utf8(trimmed)?;
             if let Ok(arxiv) = ArxivId::parse(&decoded) {
                 return Some(ParsedTarget::Arxiv(arxiv));
             }
@@ -1209,9 +1123,7 @@ fn classify_biomedical_url(host: &str, path: &str) -> Option<ParsedTarget> {
         "pmc.ncbi.nlm.nih.gov" | "www.ncbi.nlm.nih.gov" | "ncbi.nlm.nih.gov"
     ) {
         for segment in path.split('/') {
-            if strip_ascii_prefix_ignore_case(segment, PMC_PREFIX).is_some()
-                && let Ok(pmc) = PmcId::parse(segment)
-            {
+            if let Ok(pmc) = PmcId::parse(segment) {
                 return Some(ParsedTarget::PmcId(pmc));
             }
         }
@@ -1395,11 +1307,7 @@ fn split_arxiv_version<'a>(
     raw: &str,
 ) -> Result<ArxivVersionSplit<'a>, AdfontesError> {
     if let Some((digits, version_digits)) = segment.rsplit_once(['v', 'V']) {
-        if version_digits.is_empty()
-            || version_digits.len() > ARXIV_MAX_VERSION_DIGITS
-            || version_digits.starts_with('0')
-            || !version_digits.bytes().all(|byte| byte.is_ascii_digit())
-        {
+        if !is_positive_ascii_digits(version_digits, Some(ARXIV_MAX_VERSION_DIGITS)) {
             return Err(AdfontesError::InvalidTarget {
                 input: raw.to_owned(),
                 reason: "arXiv version suffix must be a positive integer (`v1`, `v2`, ...)"
@@ -1431,10 +1339,7 @@ fn parse_strict_positive_u32(
     raw: &str,
     field_name: &str,
 ) -> Result<u32, AdfontesError> {
-    if digits.is_empty()
-        || digits.starts_with('0')
-        || !digits.bytes().all(|byte| byte.is_ascii_digit())
-    {
+    if !is_positive_ascii_digits(digits, None) {
         return Err(AdfontesError::InvalidTarget {
             input: raw.to_owned(),
             reason: format!("{field_name} must be a positive ASCII integer"),
@@ -1448,46 +1353,18 @@ fn parse_strict_positive_u32(
         })
 }
 
-fn percent_decode_utf8(input: &str, raw: &str) -> Result<String, AdfontesError> {
-    let bytes = input.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0usize;
-    while let Some(&byte) = bytes.get(index) {
-        if byte == b'%'
-            && let (Some(&high), Some(&low)) = (bytes.get(index + 1), bytes.get(index + 2))
-            && let (Some(high_val), Some(low_val)) = (hex_value(high), hex_value(low))
-        {
-            decoded.push((high_val << HEX_HIGH_NIBBLE_SHIFT) | low_val);
-            index += PERCENT_ESCAPE_LEN;
-            continue;
-        }
-        decoded.push(byte);
-        index += 1;
-    }
-    String::from_utf8(decoded).map_err(|_| AdfontesError::InvalidTarget {
-        input: raw.to_owned(),
-        reason: "percent-encoded identifier is not valid UTF-8".to_owned(),
-    })
+fn is_positive_ascii_digits(digits: &str, max_len: Option<usize>) -> bool {
+    !digits.is_empty()
+        && max_len.is_none_or(|limit| digits.len() <= limit)
+        && !digits.starts_with('0')
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn push_percent_encoded_byte(out: &mut String, byte: u8) {
-    const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
-    out.push('%');
-    let high = usize::from(byte >> HEX_HIGH_NIBBLE_SHIFT);
-    let low = usize::from(byte & HEX_LOW_NIBBLE_MASK);
-    if let (Some(&hi_char), Some(&lo_char)) = (HEX_UPPER.get(high), HEX_UPPER.get(low)) {
-        out.push(char::from(hi_char));
-        out.push(char::from(lo_char));
-    }
-}
-
-const fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + HEX_LETTER_OFFSET),
-        b'A'..=b'F' => Some(byte - b'A' + HEX_LETTER_OFFSET),
-        _ => None,
-    }
+fn percent_decode_utf8(input: &str) -> Option<String> {
+    percent_decode_str(input)
+        .decode_utf8()
+        .ok()
+        .map(Cow::into_owned)
 }
 
 fn strip_trailing_sentence_punctuation(input: &str) -> &str {
@@ -1528,46 +1405,19 @@ mod tests {
     use super::*;
 
     #[rstest]
-    #[case("2409.13740", "2409.13740", "2409.13740", None)]
-    #[case("arXiv:2409.13740v2", "2409.13740v2", "2409.13740", Some(2))]
-    #[case(
-        "https://arxiv.org/pdf/2411.00640v1.PDF",
-        "2411.00640v1",
-        "2411.00640",
-        Some(1)
-    )]
-    #[case(
-        "https://ar5iv.labs.arxiv.org/html/2402.09727",
-        "2402.09727",
-        "2402.09727",
-        None
-    )]
-    #[case(
-        "https://doi.org/10.48550%2FarXiv.2409.13740v1/",
-        "2409.13740v1",
-        "2409.13740",
-        Some(1)
-    )]
-    #[case("10.48550/arXiv.2409.13740", "2409.13740", "2409.13740", None)]
-    #[case(
-        "https://arxiv.org/abs/math%2F0211159v1",
-        "math/0211159v1",
-        "math/0211159",
-        Some(1)
-    )]
-    #[case("MATH/0211159v1", "math/0211159v1", "math/0211159", Some(1))]
-    fn parses_arxiv_targets_and_datacite_aliases(
-        #[case] raw: &str,
-        #[case] expected_full: &str,
-        #[case] expected_base: &str,
-        #[case] expected_version: Option<u32>,
-    ) {
+    #[case("2409.13740", "2409.13740")]
+    #[case("arXiv:2409.13740v2", "2409.13740v2")]
+    #[case("https://arxiv.org/pdf/2411.00640v1.PDF", "2411.00640v1")]
+    #[case("https://ar5iv.labs.arxiv.org/html/2402.09727", "2402.09727")]
+    #[case("https://doi.org/10.48550%2FarXiv.2409.13740v1/", "2409.13740v1")]
+    #[case("10.48550/arXiv.2409.13740", "2409.13740")]
+    #[case("https://arxiv.org/abs/math%2F0211159v1", "math/0211159v1")]
+    #[case("MATH/0211159v1", "math/0211159v1")]
+    fn parses_arxiv_targets_and_datacite_aliases(#[case] raw: &str, #[case] expected_full: &str) {
         let parsed = ParsedTarget::parse(raw).unwrap();
         let expected = ArxivId::parse(expected_full).unwrap();
         assert_eq!(parsed, ParsedTarget::Arxiv(expected.clone()));
         assert_eq!(expected.as_str(), expected_full);
-        assert_eq!(expected.base_id(), expected_base);
-        assert_eq!(expected.version(), expected_version);
     }
 
     #[rstest]
@@ -1624,25 +1474,16 @@ mod tests {
     }
 
     #[rstest]
-    #[case("pmc10912345", "PMC10912345", "10912345")]
-    #[case(
-        "https://pmc.ncbi.nlm.nih.gov/articles/PMC7654321/",
-        "PMC7654321",
-        "7654321"
-    )]
-    #[case(
-        "https://www.europepmc.org/article/pmc/pmc998877/pdf",
-        "PMC998877",
-        "998877"
-    )]
-    #[case("https://europepmc.org/articles/PMC112233", "PMC112233", "112233")]
-    fn parses_pmcid_variants(#[case] raw: &str, #[case] expected: &str, #[case] digits: &str) {
+    #[case("pmc10912345", "PMC10912345")]
+    #[case("https://pmc.ncbi.nlm.nih.gov/articles/PMC7654321/", "PMC7654321")]
+    #[case("https://www.europepmc.org/article/pmc/pmc998877/pdf", "PMC998877")]
+    #[case("https://europepmc.org/articles/PMC112233", "PMC112233")]
+    fn parses_pmcid_variants(#[case] raw: &str, #[case] expected: &str) {
         let parsed = ParsedTarget::parse(raw).unwrap();
         let ParsedTarget::PmcId(pmc) = parsed else {
             panic!("expected PmcId variant for {raw}");
         };
         assert_eq!(pmc.as_str(), expected);
-        assert_eq!(pmc.numeric_part(), digits);
     }
 
     #[rstest]
@@ -1788,6 +1629,33 @@ mod tests {
     }
 
     #[rstest]
+    #[case(
+        "https://api.example.org/v2/works",
+        &[],
+        "https://api.example.org/v2/works"
+    )]
+    #[case(
+        "https://api.example.org/v2/works",
+        &[("q", "hello world"), ("frag", "a#b\nc")],
+        "https://api.example.org/v2/works?q=hello+world&frag=a%23b%0Ac"
+    )]
+    #[case(
+        "https://api.example.org/v2/works?select=id",
+        &[("mailto", "a+b@uni.edu"), ("tag", "q&r=1")],
+        "https://api.example.org/v2/works?select=id&mailto=a%2Bb%40uni.edu&tag=q%26r%3D1"
+    )]
+    fn appends_form_urlencoded_query_pairs_without_dangling_question_mark(
+        #[case] raw_base: &str,
+        #[case] pairs: &[(&str, &str)],
+        #[case] expected: &str,
+    ) {
+        let base = HttpUrl::parse(raw_base).unwrap();
+        let updated = base.with_query_pairs(pairs.iter().copied());
+        assert_eq!(updated.as_str(), expected);
+        assert_eq!(updated.0.fragment(), None);
+    }
+
+    #[rstest]
     #[case("0-2")]
     #[case("5-3")]
     #[case("1-9")]
@@ -1806,7 +1674,6 @@ mod tests {
             .unwrap();
         assert_eq!(span.start(), 18);
         assert_eq!(span.end(), 20);
-        assert_eq!(span.page_count(), 3);
         assert_eq!(span.to_string(), "18-20");
     }
 
@@ -1815,5 +1682,18 @@ mod tests {
         let span = PageSpan::parse_spec("5").unwrap();
         assert!(span.clamp_to_total(0).is_err());
         assert!(span.clamp_to_total(4).is_err());
+    }
+
+    #[rstest]
+    #[case("abcdef", 0, "…")]
+    #[case("abcdef", 6, "abcdef")]
+    #[case("abcdef", 3, "abc…")]
+    #[case("αβγδε", 2, "αβ…")]
+    fn truncates_strings_by_unicode_scalar_count(
+        #[case] input: &str,
+        #[case] max_chars: usize,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(truncate_chars(input, max_chars), expected);
     }
 }
