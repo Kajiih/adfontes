@@ -1,14 +1,16 @@
-//! Shared text normalization, Markdown formatting, and title extraction helpers.
+//! Shared text normalization, Markdown formatting, `CommonMark` TOC extraction (`pulldown_cmark`), and title helpers.
 
 use std::fmt::Write as _;
 use std::num::NonZeroUsize;
+use std::ops::{ControlFlow, Range};
+
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::model::TocEntry;
 
 const MAX_HEADER_SCAN_LINES: usize = 40;
 const MIN_SETEXT_UNDERLINE_LEN: usize = 3;
 const MIN_FENCE_LEN: usize = 3;
-const MAX_COMMONMARK_INDENT: usize = 3;
 const MAX_HEADING_LEVEL: usize = 6;
 const MAX_CODE_LANGUAGE_LEN: usize = 32;
 const TITLE_HEADER_PREFIX: &str = "title:";
@@ -22,13 +24,6 @@ pub struct ExtractedText {
     pub title: Option<String>,
     /// Clean UTF-8 Markdown or plain text body.
     pub markdown: String,
-}
-
-/// Active `CommonMark` §4.5 code-fence delimiter state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct CodeFenceState {
-    marker: u8,
-    length: usize,
 }
 
 /// Collapses ASCII whitespace and control characters into single spaces and trims ends.
@@ -57,14 +52,26 @@ pub fn sanitize_inline_text(input: &str) -> String {
 #[must_use]
 pub fn normalize_markdown_spacing(raw: &str) -> String {
     let unified = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let fence_ranges = collect_fenced_code_ranges(&unified);
     let mut result = String::with_capacity(unified.len());
     let mut consecutive_blanks: usize = 0;
-    let mut active_fence: Option<CodeFenceState> = None;
+    let mut line_start: usize = 0;
+    let mut fence_idx: usize = 0;
 
     for line in unified.split('\n') {
+        while fence_ranges
+            .get(fence_idx)
+            .is_some_and(|range| line_start >= range.end)
+        {
+            fence_idx += 1;
+        }
+        let in_fence = fence_ranges
+            .get(fence_idx)
+            .is_some_and(|range| line_start >= range.start && line_start < range.end);
         let trimmed_end = line.trim_end_matches([' ', '\t']);
-        update_code_fence_state(trimmed_end, &mut active_fence);
-        if active_fence.is_none() && trimmed_end.is_empty() {
+        line_start = line_start.saturating_add(line.len()).saturating_add(1);
+
+        if !in_fence && trimmed_end.is_empty() {
             if result.is_empty() {
                 continue;
             }
@@ -99,65 +106,43 @@ pub fn extract_text_title(text: &str) -> Option<String> {
 
 const MAX_TOC_ENTRIES: usize = 2_048;
 
-/// Extracts a fence-aware, 1-indexed line-ranged Markdown Table of Contents.
+/// Extracts a `CommonMark` 1-indexed line-ranged Markdown Table of Contents via `pulldown_cmark`.
 ///
-/// Respects `CommonMark` §4.2–§4.5 indentation rules (ignoring 4+-space or tab-indented code
-/// blocks), strips closing ATX `#` markers only when space-separated, skips opening YAML
-/// frontmatter, recognizes both ATX (`#`) and Setext (`===` / `---`) headings, and streams in a
-/// single bounded pass (`<= 2,048` entries) to prevent memory amplification on adversarial inputs.
+/// Skips opening YAML frontmatter, ignores headings inside code fences or 4-space/tab indented
+/// code blocks, skips empty headings (for example `## ###`), and bounds output at `<= 2,048`
+/// entries so adversarial inputs cannot amplify memory.
 #[must_use]
 pub fn extract_markdown_toc(markdown: &str) -> Vec<TocEntry> {
-    let start_idx = yaml_frontmatter_end_index(markdown.lines()).unwrap_or(0);
     let mut entries: Vec<TocEntry> = Vec::new();
-    let mut active_fence: Option<CodeFenceState> = None;
-    let mut last_entry_closed = false;
-    let mut total_lines: usize = 0;
-
-    let mut lines = markdown.lines().enumerate().peekable();
-    while let Some((idx, line)) = lines.next() {
-        total_lines = idx + 1;
-        if idx < start_idx {
-            continue;
-        }
-        let was_in_fence = active_fence.is_some();
-        update_code_fence_state(line, &mut active_fence);
-        if was_in_fence || active_fence.is_some() {
-            continue;
-        }
-
-        let heading_found = parse_atx_heading(line).or_else(|| {
-            let &(_, next_line) = lines.peek()?;
-            let parsed = parse_setext_heading(line, next_line)?;
-            let _ = lines.next();
-            total_lines = idx + 2;
-            Some(parsed)
-        });
-
-        if let Some(parsed) = heading_found {
-            let start_line = idx + 1;
-            if !last_entry_closed && let Some(previous) = entries.last_mut() {
-                let end_line = start_line.saturating_sub(1).max(previous.start_line.get());
-                if let Some(end_nz) = NonZeroUsize::new(end_line) {
-                    previous.end_line = end_nz;
-                }
-            }
-            if entries.len() < MAX_TOC_ENTRIES {
-                if let Some(start_nz) = NonZeroUsize::new(start_line) {
-                    entries.push(TocEntry {
-                        level: parsed.level,
-                        heading: parsed.heading,
-                        start_line: start_nz,
-                        end_line: start_nz,
-                    });
-                    last_entry_closed = false;
-                }
-            } else {
-                last_entry_closed = true;
+    let outcome = visit_markdown_headings(markdown, |parsed| {
+        if let Some(previous) = entries.last_mut() {
+            let end_line = parsed
+                .start_line
+                .saturating_sub(1)
+                .max(previous.start_line.get());
+            if let Some(end_nz) = NonZeroUsize::new(end_line) {
+                previous.end_line = end_nz;
             }
         }
-    }
+        if entries.len() < MAX_TOC_ENTRIES {
+            if let Some(start_nz) = NonZeroUsize::new(parsed.start_line) {
+                entries.push(TocEntry {
+                    level: parsed.level,
+                    heading: parsed.heading,
+                    start_line: start_nz,
+                    end_line: start_nz,
+                });
+            }
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    });
 
-    if !last_entry_closed && let Some(last) = entries.last_mut() {
+    if outcome.is_continue()
+        && let Some(last) = entries.last_mut()
+    {
+        let total_lines = markdown.lines().count();
         let end_line = total_lines.max(last.start_line.get());
         if let Some(end_nz) = NonZeroUsize::new(end_line) {
             last.end_line = end_nz;
@@ -258,32 +243,17 @@ pub(super) fn push_markdown_heading(out: &mut String, level: usize, text: &str) 
     let _ = writeln!(out, " {text}\n");
 }
 
-/// Updates `CommonMark` §4.5 fenced code block tracking for a single line.
-pub(super) fn update_code_fence_state(line: &str, active_fence: &mut Option<CodeFenceState>) {
-    let Some(trimmed) = strip_commonmark_indent(line) else {
-        return;
-    };
-    let Some(parsed) = parse_fence_prefix(trimmed) else {
-        return;
-    };
-    match *active_fence {
-        None => {
-            if parsed.marker != b'`' || !parsed.info.contains('`') {
-                *active_fence = Some(CodeFenceState {
-                    marker: parsed.marker,
-                    length: parsed.length,
-                });
-            }
-        }
-        Some(open) => {
-            if parsed.marker == open.marker
-                && parsed.length >= open.length
-                && parsed.info.trim().is_empty()
-            {
-                *active_fence = None;
-            }
-        }
+fn collect_fenced_code_ranges(unified: &str) -> Vec<Range<usize>> {
+    if !unified.contains("```") && !unified.contains("~~~") {
+        return Vec::new();
     }
+    Parser::new_ext(unified, Options::empty())
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))) => Some(range),
+            _ => None,
+        })
+        .collect()
 }
 
 fn push_gfm_row(out: &mut String, row: &[String], width: usize) {
@@ -315,15 +285,9 @@ fn max_backtick_run(text: &str) -> usize {
 }
 
 fn extract_yaml_frontmatter_title(lines: &[&str]) -> Option<String> {
-    if lines.first().map(|line| line.trim()) != Some(YAML_FRONTMATTER_DELIMITER) {
-        return None;
-    }
-    for line in lines.iter().skip(1).take(MAX_HEADER_SCAN_LINES) {
-        let trimmed = line.trim();
-        if trimmed == YAML_FRONTMATTER_DELIMITER || trimmed == YAML_FRONTMATTER_END_DOTS {
-            break;
-        }
-        if let Some(rest) = strip_key_ignore_case(trimmed, TITLE_HEADER_PREFIX) {
+    let scanned = scan_yaml_frontmatter(lines.iter().copied())?;
+    for line in scanned.lines {
+        if let Some(rest) = strip_key_ignore_case(line.trim(), TITLE_HEADER_PREFIX) {
             let unquoted = strip_matching_yaml_quotes(rest.trim());
             let cleaned = sanitize_inline_text(unquoted);
             if !cleaned.is_empty() {
@@ -379,21 +343,18 @@ fn extract_pep_header_title(lines: &[&str]) -> Option<String> {
 }
 
 fn extract_markdown_h1_title(markdown: &str) -> Option<String> {
-    let start_idx = yaml_frontmatter_end_index(markdown.lines()).unwrap_or(0);
-    let mut active_fence: Option<CodeFenceState> = None;
-    for line in markdown.lines().skip(start_idx) {
-        let was_in_fence = active_fence.is_some();
-        update_code_fence_state(line, &mut active_fence);
-        if was_in_fence || active_fence.is_some() {
-            continue;
+    let mut title = None;
+    let _ = visit_markdown_headings(markdown, |parsed| {
+        // Restrict fallback H1 title extraction to ATX `#` headings so PEP/RST `===` documents
+        // still pass through to `extract_rst_setext_title` (which enforces underline length).
+        if parsed.level == 1 && parsed.is_atx {
+            title = Some(parsed.heading);
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
-        if let Some(parsed) = parse_atx_heading(line)
-            && parsed.level == 1
-        {
-            return Some(parsed.heading);
-        }
-    }
-    None
+    });
+    title
 }
 
 fn extract_rst_setext_title(lines: &[&str]) -> Option<String> {
@@ -423,91 +384,168 @@ fn strip_key_ignore_case<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         .flatten()
 }
 
-struct ParsedHeading {
+struct ParsedMarkdownHeading {
     level: u8,
     heading: String,
+    start_line: usize,
+    is_atx: bool,
 }
 
-fn yaml_frontmatter_end_index<'a>(mut lines: impl Iterator<Item = &'a str>) -> Option<usize> {
-    if lines.next()?.trim() != YAML_FRONTMATTER_DELIMITER {
-        return None;
+fn visit_markdown_headings<F>(markdown: &str, mut on_heading: F) -> ControlFlow<()>
+where
+    F: FnMut(ParsedMarkdownHeading) -> ControlFlow<()>,
+{
+    let post = split_post_frontmatter(markdown);
+    if post.body.is_empty() {
+        return ControlFlow::Continue(());
     }
-    for (offset, line) in lines.enumerate().take(MAX_HEADER_SCAN_LINES) {
-        let trimmed = line.trim();
-        if trimmed == YAML_FRONTMATTER_DELIMITER || trimmed == YAML_FRONTMATTER_END_DOTS {
-            return Some(offset + 2);
+
+    let mut cursor = 0usize;
+    let mut current_line = post.start_line_base + 1;
+    let mut container_depth = 0usize;
+    let mut active: Option<ActiveHeading> = None;
+
+    for (event, range) in Parser::new_ext(post.body, Options::empty()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::BlockQuote(_) | Tag::List(_)) => {
+                container_depth += 1;
+            }
+            Event::End(TagEnd::BlockQuote(_) | TagEnd::List(_)) => {
+                container_depth = container_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::Heading { level, .. }) if container_depth == 0 => {
+                if range.start > cursor
+                    && let Some(gap) = post.body.get(cursor..range.start)
+                {
+                    current_line += gap.bytes().filter(|&byte| byte == b'\n').count();
+                    cursor = range.start;
+                }
+                let is_atx = post.body.get(range).is_some_and(is_atx_heading_raw);
+                active = Some(ActiveHeading {
+                    level: level as u8,
+                    start_line: current_line,
+                    is_atx,
+                    raw_text: String::new(),
+                });
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some(ref mut heading) = active {
+                    heading.raw_text.push_str(&text);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some(ref mut heading) = active {
+                    heading.raw_text.push(' ');
+                }
+            }
+            Event::InlineHtml(html) => {
+                if let Some(ref mut heading) = active
+                    && is_inline_br_html(&html)
+                {
+                    heading.raw_text.push(' ');
+                }
+            }
+            Event::End(TagEnd::Heading(_)) if container_depth == 0 => {
+                if let Some(finished) = active.take() {
+                    let heading = sanitize_inline_text(&finished.raw_text);
+                    if !heading.is_empty()
+                        && on_heading(ParsedMarkdownHeading {
+                            level: finished.level,
+                            heading,
+                            start_line: finished.start_line,
+                            is_atx: finished.is_atx,
+                        })
+                        .is_break()
+                    {
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    None
+    ControlFlow::Continue(())
 }
 
-fn parse_setext_heading(line: &str, next_line: &str) -> Option<ParsedHeading> {
-    let candidate = strip_commonmark_indent(line)?;
-    let trimmed_candidate = candidate.trim_end_matches([' ', '\t']);
-    if trimmed_candidate.is_empty()
-        || is_setext_excluded_prefix(trimmed_candidate)
-        || parse_fence_prefix(trimmed_candidate).is_some()
-        || parse_atx_heading(line).is_some()
-    {
-        return None;
-    }
-
-    let underline = strip_commonmark_indent(next_line)?.trim_end_matches([' ', '\t']);
-    let bytes = underline.as_bytes();
-    let &first = bytes.first()?;
-    let level = match first {
-        b'=' if bytes.iter().all(|&byte| byte == b'=') => 1,
-        b'-' if bytes.iter().all(|&byte| byte == b'-') => 2,
-        _ => return None,
-    };
-    let cleaned = sanitize_inline_text(trimmed_candidate);
-    if cleaned.is_empty() {
-        return None;
-    }
-    Some(ParsedHeading {
-        level,
-        heading: cleaned,
-    })
+fn is_inline_br_html(raw: &str) -> bool {
+    const BR_OPEN_PREFIX: &[u8] = b"<br";
+    let bytes = raw.trim_start().as_bytes();
+    bytes
+        .get(..BR_OPEN_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(BR_OPEN_PREFIX))
+        && bytes
+            .get(BR_OPEN_PREFIX.len())
+            .is_none_or(|&next| matches!(next, b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n'))
 }
 
-fn is_setext_excluded_prefix(trimmed: &str) -> bool {
-    if trimmed.starts_with('>')
-        || trimmed.starts_with("- ")
-        || trimmed.starts_with("* ")
-        || trimmed.starts_with("+ ")
-        || is_rst_adornment(trimmed)
-    {
-        return true;
-    }
-    let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
-    if digits > 0
-        && let Some(rest) = trimmed.get(digits..)
-        && (rest.starts_with(". ") || rest.starts_with(") "))
-    {
-        return true;
-    }
-    false
-}
-
-fn parse_atx_heading(line: &str) -> Option<ParsedHeading> {
-    let trimmed = strip_commonmark_indent(line)?;
+fn is_atx_heading_raw(raw: &str) -> bool {
+    let trimmed = raw.trim_start_matches(' ');
     let hashes = trimmed.bytes().take_while(|&byte| byte == b'#').count();
-    if !(1..=MAX_HEADING_LEVEL).contains(&hashes) {
+    (1..=MAX_HEADING_LEVEL).contains(&hashes)
+        && trimmed
+            .as_bytes()
+            .get(hashes)
+            .is_none_or(|&byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+struct ActiveHeading {
+    level: u8,
+    start_line: usize,
+    is_atx: bool,
+    raw_text: String,
+}
+
+struct PostFrontmatter<'a> {
+    start_line_base: usize,
+    body: &'a str,
+}
+
+fn split_post_frontmatter(markdown: &str) -> PostFrontmatter<'_> {
+    let start_idx = scan_yaml_frontmatter(markdown.lines())
+        .and_then(|scanned| scanned.closed_line_count)
+        .unwrap_or(0);
+    if start_idx == 0 {
+        return PostFrontmatter {
+            start_line_base: 0,
+            body: markdown,
+        };
+    }
+    let byte_offset: usize = markdown
+        .split_inclusive('\n')
+        .take(start_idx)
+        .map(str::len)
+        .sum();
+    PostFrontmatter {
+        start_line_base: start_idx,
+        body: markdown.get(byte_offset..).unwrap_or_default(),
+    }
+}
+
+struct YamlFrontmatter<'a> {
+    lines: Vec<&'a str>,
+    closed_line_count: Option<usize>,
+}
+
+fn scan_yaml_frontmatter<'a>(
+    mut iter: impl Iterator<Item = &'a str>,
+) -> Option<YamlFrontmatter<'a>> {
+    if iter.next()?.trim() != YAML_FRONTMATTER_DELIMITER {
         return None;
     }
-    let after = trimmed.get(hashes..)?;
-    if !after.is_empty() && !after.starts_with(' ') && !after.starts_with('\t') {
-        return None;
+    let mut lines = Vec::new();
+    for (offset, line) in iter.enumerate().take(MAX_HEADER_SCAN_LINES) {
+        let trimmed = line.trim();
+        if trimmed == YAML_FRONTMATTER_DELIMITER || trimmed == YAML_FRONTMATTER_END_DOTS {
+            return Some(YamlFrontmatter {
+                lines,
+                closed_line_count: Some(offset + 2),
+            });
+        }
+        lines.push(line);
     }
-    let stripped = strip_commonmark_closing_hashes(after.trim_start_matches([' ', '\t']));
-    let cleaned = sanitize_inline_text(stripped);
-    if cleaned.is_empty() {
-        return None;
-    }
-    let level = u8::try_from(hashes).ok()?;
-    Some(ParsedHeading {
-        level,
-        heading: cleaned,
+    Some(YamlFrontmatter {
+        lines,
+        closed_line_count: None,
     })
 }
 
@@ -522,58 +560,10 @@ fn is_rst_adornment(line: &str) -> bool {
     matches!(first, b'=' | b'-' | b'~' | b'#' | b'*') && bytes.iter().all(|&byte| byte == first)
 }
 
-struct ParsedFenceLine<'a> {
-    marker: u8,
-    length: usize,
-    info: &'a str,
-}
-
-fn parse_fence_prefix(trimmed: &str) -> Option<ParsedFenceLine<'_>> {
-    let &marker = trimmed.as_bytes().first()?;
-    if !matches!(marker, b'`' | b'~') {
-        return None;
-    }
-    let length = trimmed.bytes().take_while(|&byte| byte == marker).count();
-    if length < MIN_FENCE_LEN {
-        return None;
-    }
-    let info = trimmed.get(length..).unwrap_or_default();
-    Some(ParsedFenceLine {
-        marker,
-        length,
-        info,
-    })
-}
-
-fn strip_commonmark_indent(line: &str) -> Option<&str> {
-    let leading_spaces = line.bytes().take_while(|&byte| byte == b' ').count();
-    if leading_spaces > MAX_COMMONMARK_INDENT {
-        return None;
-    }
-    let rest = line.get(leading_spaces..)?;
-    if rest.starts_with('\t') {
-        return None;
-    }
-    Some(rest)
-}
-
-fn strip_commonmark_closing_hashes(content: &str) -> &str {
-    let trimmed = content.trim_end_matches([' ', '\t']);
-    let without_hashes = trimmed.trim_end_matches('#');
-    if without_hashes.len() == trimmed.len() {
-        return trimmed;
-    }
-    if without_hashes.is_empty() || without_hashes.ends_with(' ') || without_hashes.ends_with('\t')
-    {
-        without_hashes.trim_end_matches([' ', '\t'])
-    } else {
-        trimmed
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
+    use rstest::rstest;
 
     use super::*;
 
@@ -671,17 +661,17 @@ mod tests {
             After
         "};
         let preserved = normalize_markdown_spacing(raw);
-        let expected_inner = indoc! {r"
-            ````
+        insta::assert_snapshot!(preserved, @"
+        ````
 
 
-            ```
+        ```
 
 
-            ````
-        "};
-        assert!(preserved.starts_with(expected_inner.trim_end()));
-        assert!(preserved.ends_with("\n\nAfter"));
+        ````
+
+        After
+        ");
     }
 
     #[test]
@@ -760,5 +750,60 @@ mod tests {
         let massive = "# Heading\n".repeat(MAX_TOC_ENTRIES + 500);
         let toc = extract_markdown_toc(&massive);
         assert_eq!(toc.len(), MAX_TOC_ENTRIES);
+    }
+
+    #[test]
+    fn decodes_inline_markdown_in_headings_across_crlf_frontmatter() {
+        let crlf_doc = concat!(
+            "---\r\n",
+            "title: Frontmatter\r\n",
+            "---\r\n",
+            "## *Emphasis*, `code`, &amp; [Link](https://example.org)\r\n",
+            "Body.\r\n",
+        );
+        let toc = extract_markdown_toc(crlf_doc);
+        assert_eq!(
+            toc,
+            vec![TocEntry {
+                level: 2,
+                heading: "Emphasis, code, & Link".to_owned(),
+                start_line: NonZeroUsize::new(4).unwrap(),
+                end_line: NonZeroUsize::new(5).unwrap(),
+            }]
+        );
+    }
+
+    #[rstest]
+    #[case("Long Prose Before Short Equals")]
+    #[case("#define FOO")]
+    #[case("####### Long Prose")]
+    fn ignores_short_setext_equals_in_title_extraction(#[case] headline: &str) {
+        let doc = formatdoc! {"
+            {headline}
+            ===
+            Paragraph.
+        "};
+        assert_eq!(extract_text_title(&doc), None);
+    }
+
+    #[test]
+    fn ignores_headings_nested_inside_blockquotes_and_lists() {
+        let doc = indoc! {r"
+            > # Quoted Title
+            - # List Heading
+            # Top Title
+        "};
+        let toc = extract_markdown_toc(doc);
+        assert_eq!(extract_text_title(doc).as_deref(), Some("Top Title"));
+        assert_eq!(toc.len(), 1);
+        assert_eq!(toc[0].heading, "Top Title");
+    }
+
+    #[test]
+    fn separates_heading_words_across_inline_br_tag() {
+        assert_eq!(
+            extract_markdown_h1_title("# Alpha<br>Beta").as_deref(),
+            Some("Alpha Beta")
+        );
     }
 }
