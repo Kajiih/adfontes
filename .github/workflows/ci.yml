@@ -50,7 +50,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --target x86_64-unknown-linux-musl && rustup default stable
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools musl-dev linux-libc-dev
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -59,6 +61,10 @@ jobs:
           tool: uv
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Check static musl target
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo check -p adfontes --all-targets --locked --target x86_64-unknown-linux-musl
       - run: cargo doc --workspace --no-deps --locked
       - run: cargo doc --workspace --no-deps --document-private-items --locked
       - run: uvx omnicoach code
@@ -89,12 +95,12 @@ jobs:
       - run: uvx --from 'maturin>=1.15,<2.0' maturin build --release --locked --out dist/wheels
       - name: Verify wheel
         if: runner.os != 'Linux'
-        run: uv run --no-project scripts/verify_wheel.py --wheel-dir dist/wheels --reference-binary target/release/adfontes --python 3.10 --python 3.13
+        run: uv run --no-project --with 'pytest>=8.3,<10' pytest -q -p no:cacheprovider tests/wheel --wheel-dir dist/wheels --reference-binary target/release/adfontes --python 3.10 --python 3.13
       - name: Verify wheel and sdist
         if: runner.os == 'Linux'
         run: |
           uvx --from 'maturin>=1.15,<2.0' maturin sdist --out dist/sdist
-          uv run --no-project scripts/verify_wheel.py --wheel-dir dist/wheels --sdist-dir dist/sdist --reference-binary target/release/adfontes --python 3.10 --python 3.13
+          uv run --no-project --with 'pytest>=8.3,<10' pytest -q -p no:cacheprovider tests/wheel --wheel-dir dist/wheels --sdist-dir dist/sdist --reference-binary target/release/adfontes --python 3.10 --python 3.13
 
   zizmor:
     name: Audit workflows (zizmor)
