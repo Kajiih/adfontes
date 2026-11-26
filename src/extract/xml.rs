@@ -11,7 +11,7 @@ use roxmltree::{Document, Node, ParsingOptions};
 
 use super::title::{
     ExtractedText, normalize_markdown_spacing, push_fenced_code_block, push_inline_code,
-    push_markdown_heading, render_gfm_table, sanitize_inline_text,
+    push_markdown_blockquote, push_markdown_heading, render_gfm_table, sanitize_inline_text,
 };
 use crate::model::AdfontesError;
 
@@ -27,6 +27,7 @@ const DOCTYPE_DECL_PREFIX: &str = "<!doctype";
 const FORBIDDEN_DTD_DECLS: &[&str] = &["<!entity", "<!element", "<!attlist", "<!notation"];
 
 const TAG_ARTICLE: &str = "article";
+const TAG_RFC: &str = "rfc";
 const TAG_ARTICLE_TITLE: &str = "article-title";
 const TAG_FRONT: &str = "front";
 const TAG_BACK: &str = "back";
@@ -94,6 +95,17 @@ pub struct ArxivAtomEntry {
     pub doi: Option<String>,
 }
 
+/// Single-pass extracted XML payload dispatched by root element local name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XmlDocumentExtraction {
+    /// NISO JATS `<article>` payload (full text or restricted front-matter metadata).
+    Jats(JatsExtraction),
+    /// IETF RFCXML v3 `<rfc>` document.
+    Rfc(ExtractedText),
+    /// Valid XML document whose root element is neither `<article>` nor `<rfc>`.
+    UnsupportedRoot,
+}
+
 /// Rejects forbidden XML DTD markup declarations and internal DTD subsets.
 ///
 /// Scans `xml` outside `<!-- ... -->` comments, `<? ... ?>` processing instructions, and
@@ -112,7 +124,11 @@ pub fn reject_unsafe_xml_dtd(xml: &str) -> Result<(), AdfontesError> {
     let bytes = trimmed_bom.as_bytes();
     let mut index: usize = 0;
 
-    while index < bytes.len() {
+    while let Some(rel_lt) = bytes
+        .get(index..)
+        .and_then(|slice| slice.iter().position(|&byte| byte == b'<'))
+    {
+        index += rel_lt;
         let rest = trimmed_bom.get(index..).unwrap_or_default();
         if rest.starts_with(COMMENT_OPEN) {
             index =
@@ -146,11 +162,26 @@ pub fn reject_unsafe_xml_dtd(xml: &str) -> Result<(), AdfontesError> {
             continue;
         }
 
-        let step = rest.chars().next().map_or(1, char::len_utf8);
-        index += step;
+        index += 1;
     }
 
     Ok(())
+}
+
+/// Parses XML once under DTD/node safety limits and dispatches `<article>` (`JATS`) or `<rfc>`.
+///
+/// # Errors
+///
+/// Returns [`AdfontesError::SafetyBlock`] on forbidden DTD/entity payloads or node-limit
+/// violations, or [`AdfontesError::Extraction`] on malformed XML.
+pub fn extract_xml_document(xml: &str) -> Result<XmlDocumentExtraction, AdfontesError> {
+    let document = parse_safe_xml(xml)?;
+    let extracted = match document.root_element().tag_name().name() {
+        TAG_ARTICLE => XmlDocumentExtraction::Jats(extract_jats_from_document(&document)),
+        TAG_RFC => XmlDocumentExtraction::Rfc(extract_rfc_from_document(&document)),
+        _ => XmlDocumentExtraction::UnsupportedRoot,
+    };
+    Ok(extracted)
 }
 
 /// Parses a NISO JATS XML document into normalized Markdown or [`JatsExtraction::BodyRestricted`].
@@ -161,63 +192,7 @@ pub fn reject_unsafe_xml_dtd(xml: &str) -> Result<(), AdfontesError> {
 /// [`AdfontesError::Extraction`] on malformed XML.
 pub fn extract_jats_xml(xml: &str) -> Result<JatsExtraction, AdfontesError> {
     let document = parse_safe_xml(xml)?;
-    let root = document.root_element();
-    let article = find_jats_article_root(root);
-    let article_meta = find_jats_article_meta(article);
-
-    let title = article_meta
-        .and_then(extract_jats_title)
-        .filter(|text| !text.is_empty());
-    let authors = article_meta.map_or_default(collect_jats_authors);
-    let year = article_meta.and_then(extract_jats_year);
-    let abstract_text = article_meta
-        .and_then(select_jats_abstract_node)
-        .map(|node| render_jats_container(node, ABSTRACT_SUBHEADING_LEVEL))
-        .filter(|text| !text.is_empty());
-
-    let Some(body_node) = article.children().find(|node| node.has_tag_name("body")) else {
-        return Ok(JatsExtraction::BodyRestricted {
-            title,
-            authors,
-            year,
-            abstract_text,
-        });
-    };
-
-    let body_markdown = render_jats_container(body_node, 2);
-    if body_markdown.is_empty() {
-        return Ok(JatsExtraction::BodyRestricted {
-            title,
-            authors,
-            year,
-            abstract_text,
-        });
-    }
-
-    let mut sections = Vec::new();
-    if let Some(ref heading) = title {
-        sections.push(format!("# {heading}"));
-    }
-    if let Some(ref abstract_body) = abstract_text {
-        let mut block = String::from(ABSTRACT_HEADING_MARKDOWN);
-        block.push_str(abstract_body);
-        sections.push(block);
-    }
-    sections.push(body_markdown);
-    if let Some(back_node) = article.children().find(|node| node.has_tag_name(TAG_BACK)) {
-        let appendices = render_jats_appendices(back_node);
-        if !appendices.is_empty() {
-            sections.push(appendices);
-        }
-    }
-
-    Ok(JatsExtraction::FullText {
-        title,
-        authors,
-        year,
-        abstract_text,
-        markdown: normalize_markdown_spacing(&sections.join("\n\n")),
-    })
+    Ok(extract_jats_from_document(&document))
 }
 
 /// Parses an IETF RFCXML v3 (`rfc<N>.xml`) specification into normalized Markdown.
@@ -228,49 +203,7 @@ pub fn extract_jats_xml(xml: &str) -> Result<JatsExtraction, AdfontesError> {
 /// [`AdfontesError::Extraction`] on malformed XML.
 pub fn extract_rfc_xml(xml: &str) -> Result<ExtractedText, AdfontesError> {
     let document = parse_safe_xml(xml)?;
-    let root = document.root_element();
-
-    let front = root.children().find(|node| node.has_tag_name(TAG_FRONT));
-    let title = front
-        .and_then(|node| node.children().find(|child| child.has_tag_name(TAG_TITLE)))
-        .map(collect_inline_xml_text)
-        .filter(|text| !text.is_empty());
-
-    let mut out = String::new();
-    if let Some(ref heading) = title {
-        push_markdown_heading(&mut out, 1, heading);
-    }
-
-    if let Some(abstract_node) = front.and_then(|node| {
-        node.children()
-            .find(|child| child.has_tag_name(TAG_ABSTRACT))
-    }) {
-        let text = render_rfc_container(abstract_node, ABSTRACT_SUBHEADING_LEVEL);
-        if !text.is_empty() {
-            out.push_str(ABSTRACT_HEADING_MARKDOWN);
-            out.push_str(&text);
-            out.push_str("\n\n");
-        }
-    }
-
-    if let Some(middle) = root.children().find(|node| node.has_tag_name("middle")) {
-        out.push_str(&render_rfc_container(middle, 2));
-        out.push_str("\n\n");
-    }
-    if let Some(back) = root.children().find(|node| node.has_tag_name(TAG_BACK)) {
-        for section in back
-            .children()
-            .filter(|node| node.has_tag_name(TAG_SECTION))
-        {
-            out.push_str(&render_rfc_single_section(section, 2));
-            out.push_str("\n\n");
-        }
-    }
-
-    Ok(ExtractedText {
-        title,
-        markdown: normalize_markdown_spacing(&out),
-    })
+    Ok(extract_rfc_from_document(&document))
 }
 
 /// Parses the first entry from an `export.arxiv.org/api/query` Atom XML feed.
@@ -432,6 +365,112 @@ fn parse_safe_xml(xml: &str) -> Result<Document<'_>, AdfontesError> {
             detail: format!("XML parse error: {other}"),
         },
     })
+}
+
+fn extract_jats_from_document(document: &Document<'_>) -> JatsExtraction {
+    let root = document.root_element();
+    let article = find_jats_article_root(root);
+    let article_meta = find_jats_article_meta(article);
+
+    let title = article_meta
+        .and_then(extract_jats_title)
+        .filter(|text| !text.is_empty());
+    let authors = article_meta.map_or_default(collect_jats_authors);
+    let year = article_meta.and_then(extract_jats_year);
+    let abstract_text = article_meta
+        .and_then(select_jats_abstract_node)
+        .map(|node| render_jats_container(node, ABSTRACT_SUBHEADING_LEVEL))
+        .filter(|text| !text.is_empty());
+
+    let Some(body_node) = article.children().find(|node| node.has_tag_name("body")) else {
+        return JatsExtraction::BodyRestricted {
+            title,
+            authors,
+            year,
+            abstract_text,
+        };
+    };
+
+    let body_markdown = render_jats_container(body_node, 2);
+    if body_markdown.is_empty() {
+        return JatsExtraction::BodyRestricted {
+            title,
+            authors,
+            year,
+            abstract_text,
+        };
+    }
+
+    let mut sections = Vec::new();
+    if let Some(ref heading) = title {
+        sections.push(format!("# {heading}"));
+    }
+    if let Some(ref abstract_body) = abstract_text {
+        let mut block = String::from(ABSTRACT_HEADING_MARKDOWN);
+        block.push_str(abstract_body);
+        sections.push(block);
+    }
+    sections.push(body_markdown);
+    if let Some(back_node) = article.children().find(|node| node.has_tag_name(TAG_BACK)) {
+        let appendices = render_jats_appendices(back_node);
+        if !appendices.is_empty() {
+            sections.push(appendices);
+        }
+    }
+
+    JatsExtraction::FullText {
+        title,
+        authors,
+        year,
+        abstract_text,
+        markdown: normalize_markdown_spacing(&sections.join("\n\n")),
+    }
+}
+
+fn extract_rfc_from_document(document: &Document<'_>) -> ExtractedText {
+    let root = document.root_element();
+
+    let front = root.children().find(|node| node.has_tag_name(TAG_FRONT));
+    let title = front
+        .and_then(|node| node.children().find(|child| child.has_tag_name(TAG_TITLE)))
+        .map(collect_inline_xml_text)
+        .filter(|text| !text.is_empty());
+
+    let mut out = String::new();
+    if let Some(ref heading) = title {
+        push_markdown_heading(&mut out, 1, heading);
+    }
+
+    if let Some(abstract_node) = front.and_then(|node| {
+        node.children()
+            .find(|child| child.has_tag_name(TAG_ABSTRACT))
+    }) {
+        let text = render_rfc_container(abstract_node, ABSTRACT_SUBHEADING_LEVEL);
+        if !text.is_empty() {
+            out.push_str(ABSTRACT_HEADING_MARKDOWN);
+            out.push_str(&text);
+            out.push_str("\n\n");
+        }
+    }
+
+    if let Some(middle) = root.children().find(|node| node.has_tag_name("middle")) {
+        out.push_str(&render_rfc_container(middle, 2));
+        out.push_str("\n\n");
+    }
+    if let Some(back) = root.children().find(|node| node.has_tag_name(TAG_BACK)) {
+        for section in back
+            .children()
+            .filter(|node| node.has_tag_name(TAG_SECTION))
+        {
+            out.push_str(&render_rfc_single_section(section, 2));
+            out.push_str("\n\n");
+        }
+    }
+
+    ExtractedText {
+        title,
+        markdown: normalize_markdown_spacing(&out),
+    }
 }
 
 fn find_jats_article_root<'a, 'input>(root: Node<'a, 'input>) -> Node<'a, 'input> {
@@ -772,19 +811,7 @@ fn drain_rfc_stack(stack: &mut Vec<RfcStep<'_, '_>>, buffers: &mut Vec<String>) 
                 if let Some(inner) = buffers.pop()
                     && let Some(parent_out) = buffers.last_mut()
                 {
-                    let normalized = normalize_markdown_spacing(&inner);
-                    if !normalized.is_empty() {
-                        for line in normalized.lines() {
-                            if line.is_empty() {
-                                parent_out.push_str(">\n");
-                            } else {
-                                parent_out.push_str("> ");
-                                parent_out.push_str(line);
-                                parent_out.push('\n');
-                            }
-                        }
-                        parent_out.push('\n');
-                    }
+                    push_markdown_blockquote(parent_out, &inner);
                 }
             }
             RfcStep::Node {
@@ -1184,38 +1211,33 @@ mod tests {
     }
 
     #[test]
-    fn renders_jats_headings_and_inline_math() {
+    fn renders_jats_headings_math_lists_tables_and_isolates_nested_tables() {
         let JatsExtraction::FullText { markdown, .. } =
             extract_jats_xml(sample_jats_article()).unwrap()
         else {
             panic!("expected full text JATS");
         };
-        assert!(markdown.contains("### Background"));
-        assert!(markdown.contains("## 1 Methods"));
-        assert!(markdown.contains("$E = mc^2$"));
-    }
+        insta::assert_snapshot!(markdown, @"
+        # Clinical Trial Synthesis
 
-    #[test]
-    fn renders_jats_display_formula_without_mathml_duplication() {
-        let JatsExtraction::FullText { markdown, .. } =
-            extract_jats_xml(sample_jats_article()).unwrap()
-        else {
-            panic!("expected full text JATS");
-        };
-        assert!(markdown.contains("$$F = ma$$"));
-        assert!(!markdown.contains("glyphsoup"));
-    }
+        ## Abstract
 
-    #[test]
-    fn renders_jats_ordered_lists_table_labels_and_isolates_nested_tables() {
-        let JatsExtraction::FullText { markdown, .. } =
-            extract_jats_xml(sample_jats_article()).unwrap()
-        else {
-            panic!("expected full text JATS");
-        };
-        assert!(markdown.contains("1. First step"));
-        assert!(markdown.contains("**Table 1: Outcome metrics**"));
-        assert!(!markdown.contains("| NESTED |"));
+        ### Background
+
+        Short summary.
+
+        ## 1 Methods
+
+        Energy satisfies $E = mc^2$ and display $$F = ma$$ .
+
+        1. First step
+
+        **Table 1: Outcome metrics**
+
+        | Group | Score |
+        | --- | --- |
+        | A | 10NESTED |
+        ");
     }
 
     #[test]
@@ -1290,8 +1312,13 @@ mod tests {
         "#};
         let rfc = extract_rfc_xml(rfc_xml).unwrap();
         assert_eq!(rfc.title.as_deref(), Some("HTTP Semantics"));
-        assert!(rfc.markdown.contains("`GET`"));
-        assert!(rfc.markdown.contains("[RFC9110]"));
+        insta::assert_snapshot!(rfc.markdown, @"
+        # HTTP Semantics
+
+        ## Overview
+
+        Request methods use `GET` as defined in [RFC9110].
+        ");
     }
 
     #[test]
@@ -1313,15 +1340,22 @@ mod tests {
               </middle>
             </rfc>
         "#};
-        let expected_code = indoc! {r"
-            ```abnf
-            field-name = token
-            ```
-        "};
         let rfc = extract_rfc_xml(rfc_xml).unwrap();
-        assert!(rfc.markdown.contains("**Packet Format**"));
-        assert!(rfc.markdown.contains("+-+---+-+"));
-        assert!(rfc.markdown.contains(expected_code.trim_end()));
+        insta::assert_snapshot!(rfc.markdown, @"
+        # HTTP Semantics
+
+        ## Grammar
+
+        **Packet Format**
+
+        ```
+        +-+---+-+
+        ```
+
+        ```abnf
+        field-name = token
+        ```
+        ");
     }
 
     #[test]
@@ -1401,5 +1435,54 @@ mod tests {
         assert!(extracted.markdown.contains("[inner]"));
         assert!(!extracted.markdown.contains("[sec1]"));
         assert!(extracted.markdown.contains("[sec2]"));
+    }
+
+    #[test]
+    fn extract_xml_document_dispatches_article_rfc_and_other() {
+        let rfc_xml = "<rfc><front><title>Spec</title></front><middle><section><name>Intro</name><t>Body.</t></section></middle></rfc>";
+        let namespaced_jats = "\u{FEFF}<!-- αβγ — leading UTF-8 comment --><jats:article xmlns:jats=\"http://jats.nlm.nih.gov\"><jats:front><jats:article-meta><jats:title-group><jats:article-title>Study</jats:article-title></jats:title-group></jats:article-meta></jats:front></jats:article>";
+
+        let jats = extract_xml_document(sample_jats_article()).unwrap();
+        let ns_jats = extract_xml_document(namespaced_jats).unwrap();
+        let rfc = extract_xml_document(rfc_xml).unwrap();
+        let other = extract_xml_document("<other/>").unwrap();
+
+        assert!(matches!(
+            jats,
+            XmlDocumentExtraction::Jats(JatsExtraction::FullText { .. })
+        ));
+        assert!(matches!(
+            ns_jats,
+            XmlDocumentExtraction::Jats(JatsExtraction::BodyRestricted { .. })
+        ));
+        assert!(matches!(rfc, XmlDocumentExtraction::Rfc(_)));
+        assert_eq!(other, XmlDocumentExtraction::UnsupportedRoot);
+    }
+
+    #[test]
+    fn extract_xml_document_blocks_internal_dtd() {
+        let xxe = "<!DOCTYPE doc [<!ENTITY x SYSTEM \"file:///etc/passwd\">]><doc/>";
+        assert!(matches!(
+            extract_xml_document(xxe).unwrap_err(),
+            AdfontesError::SafetyBlock { .. }
+        ));
+    }
+
+    #[rstest]
+    #[case("<!-- unterminated UTF-8 — comment")]
+    #[case("<?xml unterminated pi")]
+    fn reject_unsafe_xml_dtd_reports_extraction_error_on_unterminated_delimiters(
+        #[case] xml: &str,
+    ) {
+        assert!(matches!(
+            reject_unsafe_xml_dtd(xml).unwrap_err(),
+            AdfontesError::Extraction { .. }
+        ));
+    }
+
+    #[test]
+    fn reject_unsafe_xml_dtd_scans_multibyte_utf8_and_trailing_angle_bracket() {
+        let clean = "\u{FEFF}<?xml version=\"1.0\"?><!-- αβγ --><doc>café &amp; naïve <";
+        assert!(reject_unsafe_xml_dtd(clean).is_ok());
     }
 }

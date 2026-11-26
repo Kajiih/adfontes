@@ -1,7 +1,8 @@
-//! Math-preserving HTML5, JATS/RFCXML/Atom XML, IETF RFC, TeX, and plain-text extractors.
+//! Math-preserving HTML5, JATS/RFCXML/Atom XML, IETF RFC, TeX, `CommonMark` TOC, and fragment extractors.
 //!
 //! All extractors operate strictly in memory over validated UTF-8 text or bounded archive bytes
-//! without network access, isolating `scraper` and `roxmltree` behind pure domain outputs.
+//! without network access, isolating `cssparser`, `scraper`, `roxmltree`, and `pulldown_cmark`
+//! behind pure domain outputs.
 
 architecture_component!(Extract);
 
@@ -19,6 +20,6 @@ pub use self::title::{
     sanitize_inline_text,
 };
 pub use self::xml::{
-    ArxivAtomEntry, JatsExtraction, extract_jats_xml, extract_rfc_xml, parse_arxiv_atom_feed,
-    reject_unsafe_xml_dtd,
+    ArxivAtomEntry, JatsExtraction, XmlDocumentExtraction, extract_jats_xml, extract_rfc_xml,
+    extract_xml_document, parse_arxiv_atom_feed, reject_unsafe_xml_dtd,
 };

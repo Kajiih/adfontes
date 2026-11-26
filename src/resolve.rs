@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::extract::{
-    JatsExtraction, clean_rfc_text, extract_arxiv_source_archive, extract_html_to_markdown,
-    extract_jats_xml, extract_markdown_toc, extract_rfc_xml, extract_text_title,
-    normalize_markdown_spacing, parse_arxiv_atom_feed, reject_unsafe_xml_dtd, sanitize_inline_text,
+    JatsExtraction, XmlDocumentExtraction, clean_html_fragment, clean_rfc_text,
+    extract_arxiv_source_archive, extract_html_to_markdown, extract_jats_xml, extract_markdown_toc,
+    extract_rfc_xml, extract_text_title, extract_xml_document, normalize_markdown_spacing,
+    parse_arxiv_atom_feed, sanitize_inline_text,
 };
 use crate::model::{
     AdfontesError, ArxivId, Doi, ExtractedDocument, ExtractedPayload, HttpUrl, ParsedTarget, PmcId,
@@ -1278,68 +1279,57 @@ fn try_dispatch_xml_response(
     }
     let raw_len = response.body.len();
     let xml = response.decode_text();
-    match reject_unsafe_xml_dtd(&xml) {
-        Ok(()) => {}
-        Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-        Err(_) => return Ok(None),
-    }
-
-    match detect_xml_root_local_name(&xml) {
-        Some("article") => match extract_jats_xml(&xml) {
-            Ok(JatsExtraction::FullText {
-                title,
-                authors,
-                year,
-                abstract_text,
-                markdown,
-            }) => {
-                fill_metadata_if_missing(metadata, title, authors, year, abstract_text);
-                return Ok(Some(ExtractedDocument {
-                    metadata: metadata.clone(),
-                    payload: ExtractedPayload::FullText {
-                        format: TextFormat::JatsXml,
-                        markdown,
-                    },
-                    raw_bytes_fetched: raw_len,
-                }));
-            }
-            Ok(JatsExtraction::BodyRestricted {
-                title,
-                authors,
-                year,
-                abstract_text,
-            }) => {
-                fill_metadata_if_missing(metadata, title, authors, year, abstract_text);
-                return Ok(Some(ExtractedDocument {
-                    metadata: metadata.clone(),
-                    payload: ExtractedPayload::MetadataOnly {
-                        reason: UnavailableReason::BodyRestricted,
-                    },
-                    raw_bytes_fetched: raw_len,
-                }));
-            }
-            Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-            Err(_) => {}
-        },
-        Some("rfc") => match extract_rfc_xml(&xml) {
-            Ok(extracted) if !extracted.markdown.is_empty() => {
+    match extract_xml_document(&xml) {
+        Ok(XmlDocumentExtraction::Jats(JatsExtraction::FullText {
+            title,
+            authors,
+            year,
+            abstract_text,
+            markdown,
+        })) => {
+            fill_metadata_if_missing(metadata, title, authors, year, abstract_text);
+            Ok(Some(ExtractedDocument {
+                metadata: metadata.clone(),
+                payload: ExtractedPayload::FullText {
+                    format: TextFormat::JatsXml,
+                    markdown,
+                },
+                raw_bytes_fetched: raw_len,
+            }))
+        }
+        Ok(XmlDocumentExtraction::Jats(JatsExtraction::BodyRestricted {
+            title,
+            authors,
+            year,
+            abstract_text,
+        })) => {
+            fill_metadata_if_missing(metadata, title, authors, year, abstract_text);
+            Ok(Some(ExtractedDocument {
+                metadata: metadata.clone(),
+                payload: ExtractedPayload::MetadataOnly {
+                    reason: UnavailableReason::BodyRestricted,
+                },
+                raw_bytes_fetched: raw_len,
+            }))
+        }
+        Ok(XmlDocumentExtraction::Rfc(extracted)) if !extracted.markdown.is_empty() => {
+            if metadata.title.is_none() {
                 metadata.title = extracted.title;
-                return Ok(Some(ExtractedDocument {
-                    metadata: metadata.clone(),
-                    payload: ExtractedPayload::FullText {
-                        format: TextFormat::RfcXml,
-                        markdown: extracted.markdown,
-                    },
-                    raw_bytes_fetched: raw_len,
-                }));
             }
-            Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-            Ok(_) | Err(_) => {}
-        },
-        _ => {}
+            Ok(Some(ExtractedDocument {
+                metadata: metadata.clone(),
+                payload: ExtractedPayload::FullText {
+                    format: TextFormat::RfcXml,
+                    markdown: extracted.markdown,
+                },
+                raw_bytes_fetched: raw_len,
+            }))
+        }
+        Err(safety @ AdfontesError::SafetyBlock { .. }) => Err(safety),
+        Ok(XmlDocumentExtraction::Rfc(_) | XmlDocumentExtraction::UnsupportedRoot) | Err(_) => {
+            Ok(None)
+        }
     }
-
-    Ok(None)
 }
 
 fn fetch_optional_json(
@@ -1410,8 +1400,7 @@ fn merge_csl_metadata(json: &Value, metadata: &mut WorkMetadata) {
         metadata.abstract_text = json
             .get(JSON_FIELD_ABSTRACT)
             .and_then(Value::as_str)
-            .map(strip_simple_markup_tags)
-            .map(|text| sanitize_inline_text(&text))
+            .map(clean_html_fragment)
             .filter(|val| !val.is_empty());
     }
 }
@@ -1653,8 +1642,7 @@ fn merge_europe_pmc_record(
         metadata.abstract_text = record
             .get("abstractText")
             .and_then(Value::as_str)
-            .map(strip_simple_markup_tags)
-            .map(|text| sanitize_inline_text(&text))
+            .map(clean_html_fragment)
             .filter(|val| !val.is_empty());
     }
     if let Some(urls) = record
@@ -1863,25 +1851,6 @@ fn parse_json_year(value: &Value) -> Option<u16> {
         .and_then(|prefix| prefix.parse::<u16>().ok())
 }
 
-fn strip_simple_markup_tags(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut inside_tag = false;
-    for character in input.chars() {
-        match character {
-            '<' => {
-                inside_tag = true;
-                out.push(' ');
-            }
-            '>' if inside_tag => {
-                inside_tag = false;
-            }
-            _ if !inside_tag => out.push(character),
-            _ => {}
-        }
-    }
-    out
-}
-
 fn extract_pmcid_from_value(raw: &str) -> Option<PmcId> {
     let trimmed = raw.trim().trim_end_matches('/');
     if let Ok(direct) = PmcId::parse(trimmed) {
@@ -1984,38 +1953,6 @@ fn is_substantive_oa_html(markdown: &str) -> bool {
     } else {
         body_headings >= MIN_OA_BODY_HEADINGS || char_count >= MIN_OA_LANDING_HEADINGLESS_CHARS
     }
-}
-
-fn detect_xml_root_local_name(xml: &str) -> Option<&str> {
-    let mut rest = xml.trim_start_matches('\u{FEFF}');
-    loop {
-        rest = rest.trim_start();
-        if let Some(after_pi) = rest.strip_prefix("<?") {
-            let end = after_pi.find("?>")?;
-            rest = after_pi.get(end + "?>".len()..)?;
-            continue;
-        }
-        if let Some(after_comment) = rest.strip_prefix("<!--") {
-            let end = after_comment.find("-->")?;
-            rest = after_comment.get(end + "-->".len()..)?;
-            continue;
-        }
-        if let Some(after_decl) = rest.strip_prefix("<!") {
-            let end = after_decl.find('>')?;
-            rest = after_decl.get(end + 1..)?;
-            continue;
-        }
-        break;
-    }
-    let after_open = rest.strip_prefix('<')?;
-    let name_len = after_open
-        .find(|character: char| character.is_whitespace() || matches!(character, '>' | '/'))
-        .unwrap_or(after_open.len());
-    let full_name = after_open.get(..name_len)?;
-    let local_name = full_name
-        .rsplit_once(':')
-        .map_or(full_name, |(_, local)| local);
-    (!local_name.is_empty()).then_some(local_name)
 }
 
 fn is_arxiv_abs_url(url: &HttpUrl) -> bool {
@@ -2850,6 +2787,31 @@ mod tests {
         assert_eq!(
             doc.metadata.title.as_deref(),
             Some("Unpaywall Routed Title")
+        );
+    }
+
+    #[test]
+    fn csl_and_europe_pmc_abstracts_preserve_decoded_math_inequalities() {
+        let mut csl_meta = WorkMetadata::default();
+        let csl_json = serde_json::json!({
+            "abstract": "<jats:p>Significance at <i>p</i> &lt; 0.05 and <b>n</b> &gt; 10.</jats:p>"
+        });
+        merge_csl_metadata(&csl_json, &mut csl_meta);
+
+        let mut epmc_meta = WorkMetadata::default();
+        let mut oa_pdfs = Vec::new();
+        let epmc_json = serde_json::json!({
+            "abstractText": "<p>First result.</p><p>Second &lt; 0.01.</p>"
+        });
+        merge_europe_pmc_record(&epmc_json, &mut epmc_meta, &mut oa_pdfs);
+
+        assert_eq!(
+            csl_meta.abstract_text.as_deref(),
+            Some("Significance at p < 0.05 and n > 10.")
+        );
+        assert_eq!(
+            epmc_meta.abstract_text.as_deref(),
+            Some("First result. Second < 0.01.")
         );
     }
 }
