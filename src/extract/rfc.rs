@@ -215,9 +215,17 @@ mod tests {
         );
         let extracted = clean_rfc_text(sample);
         assert_eq!(extracted.title.as_deref(), Some("HTTP Semantics"));
-        assert!(!extracted.markdown.contains("[Page 1]"));
-        assert!(!extracted.markdown.contains('\x0c'));
-        assert!(extracted.markdown.contains("field-value OWS"));
+        insta::assert_snapshot!(extracted.markdown, @r#"
+        Internet Engineering Task Force (IETF)                        R. Fielding
+        Request for Comments: 9110                                      June 2022
+
+                                    HTTP Semantics
+
+        Abstract
+
+           field-line = field-name ":" OWS
+                        field-value OWS
+        "#);
     }
 
     #[test]
@@ -235,16 +243,14 @@ mod tests {
         );
         let extracted = clean_rfc_text(sample);
         assert_eq!(extracted.title.as_deref(), Some("Test Protocol"));
-        assert!(!extracted.markdown.contains("RFC 9999"));
-        assert!(
-            extracted
-                .markdown
-                .contains("RFC 7230 was superseded in June 2014")
-        );
-        assert!(
-            extracted
-                .markdown
-                .contains("continued prose after bare form feed")
-        );
+        insta::assert_snapshot!(extracted.markdown, @"
+        Network Working Group                                           J. Author
+        Request for Comments: 9999                                   January 2026
+
+                                    Test Protocol
+
+        RFC 7230 was superseded in June 2014
+           continued prose after bare form feed
+        ");
     }
 }

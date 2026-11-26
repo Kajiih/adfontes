@@ -1167,41 +1167,43 @@ mod tests {
     }
 
     #[test]
-    fn flattens_nested_inputs_and_preserves_title_and_inline_math() {
+    fn flattens_multifile_tex_preserving_math_macros_and_comment_parity() {
         let files = sample_multifile_tex();
         let extracted = flatten_and_convert_tex(&files, "main.tex").unwrap();
         assert_eq!(
             extracted.title.as_deref(),
             Some(r"Fractional **Sizing** with {Nested {Braces}} \\")
         );
-        assert!(extracted.markdown.contains("## Introduction"));
-        assert!(
-            extracted
-                .markdown
-                .contains(r"$\textbf{W}\textbf{x} + P(\text{event})$")
-        );
-    }
+        insta::assert_snapshot!(extracted.markdown, @r"
+        # Fractional **Sizing** with {Nested {Braces}} \\
 
-    #[test]
-    fn preserves_line_breaks_custom_macros_and_math_environments() {
-        let files = sample_multifile_tex();
-        let extracted = flatten_and_convert_tex(&files, "main.tex").unwrap();
-        assert!(extracted.markdown.contains("Line 2 before"));
-        assert!(extracted.markdown.contains(r"\centeringbox"));
-        assert!(extracted.markdown.contains(r"\begin{align}"));
-        assert!(
-            extracted
-                .markdown
-                .contains(r"g(f) = \mu f - \frac{1}{2} \sigma^2 f^2")
-        );
-    }
+        ## Abstract
 
-    #[test]
-    fn strips_comments_using_exact_backslash_parity() {
-        let files = sample_multifile_tex();
-        let extracted = flatten_and_convert_tex(&files, "main.tex").unwrap();
-        assert!(extracted.markdown.contains("50\\% growth"));
-        assert!(!extracted.markdown.contains("trailing comment"));
+        Shows 50\% growth \\
+
+        ## Introduction
+
+        Inline math $\textbf{W}\textbf{x} + P(\text{event})$ stays intact.
+        Line 1\\[6pt] Line 2 before
+
+        $$
+        x = 1
+        $$
+
+         and \\input{ignored}.
+        Custom macro \centeringbox stays intact.
+
+        $$
+        \begin{align}
+        a &= b \\
+        c &= d
+        \end{align}
+        $$
+
+        $$
+        g(f) = \mu f - \frac{1}{2} \sigma^2 f^2
+        $$
+        ");
     }
 
     #[test]
@@ -1214,8 +1216,12 @@ mod tests {
 
         let parsed_tar = extract_arxiv_source_archive(&good_targz).unwrap();
         let parsed_single = extract_arxiv_source_archive(&single_gz).unwrap();
-        assert!(parsed_tar.markdown.contains("## Hello"));
-        assert!(parsed_single.markdown.contains("## Hello"));
+        assert_eq!(parsed_tar, parsed_single);
+        insta::assert_snapshot!(parsed_tar.markdown, @"
+        ## Hello
+
+        World
+        ");
     }
 
     #[test]
