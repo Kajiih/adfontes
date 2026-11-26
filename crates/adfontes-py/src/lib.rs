@@ -14,7 +14,7 @@ fn adfontes_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 /// Executes the `adfontes` CLI or stdio MCP server from `args`, releasing the Python GIL during
 /// execution while checking pending Python signals (such as `SIGINT` / `KeyboardInterrupt`) on
-/// interrupted stdio reads and on return.
+/// interrupted stdio reads, during async network I/O, and on return.
 #[pyfunction]
 fn run_cli(py: Python<'_>, args: Vec<OsString>) -> PyResult<u8> {
     let mut pending_signal_error: Option<PyErr> = None;

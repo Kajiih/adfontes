@@ -1,27 +1,29 @@
-//! SSRF-pinned synchronous `GET`/`HEAD` HTTP(S) transport and WHATWG charset decoding.
+//! SSRF-pinned asynchronous `GET` HTTP(S) transport and WHATWG charset decoding.
 //!
-//! Encapsulates `ureq` (`rustls` + OS platform verifier) and `encoding_rs` behind hop-by-hop
-//! redirect validation, DNS/IP pinning against rebinding attacks, strict scheme-specific HTTP(S)
-//! proxy selection, end-to-end request deadlines, bounded body streaming, and safe `gzip`/`deflate`
-//! content decoding.
+//! Encapsulates `reqwest` (`rustls` with `ring` + OS platform verifier) and `encoding_rs` behind
+//! hop-by-hop redirect validation, DNS/IP pinning against rebinding attacks, strict
+//! scheme-specific HTTP(S) proxy selection, end-to-end request deadlines, bounded body streaming,
+//! and safe `gzip`/`deflate` content decoding.
 
 architecture_component!(Transport);
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::error::Error as StdError;
+use std::fmt;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use encoding_rs::Encoding;
-use ureq::Agent;
-use ureq::config::Config;
-use ureq::http::Uri;
-use ureq::tls::{RootCerts, TlsConfig};
-use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
-use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use mime::Mime;
+use reqwest::StatusCode;
+use reqwest::header::{
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderMap,
+    HeaderName, HeaderValue, LOCATION,
+};
+use tokio::sync::Semaphore;
 
 use crate::archive::{is_gzip_magic, safe_gunzip_bytes, safe_inflate_bytes};
 use crate::model::{AdfontesError, HttpUrl, UrlHost};
@@ -36,49 +38,41 @@ pub const DEFAULT_MAX_REDIRECTS: usize = 6;
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 25 * 1024 * 1024;
 
 /// Default descriptive `User-Agent` sent on outbound scholarly API requests.
-pub const DEFAULT_USER_AGENT: &str = "adfontes/0.1.0 (+https://github.com/Kajiih/adfontes)";
+pub const DEFAULT_USER_AGENT: &str = concat!(
+    "adfontes/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/Kajiih/adfontes)"
+);
 
 const MAX_PINNED_SOCKET_ADDRS: usize = 16;
-const BODY_READ_CHUNK_SIZE: usize = 16 * 1024;
 const MAX_CONTENT_ENCODING_LAYERS: usize = 2;
 const LOCALHOST_NAME: &str = "localhost";
 const SCHEME_HTTP: &str = "http";
 const SCHEME_HTTPS: &str = "https";
-const HEADER_CONTENT_ENCODING: &str = "content-encoding";
 const ENCODING_GZIP: &str = "gzip";
 const ENCODING_X_GZIP: &str = "x-gzip";
-const ASCII_PRINTABLE_FIRST: u8 = 0x20;
-const ASCII_PRINTABLE_LAST: u8 = 0x7E;
-const MAX_IPV4_PREFIX_BITS: u8 = 32;
-const MAX_IPV6_PREFIX_BITS: u8 = 128;
 
-const HTTP_STATUS_MOVED_PERMANENTLY: u16 = 301;
-const HTTP_STATUS_FOUND: u16 = 302;
-const HTTP_STATUS_SEE_OTHER: u16 = 303;
-const HTTP_STATUS_TEMPORARY_REDIRECT: u16 = 307;
-const HTTP_STATUS_PERMANENT_REDIRECT: u16 = 308;
+const FORBIDDEN_IPV4_NETS: [Ipv4Net; 6] = [
+    Ipv4Net::new_assert(Ipv4Addr::UNSPECIFIED, 8),
+    Ipv4Net::new_assert(Ipv4Addr::new(100, 64, 0, 0), 10),
+    Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 0, 0), 24),
+    Ipv4Net::new_assert(Ipv4Addr::new(192, 88, 99, 0), 24),
+    Ipv4Net::new_assert(Ipv4Addr::new(198, 18, 0, 0), 15),
+    Ipv4Net::new_assert(Ipv4Addr::new(240, 0, 0, 0), 4),
+];
 
-const IPV4_CGNAT_FIRST: u8 = 100;
-const IPV4_CGNAT_MASK: u8 = 0xC0;
-const IPV4_CGNAT_SECOND: u8 = 64;
-const IPV4_IETF_PROTOCOL_FIRST: u8 = 192;
-const IPV4_SIX_TO_FOUR_RELAY_SECOND: u8 = 88;
-const IPV4_SIX_TO_FOUR_RELAY_THIRD: u8 = 99;
-const IPV4_BENCHMARK_FIRST: u8 = 198;
-const IPV4_BENCHMARK_MASK: u8 = 0xFE;
-const IPV4_BENCHMARK_SECOND: u8 = 18;
-const IPV4_CLASS_E_START: u8 = 240;
-
-const IPV6_GLOBAL_UNICAST_MASK: u16 = 0xE000;
-const IPV6_GLOBAL_UNICAST_PREFIX: u16 = 0x2000;
-const IPV6_IETF_SPECIAL_HEAD: u16 = 0x2001;
-const IPV6_IETF_PROTOCOL_MASK: u16 = 0xFE00;
-const IPV6_DOCUMENTATION_SECOND: u16 = 0x0DB8;
-const IPV6_RFC9637_DOC_HEAD: u16 = 0x3FFF;
-const IPV6_RFC9637_DOC_SECOND_MASK: u16 = 0xF000;
-const IPV6_SIX_TO_FOUR_HEAD: u16 = 0x2002;
-const IPV6_NAT64_HEAD: u16 = 0x0064;
-const IPV6_NAT64_SECOND: u16 = 0xFF9B;
+const IPV6_NAT64_WKP: Ipv6Net =
+    Ipv6Net::new_assert(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0), 96);
+const IPV6_GLOBAL_UNICAST: Ipv6Net =
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0), 3);
+const IPV6_TEREDO: Ipv6Net = Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32);
+const IPV6_SIX_TO_FOUR: Ipv6Net =
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16);
+const FORBIDDEN_IPV6_NETS: [Ipv6Net; 3] = [
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
+];
 
 const FORBIDDEN_EXACT_HOSTS: &[&str] = &[
     LOCALHOST_NAME,
@@ -182,7 +176,7 @@ impl ProxyConfig {
     /// Selects and validates the HTTP(S) proxy URL applicable to `url` by scheme and `NO_PROXY`.
     ///
     /// Rejects unsupported proxy schemes such as `socks5://` cleanly instead of passing them to
-    /// `ureq` without `socks-proxy` enabled.
+    /// `reqwest` without the `socks` feature enabled.
     ///
     /// # Errors
     ///
@@ -285,8 +279,7 @@ impl HttpResponse {
     pub fn mime_type(&self) -> String {
         self.content_type
             .as_deref()
-            .and_then(|value| value.split(';').next())
-            .map_or_default(|media| media.trim().to_ascii_lowercase())
+            .map_or_default(parse_media_type)
     }
 
     /// Decodes [`Self::body`] to UTF-8 using BOM detection, HTTP `charset=` label, or UTF-8 fallback.
@@ -300,35 +293,34 @@ impl HttpResponse {
         let encoding = self
             .content_type
             .as_deref()
-            .and_then(extract_charset_label)
-            .and_then(|label| Encoding::for_label(label.as_bytes()))
-            .unwrap_or(encoding_rs::UTF_8);
+            .map_or(encoding_rs::UTF_8, encoding_from_content_type);
         let (decoded, _, _) = encoding.decode(&self.body);
         decoded.into_owned()
     }
 }
 
-/// Synchronous SSRF-pinned HTTP(S) client supporting only read-only `GET` and `HEAD` methods.
+/// Asynchronous SSRF-pinned HTTP(S) client supporting only read-only `GET` requests.
 #[derive(Debug, Clone)]
 pub struct HttpClient {
     config: TransportConfig,
-    tls_config: TlsConfig,
+    tls_config: Arc<Result<rustls::ClientConfig, String>>,
+    direct_client: Result<reqwest::Client, String>,
+    proxy_clients: Arc<Mutex<HashMap<String, reqwest::Client>>>,
 }
 
 impl HttpClient {
-    /// Constructs a new [`HttpClient`] caching the OS `PlatformVerifier` TLS configuration.
+    /// Constructs a new [`HttpClient`] caching the OS `PlatformVerifier` TLS configuration and
+    /// SSRF-pinned HTTP connection pools.
     #[must_use]
     pub fn new(config: TransportConfig) -> Self {
-        let tls_config = TlsConfig::builder()
-            .root_certs(RootCerts::PlatformVerifier)
-            .build();
-        Self { config, tls_config }
-    }
-
-    /// Returns a reference to the active [`TransportConfig`].
-    #[must_use]
-    pub const fn config(&self) -> &TransportConfig {
-        &self.config
+        let tls_config = Arc::new(build_platform_tls_config());
+        let direct_client = build_direct_client(&config, &tls_config);
+        Self {
+            config,
+            tls_config,
+            direct_client,
+            proxy_clients: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Executes a validated `GET` request with optional `Accept` header and extra headers.
@@ -341,23 +333,13 @@ impl HttpClient {
     /// Returns [`AdfontesError::SafetyBlock`] if any hop targets a forbidden host/IP, exceeds the
     /// redirect cap, or exceeds `max_response_bytes`; returns [`AdfontesError::Transport`] on
     /// network, DNS, header, proxy, or TLS failures.
-    pub fn get(
+    pub async fn get(
         &self,
         url: &HttpUrl,
         accept: Option<&str>,
         extra_headers: &[(&str, &str)],
     ) -> Result<HttpResponse, AdfontesError> {
-        self.execute(HttpMethod::Get, url, accept, extra_headers)
-    }
-
-    /// Executes a validated `HEAD` request without reading a response body.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AdfontesError::SafetyBlock`] or [`AdfontesError::Transport`] on validation or
-    /// network failures.
-    pub fn head(&self, url: &HttpUrl) -> Result<HttpResponse, AdfontesError> {
-        self.execute(HttpMethod::Head, url, None, &[])
+        self.execute(url, accept, extra_headers).await
     }
 
     /// Validates `url` against static SSRF and configured blocked-host rules without performing
@@ -375,9 +357,8 @@ impl HttpClient {
         )
     }
 
-    fn execute(
+    async fn execute(
         &self,
-        method: HttpMethod,
         initial_url: &HttpUrl,
         accept: Option<&str>,
         extra_headers: &[(&str, &str)],
@@ -389,40 +370,38 @@ impl HttpClient {
             .checked_add(self.config.timeout)
             .unwrap_or_else(Instant::now);
         let initial_origin = url_origin(initial_url);
+        let mut same_origin = true;
         let mut current_url = initial_url.clone();
         let mut redirect_chain = Vec::new();
 
         for hop in 0..=self.config.max_redirects {
+            same_origin &= url_origin(&current_url) == initial_origin;
             let remaining = remaining_timeout(deadline, current_url.as_str())?;
             let allow_loopback = self.is_loopback_target_allowed(&current_url);
+            validate_hostname_policy_with_suffixes(
+                &current_url,
+                allow_loopback,
+                &self.config.blocked_host_suffixes,
+            )?;
             let proxy_url = self
                 .config
                 .proxy
                 .resolve_proxy_for_url(&current_url, allow_loopback)?;
-            let validated_addrs = validate_and_resolve_hop(
-                &current_url,
-                &self.config,
-                allow_loopback,
-                proxy_url.is_some(),
-                remaining,
-            )?;
+            if proxy_url.is_some() {
+                validate_proxied_target_dns(&current_url, &self.config, remaining).await?;
+            }
 
             let hop_timeout = remaining_timeout(deadline, current_url.as_str())?;
-            let agent = build_hop_agent(
-                &self.config,
-                &self.tls_config,
-                validated_addrs,
-                proxy_url.as_deref(),
-                hop_timeout,
-            )?;
-            let same_origin = url_origin(&current_url) == initial_origin;
+            let client = self.client_for_hop(&current_url, proxy_url.as_deref())?;
             let hop_headers = filter_hop_headers(extra_headers, same_origin);
-            let response = send_single_hop(&agent, method, &current_url, accept, &hop_headers)?;
-            let status = response.status().as_u16();
-            let raw_headers = response.headers();
+            let response =
+                send_single_hop(&client, &current_url, accept, &hop_headers, hop_timeout).await?;
+            let response_status = response.status();
+            let status = response_status.as_u16();
 
-            if is_redirect_status(status) {
-                let location = extract_single_location_header(raw_headers, current_url.as_str())?;
+            if is_redirect_status(response_status) {
+                let location =
+                    extract_single_location_header(response.headers(), current_url.as_str())?;
                 if hop >= self.config.max_redirects {
                     return Err(AdfontesError::SafetyBlock {
                         reason: format!(
@@ -439,17 +418,15 @@ impl HttpClient {
             }
 
             let content_encodings =
-                extract_content_encoding_tokens(raw_headers, current_url.as_str())?;
-            let mut headers = collect_response_headers(raw_headers);
-            let content_type = headers.get("content-type").cloned();
-            let raw_body = match method {
-                HttpMethod::Head => Vec::new(),
-                HttpMethod::Get => read_bounded_http_body(
-                    response.into_body(),
-                    self.config.max_response_bytes,
-                    current_url.as_str(),
-                )?,
-            };
+                extract_content_encoding_tokens(response.headers(), current_url.as_str())?;
+            let mut headers = collect_response_headers(response.headers());
+            let content_type = headers.get(CONTENT_TYPE.as_str()).cloned();
+            let raw_body = read_bounded_http_body(
+                response,
+                self.config.max_response_bytes,
+                current_url.as_str(),
+            )
+            .await?;
             let decoded = decode_content_encoding(
                 raw_body,
                 &content_encodings,
@@ -457,8 +434,8 @@ impl HttpClient {
                 self.config.max_response_bytes,
             )?;
             if decoded.was_decoded {
-                headers.remove(HEADER_CONTENT_ENCODING);
-                headers.remove("content-length");
+                headers.remove(CONTENT_ENCODING.as_str());
+                headers.remove(CONTENT_LENGTH.as_str());
             }
 
             return Ok(HttpResponse {
@@ -479,6 +456,33 @@ impl HttpClient {
         })
     }
 
+    fn client_for_hop(
+        &self,
+        url: &HttpUrl,
+        proxy_url: Option<&str>,
+    ) -> Result<reqwest::Client, AdfontesError> {
+        let Some(proxy_raw) = proxy_url else {
+            return self
+                .direct_client
+                .clone()
+                .map_err(|detail| AdfontesError::Transport {
+                    url: url.to_string(),
+                    detail,
+                });
+        };
+        let mut cache = self
+            .proxy_clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(client) = cache.get(proxy_raw) {
+            return Ok(client.clone());
+        }
+        let client = build_proxy_client(&self.config, &self.tls_config, proxy_raw, url)?;
+        cache.insert(proxy_raw.to_owned(), client.clone());
+        drop(cache);
+        Ok(client)
+    }
+
     fn is_loopback_target_allowed(&self, url: &HttpUrl) -> bool {
         if self.config.allowed_loopback_addrs.is_empty() {
             return false;
@@ -493,7 +497,9 @@ impl HttpClient {
                         .contains(&SocketAddr::new(ip, port))
             }
             UrlHost::Domain(domain) => {
-                domain.eq_ignore_ascii_case(LOCALHOST_NAME)
+                domain
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(LOCALHOST_NAME)
                     && self
                         .config
                         .allowed_loopback_addrs
@@ -513,28 +519,18 @@ impl HttpClient {
 /// sub-blocks and checking embedded IPv4 in 6to4/Teredo) and NAT64 WKP `64:ff9b::/96` when the
 /// embedded IPv4 address is global.
 #[must_use]
-pub const fn is_forbidden_ip(address: IpAddr) -> bool {
+pub fn is_forbidden_ip(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(ipv4) => is_forbidden_ipv4(ipv4),
         IpAddr::V6(ipv6) => is_forbidden_ipv6(ipv6),
     }
 }
 
-/// Validates a URL's hostname against static SSRF blocklists without performing DNS lookups.
+/// Validates a URL's hostname against built-in and configured SSRF suffix blocklists.
 ///
-/// Rejects single-label domains (which trigger `/etc/resolv.conf` search-domain expansion),
-/// local/internal suffixes, metadata services, and wildcard DNS rebinding domains (`nip.io`,
-/// `sslip.io`, `xip.io`, `vcap.me`, `traefik.me`, `local.gd`, `rbndr.us`).
-///
-/// # Errors
-///
-/// Returns [`AdfontesError::SafetyBlock`] if the host violates SSRF policy.
-pub fn validate_hostname_policy(url: &HttpUrl, allow_loopback: bool) -> Result<(), AdfontesError> {
-    validate_hostname_policy_with_suffixes(url, allow_loopback, &[])
-}
-
-/// Validates a URL's hostname against built-in SSRF blocklists plus additional operator-configured
-/// host suffixes (each matching both the exact domain and any subdomain).
+/// Built-in checks reject `localhost`, metadata services, single-label domains, and wildcard DNS
+/// rebinding domains; additional operator-configured suffixes match both exact domains and
+/// subdomains.
 ///
 /// # Errors
 ///
@@ -593,12 +589,6 @@ pub fn validate_hostname_policy_with_suffixes(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-enum HttpMethod {
-    Get,
-    Head,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct UrlOrigin {
     scheme: String,
@@ -637,10 +627,8 @@ fn remaining_timeout(deadline: Instant, url: &str) -> Result<Duration, AdfontesE
 fn validate_extra_headers(headers: &[(&str, &str)], url: &str) -> Result<(), AdfontesError> {
     for &(name, value) in headers {
         let valid_name = !name.is_empty()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
-        if !valid_name || name.eq_ignore_ascii_case("host") {
+            && HeaderName::from_bytes(name.as_bytes()).is_ok_and(|parsed| parsed != HOST);
+        if !valid_name {
             return Err(AdfontesError::Transport {
                 url: url.to_owned(),
                 detail: format!("disallowed HTTP header name `{name}`"),
@@ -652,11 +640,7 @@ fn validate_extra_headers(headers: &[(&str, &str)], url: &str) -> Result<(), Adf
 }
 
 fn validate_header_value(name: &str, value: &str, url: &str) -> Result<(), AdfontesError> {
-    let valid = !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte == b'\t' || (ASCII_PRINTABLE_FIRST..=ASCII_PRINTABLE_LAST).contains(&byte)
-        });
-    if !valid {
+    if value.is_empty() || !value.is_ascii() || HeaderValue::from_str(value).is_err() {
         return Err(AdfontesError::Transport {
             url: url.to_owned(),
             detail: format!("invalid HTTP header value for `{name}`"),
@@ -683,49 +667,194 @@ fn filter_hop_headers<'a>(
         .collect()
 }
 
-fn validate_and_resolve_hop(
+async fn validate_proxied_target_dns(
     url: &HttpUrl,
     config: &TransportConfig,
-    allow_loopback: bool,
-    using_proxy: bool,
     timeout: Duration,
-) -> Result<Vec<SocketAddr>, AdfontesError> {
-    validate_hostname_policy_with_suffixes(url, allow_loopback, &config.blocked_host_suffixes)?;
-    let port = url.port_or_default();
-
-    let all_addrs: Vec<SocketAddr> = match url.host() {
-        UrlHost::Ip(address) => vec![SocketAddr::new(address, port)],
-        UrlHost::Domain(domain) => match resolve_domain_with_timeout(domain, port, timeout) {
-            Ok(addresses) => addresses,
-            Err(dns_error) => {
-                if using_proxy && config.proxy.allow_proxy_remote_dns {
-                    return Ok(Vec::new());
-                }
-                return Err(AdfontesError::Transport {
-                    url: url.to_string(),
-                    detail: dns_error,
-                });
-            }
-        },
+) -> Result<(), AdfontesError> {
+    let UrlHost::Domain(domain) = url.host() else {
+        return Ok(());
     };
-
-    if all_addrs.is_empty() {
-        return Err(AdfontesError::Transport {
+    match resolve_and_validate_host(
+        domain,
+        url.port_or_default(),
+        false,
+        &config.allowed_loopback_addrs,
+        timeout,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(HostResolutionError::SafetyBlock(reason)) => Err(AdfontesError::SafetyBlock { reason }),
+        Err(HostResolutionError::Transport(_)) if config.proxy.allow_proxy_remote_dns => Ok(()),
+        Err(HostResolutionError::Transport(detail)) => Err(AdfontesError::Transport {
             url: url.to_string(),
-            detail: format!("DNS returned no addresses for `{}`", url.host_str()),
-        });
+            detail,
+        }),
+    }
+}
+
+fn build_platform_tls_config() -> Result<rustls::ClientConfig, String> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| format!("failed to configure TLS protocol versions: {error}"))?
+        .with_platform_verifier()
+        .map_err(|error| format!("failed to initialize platform TLS verifier: {error}"))?
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(tls_config)
+}
+
+fn build_direct_client(
+    transport_config: &TransportConfig,
+    tls_config: &Result<rustls::ClientConfig, String>,
+) -> Result<reqwest::Client, String> {
+    let builder = base_client_builder(transport_config, tls_config)?
+        .no_proxy()
+        .dns_resolver(Arc::new(SsrfDnsResolver::new(transport_config)));
+    finish_client_builder(builder)
+}
+
+fn build_proxy_client(
+    transport_config: &TransportConfig,
+    tls_config: &Result<rustls::ClientConfig, String>,
+    proxy_raw: &str,
+    url: &HttpUrl,
+) -> Result<reqwest::Client, AdfontesError> {
+    let proxy = reqwest::Proxy::all(proxy_raw).map_err(|proxy_error| AdfontesError::Transport {
+        url: proxy_raw.to_owned(),
+        detail: format!("invalid proxy URL: {proxy_error}"),
+    })?;
+    let builder = base_client_builder(transport_config, tls_config)
+        .map_err(|detail| AdfontesError::Transport {
+            url: url.to_string(),
+            detail,
+        })?
+        .proxy(proxy);
+    finish_client_builder(builder).map_err(|detail| AdfontesError::Transport {
+        url: url.to_string(),
+        detail,
+    })
+}
+
+fn base_client_builder(
+    transport_config: &TransportConfig,
+    tls_config: &Result<rustls::ClientConfig, String>,
+) -> Result<reqwest::ClientBuilder, String> {
+    let built_tls = tls_config.as_ref().map_err(Clone::clone)?;
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(transport_config.timeout)
+        .connect_timeout(transport_config.timeout)
+        .user_agent(&transport_config.user_agent)
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .tls_backend_preconfigured(built_tls.clone()))
+}
+
+fn finish_client_builder(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, String> {
+    builder
+        .build()
+        .map_err(|client_error| format!("failed to build HTTP client: {client_error}"))
+}
+
+#[derive(Debug)]
+struct SsrfDnsResolver {
+    timeout: Duration,
+    allowed_loopback_addrs: Arc<BTreeSet<SocketAddr>>,
+}
+
+impl SsrfDnsResolver {
+    fn new(config: &TransportConfig) -> Self {
+        Self {
+            timeout: config.timeout,
+            allowed_loopback_addrs: Arc::new(config.allowed_loopback_addrs.clone()),
+        }
+    }
+}
+
+impl reqwest::dns::Resolve for SsrfDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().trim_end_matches('.').to_owned();
+        let timeout = self.timeout;
+        let allowed_loopback_addrs = Arc::clone(&self.allowed_loopback_addrs);
+        Box::pin(async move {
+            let allow_localhost = host.eq_ignore_ascii_case(LOCALHOST_NAME);
+            match resolve_and_validate_host(
+                &host,
+                0,
+                allow_localhost,
+                &allowed_loopback_addrs,
+                timeout,
+            )
+            .await
+            {
+                Ok(addrs) => Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs),
+                Err(HostResolutionError::SafetyBlock(reason)) => {
+                    Err(Box::new(SsrfBlockedError { reason }) as Box<dyn StdError + Send + Sync>)
+                }
+                Err(HostResolutionError::Transport(detail)) => {
+                    Err(Box::new(io::Error::other(detail)) as Box<dyn StdError + Send + Sync>)
+                }
+            }
+        })
+    }
+}
+
+enum HostResolutionError {
+    SafetyBlock(String),
+    Transport(String),
+}
+
+async fn resolve_and_validate_host(
+    host: &str,
+    port: u16,
+    allow_localhost_loopback: bool,
+    allowed_loopback_addrs: &BTreeSet<SocketAddr>,
+    timeout: Duration,
+) -> Result<Vec<SocketAddr>, HostResolutionError> {
+    let all_addrs = resolve_domain_with_timeout(host, port, timeout)
+        .await
+        .map_err(HostResolutionError::Transport)?;
+    if all_addrs.is_empty() {
+        return Err(HostResolutionError::Transport(format!(
+            "DNS returned no addresses for `{host}`"
+        )));
+    }
+
+    if allow_localhost_loopback {
+        let mut allowed_addrs = Vec::new();
+        for socket_addr in &all_addrs {
+            let ip = socket_addr.ip();
+            if !ip.is_loopback() && is_forbidden_ip(ip) {
+                return Err(non_global_ip_block(host, ip));
+            }
+            if ip.is_loopback()
+                && allowed_loopback_addrs
+                    .iter()
+                    .any(|allowed| allowed.ip() == ip && (port == 0 || allowed.port() == port))
+            {
+                allowed_addrs.push(*socket_addr);
+            }
+        }
+        if allowed_addrs.is_empty() {
+            return Err(HostResolutionError::SafetyBlock(format!(
+                "host `{host}` resolved to non-allowlisted loopback address"
+            )));
+        }
+        allowed_addrs.truncate(MAX_PINNED_SOCKET_ADDRS);
+        return Ok(allowed_addrs);
     }
 
     for socket_addr in &all_addrs {
         let ip = socket_addr.ip();
-        if allow_loopback && ip.is_loopback() && config.allowed_loopback_addrs.contains(socket_addr)
-        {
-            continue;
-        }
         if is_forbidden_ip(ip) {
-            return Err(AdfontesError::SafetyBlock {
-                reason: format!("host `{}` resolved to non-global IP `{ip}`", url.host_str()),
-            });
+            return Err(non_global_ip_block(host, ip));
         }
     }
 
@@ -735,171 +864,87 @@ fn validate_and_resolve_hop(
         .collect())
 }
 
-const MAX_CONCURRENT_DNS_LOOKUPS: usize = 16;
-static ACTIVE_DNS_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+fn non_global_ip_block(host: &str, ip: IpAddr) -> HostResolutionError {
+    HostResolutionError::SafetyBlock(format!("host `{host}` resolved to non-global IP `{ip}`"))
+}
 
-fn resolve_domain_with_timeout(
+const MAX_CONCURRENT_DNS_LOOKUPS: usize = 16;
+static DNS_LOOKUP_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_DNS_LOOKUPS);
+
+async fn resolve_domain_with_timeout(
     domain: &str,
     port: u16,
     timeout: Duration,
 ) -> Result<Vec<SocketAddr>, String> {
-    let slot_guard = DnsLookupSlot::try_acquire().ok_or_else(|| {
-        format!("DNS resolver busy ({MAX_CONCURRENT_DNS_LOOKUPS} concurrent lookups active) for `{domain}`")
-    })?;
-    let target = (domain.to_owned(), port);
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let _guard = slot_guard;
-        let lookup = target
-            .to_socket_addrs()
-            .map(Iterator::collect::<Vec<SocketAddr>>);
-        let _ = sender.send(lookup);
-    });
-    match receiver.recv_timeout(timeout) {
-        Ok(Ok(addresses)) => Ok(addresses),
-        Ok(Err(io_error)) => Err(format!("DNS resolution failed for `{domain}`: {io_error}")),
-        Err(RecvTimeoutError::Timeout) => Err(format!("DNS resolution timed out for `{domain}`")),
-        Err(RecvTimeoutError::Disconnected) => {
-            Err(format!("DNS resolver worker terminated for `{domain}`"))
-        }
-    }
+    tokio::time::timeout(timeout, async move {
+        let _permit = DNS_LOOKUP_SEMAPHORE
+            .acquire()
+            .await
+            .map_err(|_| format!("DNS resolver semaphore closed for `{domain}`"))?;
+        let addrs = tokio::net::lookup_host((domain, port))
+            .await
+            .map_err(|io_error| format!("DNS resolution failed for `{domain}`: {io_error}"))?;
+        Ok(addrs.collect())
+    })
+    .await
+    .unwrap_or_else(|_| Err(format!("DNS resolution timed out for `{domain}`")))
 }
 
-struct DnsLookupSlot;
-
-impl DnsLookupSlot {
-    fn try_acquire() -> Option<Self> {
-        let mut current = ACTIVE_DNS_LOOKUPS.load(Ordering::Acquire);
-        while current < MAX_CONCURRENT_DNS_LOOKUPS {
-            match ACTIVE_DNS_LOOKUPS.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(Self),
-                Err(observed) => current = observed,
-            }
-        }
-        None
-    }
-}
-
-impl Drop for DnsLookupSlot {
-    fn drop(&mut self) {
-        ACTIVE_DNS_LOOKUPS.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-fn build_hop_agent(
-    transport_config: &TransportConfig,
-    tls_config: &TlsConfig,
-    validated_addrs: Vec<SocketAddr>,
-    proxy_url: Option<&str>,
-    hop_timeout: Duration,
-) -> Result<Agent, AdfontesError> {
-    let mut builder = Config::builder()
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .timeout_global(Some(hop_timeout))
-        .timeout_connect(Some(hop_timeout))
-        .user_agent(&transport_config.user_agent)
-        .tls_config(tls_config.clone());
-
-    if let Some(proxy_raw) = proxy_url {
-        let proxy =
-            ureq::Proxy::new(proxy_raw).map_err(|proxy_error| AdfontesError::Transport {
-                url: proxy_raw.to_owned(),
-                detail: format!("invalid proxy URL: {proxy_error}"),
-            })?;
-        builder = builder.proxy(Some(proxy));
-        return Ok(Agent::new_with_config(builder.build()));
-    }
-
-    builder = builder.proxy(None);
-    let resolver = PinnedResolver::new(validated_addrs);
-    Ok(Agent::with_parts(
-        builder.build(),
-        DefaultConnector::default(),
-        resolver,
-    ))
-}
-
-#[derive(Debug)]
-struct PinnedResolver {
-    addresses: Vec<SocketAddr>,
-}
-
-impl PinnedResolver {
-    const fn new(addresses: Vec<SocketAddr>) -> Self {
-        Self { addresses }
-    }
-}
-
-impl Resolver for PinnedResolver {
-    fn resolve(
-        &self,
-        _uri: &Uri,
-        _config: &Config,
-        _timeout: NextTimeout,
-    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
-        let mut resolved = self.empty();
-        for &address in self.addresses.iter().take(MAX_PINNED_SOCKET_ADDRS) {
-            resolved.push(address);
-        }
-        if resolved.is_empty() {
-            return Err(ureq::Error::HostNotFound);
-        }
-        Ok(resolved)
-    }
-}
-
-fn send_single_hop(
-    agent: &Agent,
-    method: HttpMethod,
+async fn send_single_hop(
+    client: &reqwest::Client,
     url: &HttpUrl,
     accept: Option<&str>,
     extra_headers: &[(&str, &str)],
-) -> Result<ureq::http::Response<ureq::Body>, AdfontesError> {
-    match method {
-        HttpMethod::Get => {
-            let mut request = agent
-                .get(url.as_str())
-                .header("Accept-Encoding", "gzip, deflate");
-            if let Some(accept_value) = accept {
-                request = request.header("Accept", accept_value);
-            }
-            for &(name, value) in extra_headers {
-                request = request.header(name, value);
-            }
-            request
-                .call()
-                .map_err(|http_error| AdfontesError::Transport {
-                    url: url.to_string(),
-                    detail: http_error.to_string(),
-                })
+    hop_timeout: Duration,
+) -> Result<reqwest::Response, AdfontesError> {
+    let mut request = client
+        .get(url.as_str())
+        .timeout(hop_timeout)
+        .header(ACCEPT_ENCODING, "gzip, deflate");
+    if let Some(accept_value) = accept {
+        request = request.header(ACCEPT, accept_value);
+    }
+    for &(name, value) in extra_headers {
+        request = request.header(name, value);
+    }
+    request
+        .send()
+        .await
+        .map_err(|http_error| map_reqwest_error(&http_error, url))
+}
+
+fn map_reqwest_error(http_error: &reqwest::Error, url: &HttpUrl) -> AdfontesError {
+    let mut source: Option<&(dyn StdError + 'static)> = Some(http_error);
+    while let Some(error) = source {
+        if let Some(blocked) = error.downcast_ref::<SsrfBlockedError>() {
+            return AdfontesError::SafetyBlock {
+                reason: blocked.reason.clone(),
+            };
         }
-        HttpMethod::Head => {
-            let mut request = agent.head(url.as_str());
-            for &(name, value) in extra_headers {
-                request = request.header(name, value);
-            }
-            request
-                .call()
-                .map_err(|http_error| AdfontesError::Transport {
-                    url: url.to_string(),
-                    detail: http_error.to_string(),
-                })
-        }
+        source = error.source();
+    }
+    AdfontesError::Transport {
+        url: url.to_string(),
+        detail: format_error_chain(http_error),
     }
 }
 
-fn extract_single_location_header(
-    headers: &ureq::http::HeaderMap,
-    url: &str,
-) -> Result<String, AdfontesError> {
+#[derive(Debug)]
+struct SsrfBlockedError {
+    reason: String,
+}
+
+impl fmt::Display for SsrfBlockedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl StdError for SsrfBlockedError {}
+
+fn extract_single_location_header(headers: &HeaderMap, url: &str) -> Result<String, AdfontesError> {
     let mut locations = Vec::new();
-    for raw_value in headers.get_all("location") {
+    for raw_value in headers.get_all(LOCATION) {
         let text = raw_value.to_str().map_err(|_| AdfontesError::Transport {
             url: url.to_owned(),
             detail: "HTTP redirect Location header contains non-ASCII bytes".to_owned(),
@@ -919,11 +964,11 @@ fn extract_single_location_header(
 }
 
 fn extract_content_encoding_tokens(
-    headers: &ureq::http::HeaderMap,
+    headers: &HeaderMap,
     url: &str,
 ) -> Result<Vec<String>, AdfontesError> {
     let mut tokens = Vec::new();
-    for raw_value in headers.get_all(HEADER_CONTENT_ENCODING) {
+    for raw_value in headers.get_all(CONTENT_ENCODING) {
         let text = raw_value.to_str().map_err(|_| AdfontesError::Transport {
             url: url.to_owned(),
             detail: "HTTP Content-Encoding header contains non-ASCII bytes".to_owned(),
@@ -938,7 +983,7 @@ fn extract_content_encoding_tokens(
     Ok(tokens)
 }
 
-fn collect_response_headers(headers: &ureq::http::HeaderMap) -> BTreeMap<String, String> {
+fn collect_response_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     for (name, value) in headers {
         if let Ok(text) = value.to_str() {
@@ -955,12 +1000,12 @@ fn collect_response_headers(headers: &ureq::http::HeaderMap) -> BTreeMap<String,
     map
 }
 
-fn read_bounded_http_body(
-    body: ureq::Body,
+async fn read_bounded_http_body(
+    mut response: reqwest::Response,
     max_bytes: usize,
     url: &str,
 ) -> Result<Vec<u8>, AdfontesError> {
-    if let Some(declared_len) = body.content_length()
+    if let Some(declared_len) = response.content_length()
         && declared_len > max_bytes as u64
     {
         return Err(AdfontesError::SafetyBlock {
@@ -968,44 +1013,41 @@ fn read_bounded_http_body(
         });
     }
 
-    let reader_limit = (max_bytes as u64).saturating_add(1);
-    let mut reader = body.into_with_config().limit(reader_limit).reader();
     let mut output = Vec::new();
-    let mut chunk = [0u8; BODY_READ_CHUNK_SIZE];
-    while output.len() < max_bytes {
-        let remaining = max_bytes - output.len();
-        let to_read = remaining.min(BODY_READ_CHUNK_SIZE);
-        let Some(target) = chunk.get_mut(..to_read) else {
-            break;
-        };
-        let bytes_read = reader
-            .read(target)
-            .map_err(|io_error| AdfontesError::Transport {
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|http_error| AdfontesError::Transport {
                 url: url.to_owned(),
-                detail: format!("failed reading HTTP body: {io_error}"),
-            })?;
-        if bytes_read == 0 {
-            return Ok(output);
+                detail: format!(
+                    "failed reading HTTP body: {}",
+                    format_error_chain(&http_error)
+                ),
+            })?
+    {
+        let remaining = max_bytes.saturating_sub(output.len());
+        if chunk.len() > remaining {
+            return Err(AdfontesError::SafetyBlock {
+                reason: format!("HTTP response body exceeded {max_bytes}-byte limit"),
+            });
         }
-        if let Some(slice) = target.get(..bytes_read) {
-            output.extend_from_slice(slice);
-        }
-    }
-
-    let mut overflow_probe = [0u8; 1];
-    let probe_read =
-        reader
-            .read(&mut overflow_probe)
-            .map_err(|io_error| AdfontesError::Transport {
-                url: url.to_owned(),
-                detail: format!("failed reading HTTP body: {io_error}"),
-            })?;
-    if probe_read > 0 {
-        return Err(AdfontesError::SafetyBlock {
-            reason: format!("HTTP response body exceeded {max_bytes}-byte limit"),
-        });
+        output.extend_from_slice(&chunk);
     }
     Ok(output)
+}
+
+fn format_error_chain(error: &(dyn StdError + 'static)) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Option<&(dyn StdError + 'static)> = Some(error);
+    while let Some(frame) = current {
+        let rendered = frame.to_string();
+        if !rendered.is_empty() && parts.last().is_none_or(|prev| prev != &rendered) {
+            parts.push(rendered);
+        }
+        current = frame.source();
+    }
+    parts.join(": ")
 }
 
 fn decode_content_encoding(
@@ -1044,9 +1086,7 @@ fn decode_content_encoding(
         }
     }
 
-    let media_type = content_type
-        .and_then(|value| value.split(';').next())
-        .map_or_default(|media| media.trim().to_ascii_lowercase());
+    let media_type = content_type.map_or_default(parse_media_type);
     let is_single_gzip =
         matches!(encodings, [single] if single == ENCODING_GZIP || single == ENCODING_X_GZIP);
     if is_single_gzip
@@ -1078,76 +1118,42 @@ fn decode_content_encoding(
     })
 }
 
-const fn is_redirect_status(status: u16) -> bool {
+const fn is_redirect_status(status: StatusCode) -> bool {
     matches!(
         status,
-        HTTP_STATUS_MOVED_PERMANENTLY
-            | HTTP_STATUS_FOUND
-            | HTTP_STATUS_SEE_OTHER
-            | HTTP_STATUS_TEMPORARY_REDIRECT
-            | HTTP_STATUS_PERMANENT_REDIRECT
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
     )
 }
 
-const fn is_forbidden_ipv6(ipv6: Ipv6Addr) -> bool {
-    let [seg0, seg1, seg2, seg3, seg4, seg5, seg6, seg7] = ipv6.segments();
+fn is_forbidden_ipv6(ipv6: Ipv6Addr) -> bool {
+    let [_seg0, seg1, seg2, seg3, _seg4, _seg5, seg6, seg7] = ipv6.segments();
 
-    // NAT64 well-known prefix (`64:ff9b::/96`) is permitted only when its embedded IPv4 is global.
-    if seg0 == IPV6_NAT64_HEAD
-        && seg1 == IPV6_NAT64_SECOND
-        && seg2 == 0
-        && seg3 == 0
-        && seg4 == 0
-        && seg5 == 0
-    {
+    if IPV6_NAT64_WKP.contains(&ipv6) {
         return is_forbidden_ipv4(ipv4_from_segments(seg6, seg7));
     }
 
-    // Reject everything outside IANA Global Unicast (`2000::/3`).
-    if (seg0 & IPV6_GLOBAL_UNICAST_MASK) != IPV6_GLOBAL_UNICAST_PREFIX {
+    if !IPV6_GLOBAL_UNICAST.contains(&ipv6) {
         return true;
     }
 
-    // RFC 3849 documentation (`2001:db8::/32`) and RFC 9637 documentation (`3fff::/20`).
-    let is_rfc3849_doc = seg0 == IPV6_IETF_SPECIAL_HEAD && seg1 == IPV6_DOCUMENTATION_SECOND;
-    let is_rfc9637_doc =
-        seg0 == IPV6_RFC9637_DOC_HEAD && (seg1 & IPV6_RFC9637_DOC_SECOND_MASK) == 0;
-    if is_rfc3849_doc || is_rfc9637_doc {
-        return true;
-    }
-
-    // Teredo (`2001:0000::/32`) embeds server IPv4 in segments 2..4 and inverted client IPv4 in 6..8.
-    if seg0 == IPV6_IETF_SPECIAL_HEAD && seg1 == 0 {
+    if IPV6_TEREDO.contains(&ipv6) {
         let server_ip = ipv4_from_segments(seg2, seg3);
         let client_ip = ipv4_from_segments(!seg6, !seg7);
         return is_forbidden_ipv4(server_ip) || is_forbidden_ipv4(client_ip);
     }
 
-    // Non-global IETF protocol assignments (`2001::/23`, covering `2001:2::/48`, ORCHID `2001:10::/28`, etc.).
-    if seg0 == IPV6_IETF_SPECIAL_HEAD && (seg1 & IPV6_IETF_PROTOCOL_MASK) == 0 {
-        return true;
-    }
-
-    // 6to4 (`2002::/16`) embeds an IPv4 address in segments 1 and 2.
-    if seg0 == IPV6_SIX_TO_FOUR_HEAD {
+    if IPV6_SIX_TO_FOUR.contains(&ipv6) {
         return is_forbidden_ipv4(ipv4_from_segments(seg1, seg2));
     }
 
-    false
+    FORBIDDEN_IPV6_NETS.iter().any(|net| net.contains(&ipv6))
 }
 
-const fn is_forbidden_ipv4(ipv4: Ipv4Addr) -> bool {
-    let [first, second, third, _fourth] = ipv4.octets();
-    let is_this_network = first == 0;
-    let is_cgnat = first == IPV4_CGNAT_FIRST && (second & IPV4_CGNAT_MASK) == IPV4_CGNAT_SECOND;
-    let is_ietf_protocol = first == IPV4_IETF_PROTOCOL_FIRST && second == 0 && third == 0;
-    let is_six_to_four_relay = first == IPV4_IETF_PROTOCOL_FIRST
-        && second == IPV4_SIX_TO_FOUR_RELAY_SECOND
-        && third == IPV4_SIX_TO_FOUR_RELAY_THIRD;
-    let is_benchmarking =
-        first == IPV4_BENCHMARK_FIRST && (second & IPV4_BENCHMARK_MASK) == IPV4_BENCHMARK_SECOND;
-    let is_reserved_class_e = first >= IPV4_CLASS_E_START;
-
+fn is_forbidden_ipv4(ipv4: Ipv4Addr) -> bool {
     ipv4.is_private()
         || ipv4.is_loopback()
         || ipv4.is_link_local()
@@ -1155,12 +1161,7 @@ const fn is_forbidden_ipv4(ipv4: Ipv4Addr) -> bool {
         || ipv4.is_documentation()
         || ipv4.is_multicast()
         || ipv4.is_unspecified()
-        || is_this_network
-        || is_cgnat
-        || is_ietf_protocol
-        || is_six_to_four_relay
-        || is_benchmarking
-        || is_reserved_class_e
+        || FORBIDDEN_IPV4_NETS.iter().any(|net| net.contains(&ipv4))
 }
 
 const fn ipv4_from_segments(high: u16, low: u16) -> Ipv4Addr {
@@ -1184,10 +1185,24 @@ fn validate_http_proxy_url(raw_proxy: &str) -> Result<(), AdfontesError> {
             ),
         });
     }
-    if rest.is_empty() || raw_proxy.chars().any(char::is_control) {
+    if rest.is_empty()
+        || raw_proxy
+            .chars()
+            .any(|character| character.is_control() || character.is_ascii_whitespace())
+    {
         return Err(AdfontesError::Transport {
             url: raw_proxy.to_owned(),
-            detail: "proxy URL is empty or contains control characters".to_owned(),
+            detail: "proxy URL is empty or contains whitespace or control characters".to_owned(),
+        });
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_userinfo, host_part)| host_part);
+    if host_port.is_empty() || host_port.starts_with(':') {
+        return Err(AdfontesError::Transport {
+            url: raw_proxy.to_owned(),
+            detail: "proxy URL authority host is empty".to_owned(),
         });
     }
     Ok(())
@@ -1277,7 +1292,7 @@ fn matches_no_proxy(url: &HttpUrl, no_proxy: &[String]) -> bool {
 enum NoProxyEntry {
     MatchAll,
     Ip { address: IpAddr, port: Option<u16> },
-    Cidr { network: IpAddr, prefix_len: u8 },
+    Cidr(IpNet),
     Domain { suffix: String, port: Option<u16> },
 }
 
@@ -1289,11 +1304,8 @@ impl NoProxyEntry {
                 port.is_none_or(|required| required == target_port)
                     && target_host == UrlHost::Ip(*address)
             }
-            Self::Cidr {
-                network,
-                prefix_len,
-            } => match target_host {
-                UrlHost::Ip(target_ip) => cidr_contains(*network, *prefix_len, target_ip),
+            Self::Cidr(network) => match target_host {
+                UrlHost::Ip(target_ip) => network.contains(&target_ip),
                 UrlHost::Domain(_) => false,
             },
             Self::Domain { suffix, port } => {
@@ -1322,20 +1334,11 @@ fn parse_no_proxy_entry(raw_rule: &str) -> Option<NoProxyEntry> {
         return Some(NoProxyEntry::MatchAll);
     }
 
-    if let Some((ip_part, prefix_part)) = trimmed.split_once('/') {
-        let network: IpAddr = ip_part.trim().parse().ok()?;
-        let prefix_len: u8 = prefix_part.trim().parse().ok()?;
-        let max_prefix = match network {
-            IpAddr::V4(_) => MAX_IPV4_PREFIX_BITS,
-            IpAddr::V6(_) => MAX_IPV6_PREFIX_BITS,
-        };
-        if prefix_len <= max_prefix {
-            return Some(NoProxyEntry::Cidr {
-                network,
-                prefix_len,
-            });
-        }
-        return None;
+    if trimmed.contains('/') {
+        return trimmed
+            .parse::<IpNet>()
+            .ok()
+            .map(|net| NoProxyEntry::Cidr(net.trunc()));
     }
 
     if let Some(rest) = trimmed.strip_prefix('[') {
@@ -1384,117 +1387,52 @@ fn parse_no_proxy_entry(raw_rule: &str) -> Option<NoProxyEntry> {
     })
 }
 
-fn cidr_contains(network: IpAddr, prefix_len: u8, target: IpAddr) -> bool {
-    match (network, target) {
-        (IpAddr::V4(net_v4), IpAddr::V4(target_v4)) => {
-            if prefix_len == 0 {
-                return true;
-            }
-            let mask = u32::MAX << (MAX_IPV4_PREFIX_BITS - prefix_len);
-            (u32::from(net_v4) & mask) == (u32::from(target_v4) & mask)
-        }
-        (IpAddr::V6(net_v6), IpAddr::V6(target_v6)) => {
-            if prefix_len == 0 {
-                return true;
-            }
-            let mask = u128::MAX << (MAX_IPV6_PREFIX_BITS - prefix_len);
-            (u128::from(net_v6) & mask) == (u128::from(target_v6) & mask)
-        }
-        _ => false,
+fn parse_media_type(content_type: &str) -> String {
+    let trimmed = content_type.trim();
+    if let Ok(parsed) = trimmed.parse::<Mime>() {
+        return parsed.essence_str().to_owned();
     }
+    trimmed
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
 }
 
-fn extract_charset_label(content_type: &str) -> Option<&str> {
-    for parameter in content_type.split(';').skip(1) {
+fn encoding_from_content_type(content_type: &str) -> &'static Encoding {
+    let trimmed = content_type.trim();
+    if let Ok(parsed) = trimmed.parse::<Mime>() {
+        return parsed
+            .get_param(mime::CHARSET)
+            .and_then(|charset| Encoding::for_label(charset.as_str().trim_matches('\'').as_bytes()))
+            .unwrap_or(encoding_rs::UTF_8);
+    }
+    for parameter in trimmed.split(';').skip(1) {
         let Some((key, value)) = parameter.split_once('=') else {
             continue;
         };
-        if key.trim().eq_ignore_ascii_case("charset") {
-            let trimmed = value.trim().trim_matches('"').trim_matches('\'');
-            if !trimmed.is_empty() {
-                return Some(trimmed);
-            }
+        if key.trim().eq_ignore_ascii_case(mime::CHARSET.as_str()) {
+            let label = value.trim().trim_matches('"').trim_matches('\'');
+            return Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::UTF_8);
         }
     }
-    None
+    encoding_rs::UTF_8
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     use rstest::rstest;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, Request as WiremockRequest, ResponseTemplate};
 
     use super::*;
     use crate::archive::{test_gzip_bytes, test_zlib_bytes};
-
-    struct TestResponse {
-        status_line: &'static str,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
-    }
-
-    struct CapturedRequest {
-        path: String,
-        headers: BTreeMap<String, String>,
-    }
-
-    fn spawn_loopback_server<F>(
-        max_requests: usize,
-        handler: F,
-    ) -> (SocketAddr, thread::JoinHandle<()>)
-    where
-        F: Fn(&CapturedRequest) -> TestResponse + Send + 'static,
-    {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let bound_addr = listener.local_addr().unwrap();
-        let handle = thread::spawn(move || {
-            for _ in 0..max_requests {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    break;
-                };
-                let request = {
-                    let mut reader = BufReader::new(&stream);
-                    let mut line = String::new();
-                    let _ = reader.read_line(&mut line);
-                    let path = line.split_whitespace().nth(1).unwrap_or("/").to_owned();
-                    let mut headers = BTreeMap::new();
-                    let mut header_line = String::new();
-                    while reader.read_line(&mut header_line).unwrap_or(0) > 0 {
-                        if header_line == "\r\n" || header_line == "\n" {
-                            break;
-                        }
-                        if let Some((key, value)) = header_line.split_once(':') {
-                            headers
-                                .insert(key.trim().to_ascii_lowercase(), value.trim().to_owned());
-                        }
-                        header_line.clear();
-                    }
-                    CapturedRequest { path, headers }
-                };
-                let response = handler(&request);
-                let mut raw = String::new();
-                raw.push_str("HTTP/1.1 ");
-                raw.push_str(response.status_line);
-                raw.push_str("\r\nContent-Length: ");
-                raw.push_str(&response.body.len().to_string());
-                raw.push_str("\r\nConnection: close\r\n");
-                for (name, value) in &response.headers {
-                    raw.push_str(name);
-                    raw.push_str(": ");
-                    raw.push_str(value);
-                    raw.push_str("\r\n");
-                }
-                raw.push_str("\r\n");
-                let _ = stream.write_all(raw.as_bytes());
-                let _ = stream.write_all(&response.body);
-                let _ = stream.flush();
-            }
-        });
-        (bound_addr, handle)
-    }
 
     fn loopback_client(allowed_addrs: &[SocketAddr], max_response_bytes: usize) -> HttpClient {
         let mut addrs = BTreeSet::new();
@@ -1566,7 +1504,7 @@ mod tests {
     fn blocks_ssrf_hostnames_rebind_services_and_single_labels(#[case] raw_url: &str) {
         let url = HttpUrl::parse(raw_url).unwrap();
         assert!(matches!(
-            validate_hostname_policy(&url, false).unwrap_err(),
+            validate_hostname_policy_with_suffixes(&url, false, &[]).unwrap_err(),
             AdfontesError::SafetyBlock { .. }
         ));
     }
@@ -1620,167 +1558,156 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn resolves_proxies_per_scheme_and_matches_cidr_wildcard_and_ipv6_no_proxy() {
+    #[rstest]
+    #[case("https://export.arxiv.org/pdf/2409.13740", None)]
+    #[case(
+        "https://example.org/paper.pdf",
+        Some("http://proxy-https.example:8443")
+    )]
+    #[case("http://10.1.2.3/x", None)]
+    #[case("http://[fd00::42]/x", None)]
+    #[case("http://[fd01::1]/x", Some("http://proxy-http.example:8080"))]
+    #[case("http://[fd02::1]/x", Some("http://proxy-http.example:8080"))]
+    #[case("http://[::1]:8080/x", None)]
+    #[case("http://127.0.0.1/x", Some("http://proxy-http.example:8080"))]
+    #[case("http://192.168.1.1/x", Some("http://proxy-http.example:8080"))]
+    fn resolves_proxies_per_scheme_and_matches_cidr_wildcard_and_ipv6_no_proxy(
+        #[case] raw_url: &str,
+        #[case] expected_proxy: Option<&str>,
+    ) {
         let config = ProxyConfig {
             http_proxy: Some("http://proxy-http.example:8080".to_owned()),
             https_proxy: Some("http://proxy-https.example:8443".to_owned()),
             all_proxy: None,
             no_proxy: vec![
                 "*.ArXiv.org.".to_owned(),
-                "10.0.0.0/8".to_owned(),
+                "10.9.8.7/8".to_owned(),
+                "fd00::abcd/16".to_owned(),
+                "fd02::/129".to_owned(),
+                "192.168.1.1/33".to_owned(),
                 "[0:0:0:0:0:0:0:1]:8080".to_owned(),
                 "[::1]:badport".to_owned(),
                 "0.1".to_owned(),
             ],
             allow_proxy_remote_dns: false,
         };
-        let excluded_domain = HttpUrl::parse("https://export.arxiv.org/pdf/2409.13740").unwrap();
-        let excluded_cidr = HttpUrl::parse("http://10.1.2.3/x").unwrap();
-        let excluded_ipv6 = HttpUrl::parse("http://[::1]:8080/x").unwrap();
-        let non_matching_ipv4 = HttpUrl::parse("http://127.0.0.1/x").unwrap();
+        let url = HttpUrl::parse(raw_url).unwrap();
 
         assert_eq!(
             config
-                .resolve_proxy_for_url(&excluded_domain, false)
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            config.resolve_proxy_for_url(&excluded_cidr, false).unwrap(),
-            None
-        );
-        assert_eq!(
-            config.resolve_proxy_for_url(&excluded_ipv6, false).unwrap(),
-            None
-        );
-        assert_eq!(
-            config
-                .resolve_proxy_for_url(&non_matching_ipv4, false)
+                .resolve_proxy_for_url(&url, false)
                 .unwrap()
                 .as_deref(),
-            Some("http://proxy-http.example:8080")
+            expected_proxy
         );
     }
 
-    #[test]
-    fn strips_authorization_header_across_cross_origin_redirects() {
-        let (dest_addr, dest_handle) = spawn_loopback_server(1, |request| {
-            let body = if request.headers.contains_key("authorization") {
-                b"LEAKED".to_vec()
-            } else {
-                b"STRIPPED".to_vec()
-            };
-            TestResponse {
-                status_line: "200 OK",
-                headers: vec![("Content-Type".to_owned(), "text/plain".to_owned())],
-                body,
-            }
-        });
-        let dest_url = format!("http://{dest_addr}/final");
-        let (start_addr, start_handle) = spawn_loopback_server(1, move |request| {
-            let status_line = if request.headers.get("authorization").map(String::as_str)
-                == Some("Bearer secret")
-            {
-                "302 Found"
-            } else {
-                "401 Unauthorized"
-            };
-            TestResponse {
-                status_line,
-                headers: vec![("Location".to_owned(), dest_url.clone())],
-                body: Vec::new(),
-            }
-        });
+    #[tokio::test(flavor = "current_thread")]
+    async fn strips_authorization_header_across_cross_origin_redirects() {
+        let dest_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/final"))
+            .and(|request: &WiremockRequest| !request.headers.contains_key("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("STRIPPED"))
+            .expect(1)
+            .mount(&dest_server)
+            .await;
 
-        let client = loopback_client(&[start_addr, dest_addr], 4096);
-        let url = HttpUrl::parse(&format!("http://{start_addr}/start")).unwrap();
+        let start_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/final", dest_server.uri())),
+            )
+            .expect(1)
+            .mount(&start_server)
+            .await;
+
+        let client = loopback_client(&[*start_server.address(), *dest_server.address()], 4096);
+        let url = HttpUrl::parse(&format!("{}/start", start_server.uri())).unwrap();
         let response = client
             .get(&url, None, &[("Authorization", "Bearer secret")])
+            .await
             .unwrap();
-        start_handle.join().unwrap();
-        dest_handle.join().unwrap();
+        start_server.verify().await;
+        dest_server.verify().await;
 
         assert_eq!(response.final_url.path(), "/final");
         assert_eq!(response.decode_text(), "STRIPPED");
     }
 
-    #[test]
-    fn decodes_deflate_with_windows_1252_charset_and_clears_content_encoding() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn decodes_deflate_with_windows_1252_charset_and_clears_content_encoding() {
         let latin1_bytes = encoding_rs::WINDOWS_1252.encode("Café").0.into_owned();
         let compressed = test_zlib_bytes(&latin1_bytes);
-        let (addr, handle) = spawn_loopback_server(1, move |_| TestResponse {
-            status_line: "200 OK",
-            headers: vec![
-                (
-                    "Content-Type".to_owned(),
-                    "text/plain; charset=windows-1252".to_owned(),
-                ),
-                ("Content-Encoding".to_owned(), "deflate".to_owned()),
-            ],
-            body: compressed.clone(),
-        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/latin1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(compressed, "text/plain; charset=windows-1252")
+                    .insert_header("Content-Encoding", "deflate"),
+            )
+            .mount(&server)
+            .await;
 
-        let client = loopback_client(&[addr], 4096);
-        let url = HttpUrl::parse(&format!("http://{addr}/latin1")).unwrap();
-        let response = client.get(&url, None, &[]).unwrap();
-        handle.join().unwrap();
+        let client = loopback_client(&[*server.address()], 4096);
+        let url = HttpUrl::parse(&format!("{}/latin1", server.uri())).unwrap();
+        let response = client.get(&url, None, &[]).await.unwrap();
 
         assert_eq!(response.decode_text(), "Café");
         assert!(!response.headers.contains_key("content-encoding"));
     }
 
-    #[test]
-    fn preserves_raw_gzip_bytes_for_archive_mime_types_only() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn preserves_raw_gzip_bytes_for_archive_mime_types_only() {
         let gz_payload = test_gzip_bytes(b"\\documentclass{article}");
         let expected = gz_payload.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/src/2409.13740"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(gz_payload, "application/x-gzip")
+                    .insert_header("Content-Encoding", "x-gzip"),
+            )
+            .mount(&server)
+            .await;
 
-        let (addr, handle) = spawn_loopback_server(1, move |_| TestResponse {
-            status_line: "200 OK",
-            headers: vec![
-                ("Content-Type".to_owned(), "application/x-gzip".to_owned()),
-                ("Content-Encoding".to_owned(), "x-gzip".to_owned()),
-            ],
-            body: gz_payload.clone(),
-        });
-
-        let client = loopback_client(&[addr], 4096);
-        let url = HttpUrl::parse(&format!("http://{addr}/src/2409.13740")).unwrap();
-        let response = client.get(&url, None, &[]).unwrap();
-        handle.join().unwrap();
+        let client = loopback_client(&[*server.address()], 4096);
+        let url = HttpUrl::parse(&format!("{}/src/2409.13740", server.uri())).unwrap();
+        let response = client.get(&url, None, &[]).await.unwrap();
 
         assert_eq!(response.body, expected);
     }
 
-    #[test]
-    fn blocks_stacked_duplicate_content_encoding_and_oversized_uncompressed_body() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocks_stacked_duplicate_content_encoding_and_oversized_uncompressed_body() {
         let double_gz = test_gzip_bytes(&test_gzip_bytes(b"nested"));
-        let (addr, handle) = spawn_loopback_server(2, move |request| {
-            if request.path == "/stacked" {
-                TestResponse {
-                    status_line: "200 OK",
-                    headers: vec![
-                        ("Content-Type".to_owned(), "text/plain".to_owned()),
-                        ("Content-Encoding".to_owned(), "gzip".to_owned()),
-                        ("Content-Encoding".to_owned(), "gzip".to_owned()),
-                    ],
-                    body: double_gz.clone(),
-                }
-            } else {
-                TestResponse {
-                    status_line: "200 OK",
-                    headers: vec![("Content-Type".to_owned(), "text/plain".to_owned())],
-                    body: vec![b'X'; 512],
-                }
-            }
-        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/stacked"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(double_gz, "text/plain")
+                    .append_header("Content-Encoding", "gzip")
+                    .append_header("Content-Encoding", "gzip"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(vec![b'X'; 512], "text/plain"))
+            .mount(&server)
+            .await;
 
-        let client = loopback_client(&[addr], 256);
-        let stacked_url = HttpUrl::parse(&format!("http://{addr}/stacked")).unwrap();
-        let big_url = HttpUrl::parse(&format!("http://{addr}/big")).unwrap();
-        let stacked_failure = client.get(&stacked_url, None, &[]).unwrap_err();
-        let oversized_failure = client.get(&big_url, None, &[]).unwrap_err();
-        handle.join().unwrap();
+        let client = loopback_client(&[*server.address()], 256);
+        let stacked_url = HttpUrl::parse(&format!("{}/stacked", server.uri())).unwrap();
+        let big_url = HttpUrl::parse(&format!("{}/big", server.uri())).unwrap();
+        let stacked_failure = client.get(&stacked_url, None, &[]).await.unwrap_err();
+        let oversized_failure = client.get(&big_url, None, &[]).await.unwrap_err();
 
         assert!(matches!(stacked_failure, AdfontesError::SafetyBlock { .. }));
         assert!(matches!(
@@ -1789,41 +1716,42 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn blocks_gzip_bomb_over_loopback() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocks_gzip_bomb_over_loopback() {
         let bomb_bytes = test_gzip_bytes(&vec![b'B'; 4096]);
-        let (addr, handle) = spawn_loopback_server(1, move |_| TestResponse {
-            status_line: "200 OK",
-            headers: vec![
-                ("Content-Type".to_owned(), "text/html".to_owned()),
-                ("Content-Encoding".to_owned(), "gzip".to_owned()),
-            ],
-            body: bomb_bytes.clone(),
-        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bomb"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(bomb_bytes, "text/html")
+                    .insert_header("Content-Encoding", "gzip"),
+            )
+            .mount(&server)
+            .await;
 
-        let client = loopback_client(&[addr], 256);
-        let url = HttpUrl::parse(&format!("http://{addr}/bomb")).unwrap();
-        let failure = client.get(&url, None, &[]).unwrap_err();
-        handle.join().unwrap();
+        let client = loopback_client(&[*server.address()], 256);
+        let url = HttpUrl::parse(&format!("{}/bomb", server.uri())).unwrap();
+        let failure = client.get(&url, None, &[]).await.unwrap_err();
 
         assert!(matches!(failure, AdfontesError::SafetyBlock { .. }));
     }
 
-    #[test]
-    fn blocks_redirect_to_disallowed_loopback_address_and_sibling_127_ip() {
-        let (addr, handle) = spawn_loopback_server(1, |_| TestResponse {
-            status_line: "302 Found",
-            headers: vec![(
-                "Location".to_owned(),
-                "http://127.0.0.2:8080/internal".to_owned(),
-            )],
-            body: Vec::new(),
-        });
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocks_redirect_to_disallowed_loopback_address_and_sibling_127_ip() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/hop"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "http://127.0.0.2:8080/internal"),
+            )
+            .mount(&server)
+            .await;
 
-        let client = loopback_client(&[addr], 4096);
-        let url = HttpUrl::parse(&format!("http://{addr}/hop")).unwrap();
-        let failure = client.get(&url, None, &[]).unwrap_err();
-        handle.join().unwrap();
+        let client = loopback_client(&[*server.address()], 4096);
+        let url = HttpUrl::parse(&format!("{}/hop", server.uri())).unwrap();
+        let failure = client.get(&url, None, &[]).await.unwrap_err();
 
         assert!(matches!(failure, AdfontesError::SafetyBlock { .. }));
     }
@@ -1841,5 +1769,309 @@ mod tests {
             body: bytes,
         };
         assert_eq!(response.decode_text(), "\u{FEFF}body");
+    }
+
+    #[rstest]
+    #[case(Some("TEXT/HTML; charset=\"windows-1252\""), "text/html", "Café")]
+    #[case(Some("text/html; charset='windows-1252'"), "text/html", "Café")]
+    #[case(
+        Some("text/html; foo=\"a;b\"; charset=\"windows-1252\""),
+        "text/html",
+        "Café"
+    )]
+    #[case(
+        Some("text/html; foo=\"bar; charset=windows-1252\""),
+        "text/html",
+        "Caf\u{FFFD}"
+    )]
+    #[case(
+        Some("text/html; charset=bogus; charset=windows-1252"),
+        "text/html",
+        "Caf\u{FFFD}"
+    )]
+    #[case(Some("text/html; invalid param"), "text/html", "Caf\u{FFFD}")]
+    #[case(Some("application/jats+xml; "), "application/jats+xml", "Caf\u{FFFD}")]
+    fn normalizes_mime_type_and_decodes_quoted_and_quirky_content_types(
+        #[case] content_type: Option<&str>,
+        #[case] expected_mime: &str,
+        #[case] expected_text: &str,
+    ) {
+        let latin1_bytes = encoding_rs::WINDOWS_1252.encode("Café").0.into_owned();
+        let response = HttpResponse {
+            status: 200,
+            redirect_chain: Vec::new(),
+            final_url: HttpUrl::parse("https://example.org/doc").unwrap(),
+            content_type: content_type.map(str::to_owned),
+            headers: BTreeMap::new(),
+            body: latin1_bytes,
+        };
+        assert_eq!(response.mime_type(), expected_mime);
+        assert_eq!(response.decode_text(), expected_text);
+    }
+
+    #[rstest]
+    #[case("127.0.0.1", &[])]
+    #[case("localhost", &[])]
+    #[case("127.0.0.1", &["127.0.0.1:45123", "[::1]:45123"])]
+    #[tokio::test(flavor = "current_thread")]
+    async fn ssrf_dns_resolver_blocks_forbidden_and_non_localhost_ips(
+        #[case] query: &str,
+        #[case] allowed_raw: &[&str],
+    ) {
+        let allowed_addrs = allowed_raw.iter().map(|raw| raw.parse().unwrap()).collect();
+        let resolver = SsrfDnsResolver::new(&TransportConfig {
+            allowed_loopback_addrs: allowed_addrs,
+            ..TransportConfig::default()
+        });
+        let failure = reqwest::dns::Resolve::resolve(&resolver, query.parse().unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(failure.downcast_ref::<SsrfBlockedError>().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ssrf_dns_resolver_allows_allowlisted_localhost() {
+        let mut allowed_addrs = BTreeSet::new();
+        allowed_addrs.insert("127.0.0.1:45123".parse().unwrap());
+        allowed_addrs.insert("[::1]:45123".parse().unwrap());
+        let resolver = SsrfDnsResolver::new(&TransportConfig {
+            allowed_loopback_addrs: allowed_addrs,
+            ..TransportConfig::default()
+        });
+        let addrs: Vec<SocketAddr> =
+            reqwest::dns::Resolve::resolve(&resolver, "localhost".parse().unwrap())
+                .await
+                .unwrap()
+                .collect();
+        assert_ne!(addrs, [] as [SocketAddr; 0]);
+        assert!(addrs.iter().all(|addr| addr.ip().is_loopback()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dns_resolver_ssrf_block_propagates_as_safety_block() {
+        struct BlockedTestResolver(SsrfDnsResolver);
+
+        impl reqwest::dns::Resolve for BlockedTestResolver {
+            fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                self.0.resolve("127.0.0.1".parse().unwrap())
+            }
+        }
+
+        let config = TransportConfig::default();
+        let inner = SsrfDnsResolver::new(&config);
+        let client = base_client_builder(&config, &build_platform_tls_config())
+            .unwrap()
+            .no_proxy()
+            .dns_resolver(Arc::new(BlockedTestResolver(inner)))
+            .build()
+            .unwrap();
+        let target = HttpUrl::parse("http://blocked-dns.example/paper").unwrap();
+        let failure = send_single_hop(&client, &target, None, &[], Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            AdfontesError::SafetyBlock { ref reason } if reason.contains("non-global IP")
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reuses_keep_alive_connection_across_sequential_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let accepts_for_server = Arc::clone(&accept_count);
+        let requests_for_server = Arc::clone(&request_count);
+
+        let server = thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            accepts_for_server.fetch_add(1, Ordering::SeqCst);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            for _ in 0..2 {
+                let mut header_line = String::new();
+                loop {
+                    header_line.clear();
+                    if reader.read_line(&mut header_line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if header_line == "\r\n" || header_line == "\n" {
+                        break;
+                    }
+                }
+                requests_for_server.fetch_add(1, Ordering::SeqCst);
+                let response = [
+                    "HTTP/1.1 200 OK",
+                    "Content-Type: text/plain",
+                    "Content-Length: 2",
+                    "",
+                    "ok",
+                ]
+                .join("\r\n");
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let client = loopback_client(&[addr], 4096);
+        let url = HttpUrl::parse(&format!("http://{addr}/ping")).unwrap();
+        let first = client.get(&url, None, &[]).await.unwrap();
+        let second = client.get(&url, None, &[]).await.unwrap();
+        drop(client);
+        server.join().unwrap();
+
+        assert_eq!(first.decode_text(), "ok");
+        assert_eq!(second.decode_text(), "ok");
+        assert_eq!(accept_count.load(Ordering::SeqCst), 1);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn strips_authorization_permanently_across_redirect_bounce_back() {
+        let origin_server = MockServer::start().await;
+        let mid_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/mid", mid_server.uri())),
+            )
+            .expect(1)
+            .mount(&origin_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/mid"))
+            .and(|request: &WiremockRequest| !request.headers.contains_key("authorization"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/final", origin_server.uri())),
+            )
+            .expect(1)
+            .mount(&mid_server)
+            .await;
+
+        let final_url = format!("{}/final", origin_server.uri());
+        Mock::given(method("GET"))
+            .and(path("/final"))
+            .and(|request: &WiremockRequest| !request.headers.contains_key("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("STRIPPED"))
+            .expect(1)
+            .mount(&origin_server)
+            .await;
+
+        let client = loopback_client(&[*origin_server.address(), *mid_server.address()], 4096);
+        let start_url = HttpUrl::parse(&format!("{}/start", origin_server.uri())).unwrap();
+        let response = client
+            .get(&start_url, None, &[("Authorization", "Bearer secret")])
+            .await
+            .unwrap();
+        origin_server.verify().await;
+        mid_server.verify().await;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.final_url.as_str(), final_url);
+        assert_eq!(response.decode_text(), "STRIPPED");
+    }
+
+    #[derive(Debug)]
+    struct ChainedTestError {
+        message: &'static str,
+        source: Option<Box<Self>>,
+    }
+
+    impl fmt::Display for ChainedTestError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.message)
+        }
+    }
+
+    impl StdError for ChainedTestError {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            self.source
+                .as_deref()
+                .map(|inner| inner as &(dyn StdError + 'static))
+        }
+    }
+
+    #[test]
+    fn formats_error_chain_preserving_root_cause_and_deduplicating_consecutive_frames() {
+        let root = ChainedTestError {
+            message: "dns lookup timed out",
+            source: None,
+        };
+        let duplicate = ChainedTestError {
+            message: "tcp connect failed",
+            source: Some(Box::new(root)),
+        };
+        let outer = ChainedTestError {
+            message: "tcp connect failed",
+            source: Some(Box::new(duplicate)),
+        };
+        assert_eq!(
+            format_error_chain(&outer),
+            "tcp connect failed: dns lookup timed out"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_error_preserves_reqwest_source_chain() {
+        const LOOPBACK_BUFFER_BYTES: usize = 4096;
+        const MIN_CHAIN_SEPARATORS: usize = 2;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = loopback_client(&[closed_addr], LOOPBACK_BUFFER_BYTES);
+        let url = HttpUrl::parse(&format!("http://{closed_addr}/unreachable")).unwrap();
+        let error_text = client.get(&url, None, &[]).await.unwrap_err().to_string();
+        assert!(
+            error_text.starts_with("transport failure for "),
+            "unexpected error variant: {error_text}"
+        );
+        assert!(
+            error_text.matches(": ").count() >= MIN_CHAIN_SEPARATORS,
+            "expected chained source frames in {error_text}"
+        );
+    }
+
+    #[rstest]
+    #[case("text/html; charset=bogus; charset=shift_jis", encoding_rs::UTF_8)]
+    #[case("text/html; ; charset=bogus; charset=shift_jis", encoding_rs::UTF_8)]
+    #[case("text/html; ; charset=shift_jis", encoding_rs::SHIFT_JIS)]
+    fn resolves_encoding_from_first_charset_only(
+        #[case] content_type: &str,
+        #[case] expected: &'static Encoding,
+    ) {
+        assert_eq!(encoding_from_content_type(content_type), expected);
+    }
+
+    #[rstest]
+    #[case("http://proxy.example:8080", true)]
+    #[case("https://user@proxy.example/path", true)]
+    #[case("http://proxy .example:8080", false)]
+    #[case("http://proxy.example:8080\t", false)]
+    #[case("http:///path", false)]
+    #[case("http://:8080", false)]
+    #[case("http://user@", false)]
+    #[case("http://user@:8080/path", false)]
+    fn validates_http_proxy_url(#[case] raw_proxy: &str, #[case] expected_ok: bool) {
+        assert_eq!(validate_http_proxy_url(raw_proxy).is_ok(), expected_ok);
+    }
+
+    #[test]
+    fn allows_loopback_localhost_with_trailing_dot() {
+        const LOOPBACK_BUFFER_BYTES: usize = 4096;
+        let addr: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let client = loopback_client(&[addr], LOOPBACK_BUFFER_BYTES);
+        let trailing_dot_url = HttpUrl::parse("http://localhost.:8443/paper").unwrap();
+        assert!(client.is_loopback_target_allowed(&trailing_dot_url));
     }
 }

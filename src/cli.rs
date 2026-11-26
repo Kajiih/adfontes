@@ -5,6 +5,7 @@ architecture_component!(Cli);
 use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Parser, Subcommand};
@@ -15,22 +16,24 @@ use crate::resolve::{ResolverConfig, resolve_target};
 use crate::stage::{StagingPolicy, slice_staged_pdf, stage_document, validate_staging_dir_policy};
 use crate::transport::{HttpClient, TransportConfig};
 
+const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Exit code for successful invocations and clean `BrokenPipe` (`EPIPE`) terminations.
-pub const EXIT_OK: u8 = 0;
+pub(crate) const EXIT_OK: u8 = 0;
 /// Exit code for operational retrieval, extraction, safety, or filesystem errors.
-pub const EXIT_ERROR: u8 = 1;
+pub(crate) const EXIT_ERROR: u8 = 1;
 /// Exit code for CLI usage or argument parsing errors.
-pub const EXIT_USAGE: u8 = 2;
+pub(crate) const EXIT_USAGE: u8 = 2;
 
 /// Process-level configuration parsed once at CLI startup.
 #[derive(Debug, Clone)]
-pub struct CliEnv {
+pub(crate) struct CliEnv {
     /// SSRF-validated HTTP transport settings (including environment proxies).
-    pub transport_config: TransportConfig,
+    pub(crate) transport_config: TransportConfig,
     /// Upstream repository endpoints and optional `ADFONTES_CONTACT_EMAIL`.
-    pub resolver_config: ResolverConfig,
+    pub(crate) resolver_config: ResolverConfig,
     /// Confined staging policy (`ADFONTES_STAGING_DIR`, `ADFONTES_DISABLE_PDF_SLICE`, UID).
-    pub staging_policy: StagingPolicy,
+    pub(crate) staging_policy: StagingPolicy,
 }
 
 impl CliEnv {
@@ -59,10 +62,11 @@ where
 }
 
 /// Parses `args` and executes `adfontes` against process stdio while polling `should_stop` on
-/// interrupted (`EINTR`) MCP stdin reads.
+/// interrupted (`EINTR`) MCP stdin reads and during async network I/O.
 ///
 /// Used by language bindings (such as `adfontes-py`) so pending host signals (`SIGINT`) terminate
-/// `adfontes mcp` cleanly without printing spurious stderr errors while benign signals are retried.
+/// `adfontes mcp` and `adfontes fetch` cleanly without printing spurious stderr errors while benign
+/// signals are retried.
 #[must_use]
 pub fn run_from_args_with_interrupt<I, T, F>(args: I, should_stop: F) -> u8
 where
@@ -85,15 +89,15 @@ where
 }
 
 /// Parses `args` and executes `adfontes` with injected environment configuration, stdio streams, and
-/// an interrupt predicate for `adfontes mcp`.
+/// an interrupt predicate polled on `EINTR` stdin reads and async network waits.
 #[must_use]
-pub fn run_from_args_with_io<I, T, R, W, E, F>(
+pub(crate) fn run_from_args_with_io<I, T, R, W, E, F>(
     args: I,
     env: &CliEnv,
     stdin: R,
     mut stdout: W,
     mut stderr: E,
-    should_stop: F,
+    mut should_stop: F,
 ) -> u8
 where
     I: IntoIterator<Item = T>,
@@ -126,8 +130,18 @@ where
         }
     };
 
-    match dispatch_command(parsed.command, env, stdin, &mut stdout, should_stop) {
+    // Latch one-shot host predicates (such as CPython `check_signals`) so subsequent stop checks
+    // continue observing the signal without emitting spurious stderr errors on clean shutdown.
+    let stopped = std::cell::Cell::new(false);
+    let outcome = dispatch_command(parsed.command, env, stdin, &mut stdout, || {
+        if !stopped.get() && should_stop() {
+            stopped.set(true);
+        }
+        stopped.get()
+    });
+    match outcome {
         Ok(()) => EXIT_OK,
+        Err(_) if stopped.get() => EXIT_OK,
         Err(error) => {
             let message = format!("adfontes: {error}\n");
             write_stderr_best_effort(&mut stderr, &message);
@@ -181,7 +195,7 @@ fn dispatch_command<R, W, F>(
     env: &CliEnv,
     stdin: R,
     stdout: &mut W,
-    should_stop: F,
+    mut should_stop: F,
 ) -> Result<(), AdfontesError>
 where
     R: BufRead,
@@ -196,8 +210,16 @@ where
         } => {
             let parsed_target = ParsedTarget::parse(&target)?;
             validate_staging_dir_policy(output_dir.as_deref(), &env.staging_policy)?;
+            let runtime = build_async_runtime()?;
             let client = HttpClient::new(env.transport_config.clone());
-            let extracted = resolve_target(&parsed_target, &client, &env.resolver_config)?;
+            let outcome = block_on_interruptible(
+                &runtime,
+                &mut should_stop,
+                resolve_target(&parsed_target, &client, &env.resolver_config),
+            );
+            drop(client);
+            runtime.shutdown_background();
+            let extracted = outcome?;
             let staged = stage_document(
                 &parsed_target,
                 extracted,
@@ -218,21 +240,77 @@ where
             write_output_line_epipe_safe(stdout, &slice.summary)
         }
         CliCommand::Mcp => {
+            let runtime = build_async_runtime()?;
             let client = HttpClient::new(env.transport_config.clone());
-            let resolver_config = &env.resolver_config;
-            let mut fetcher = |target: &ParsedTarget,
-                               _stop: &mut dyn FnMut() -> bool|
-             -> Result<ExtractedDocument, AdfontesError> {
-                resolve_target(target, &client, resolver_config)
+            let outcome = {
+                let resolver_config = &env.resolver_config;
+                let mut fetcher = |target: &ParsedTarget,
+                                   stop: &mut dyn FnMut() -> bool|
+                 -> Result<ExtractedDocument, AdfontesError> {
+                    block_on_interruptible(
+                        &runtime,
+                        stop,
+                        resolve_target(target, &client, resolver_config),
+                    )
+                };
+                serve_io_until(
+                    stdin,
+                    stdout,
+                    &env.staging_policy,
+                    &mut fetcher,
+                    should_stop,
+                )
             };
-            serve_io_until(
-                stdin,
-                stdout,
-                &env.staging_policy,
-                &mut fetcher,
-                should_stop,
-            )
+            drop(client);
+            runtime.shutdown_background();
+            outcome
         }
+    }
+}
+
+fn build_async_runtime() -> Result<tokio::runtime::Runtime, AdfontesError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|source| AdfontesError::Io {
+            context: "initializing async HTTP runtime".to_owned(),
+            source,
+        })
+}
+
+fn block_on_interruptible<F, Fut, T>(
+    runtime: &tokio::runtime::Runtime,
+    should_stop: &mut F,
+    future: Fut,
+) -> Result<T, AdfontesError>
+where
+    F: FnMut() -> bool + ?Sized,
+    Fut: Future<Output = Result<T, AdfontesError>>,
+{
+    if should_stop() {
+        return Err(interrupted_error());
+    }
+    runtime.block_on(async move {
+        let mut pinned = std::pin::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                outcome = &mut pinned => return outcome,
+                () = tokio::time::sleep(INTERRUPT_POLL_INTERVAL) => {
+                    if should_stop() {
+                        return Err(interrupted_error());
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn interrupted_error() -> AdfontesError {
+    AdfontesError::Io {
+        context: "interrupted during network I/O".to_owned(),
+        source: io::Error::new(io::ErrorKind::Interrupted, "operation interrupted"),
     }
 }
 
@@ -267,14 +345,16 @@ fn write_stderr_best_effort<W: Write>(writer: &mut W, text: &str) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::io::{Cursor, Read};
+    use std::io::Cursor;
     use std::net::TcpListener;
     use std::path::Path;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use std::thread;
 
     use indoc::indoc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::stage::TestSandbox;
@@ -417,10 +497,6 @@ mod tests {
     #[test]
     fn dispatches_fetch_and_blocks_forbidden_output_dir_before_network() {
         let sandbox = TestSandbox::new();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let hits = Arc::new(AtomicUsize::new(0));
-        let server_hits = Arc::clone(&hits);
         let body = indoc! {"
             # CLI Article
 
@@ -428,24 +504,20 @@ mod tests {
 
             Full markdown body for end-to-end CLI verification with sufficient prose length to pass extraction cleanly.
         "};
-        let server = thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                server_hits.fetch_add(1, Ordering::SeqCst);
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let headers = [
-                    "HTTP/1.1 200 OK".to_owned(),
-                    "Content-Type: text/markdown; charset=utf-8".to_owned(),
-                    format!("Content-Length: {}", body.len()),
-                    "Connection: close".to_owned(),
-                    String::new(),
-                    String::new(),
-                ]
-                .join("\r\n");
-                let _ = stream.write_all(headers.as_bytes());
-                let _ = stream.write_all(body.as_bytes());
-            }
+        let runtime = build_async_runtime().unwrap();
+        let server = runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/article.md"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(body, "text/markdown; charset=utf-8"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            server
         });
+        let addr = *server.address();
 
         let mut allowed_loopback_addrs = BTreeSet::new();
         allowed_loopback_addrs.insert(addr);
@@ -457,7 +529,7 @@ mod tests {
             resolver_config: ResolverConfig::default(),
             staging_policy: StagingPolicy::for_sandbox(sandbox.path()),
         };
-        let url = format!("http://{addr}/article.md");
+        let url = format!("{}/article.md", server.uri());
         let fetch_dir = sandbox.path().join("fetched");
         let mut fetch_stdout = Vec::new();
 
@@ -491,7 +563,8 @@ mod tests {
             &mut Vec::new(),
             || false,
         );
-        server.join().unwrap();
+        let recorded = runtime.block_on(server.received_requests()).unwrap();
+        drop(server);
 
         assert_eq!(blocked_code, EXIT_ERROR);
         assert_eq!(fetch_code, EXIT_OK);
@@ -500,7 +573,7 @@ mod tests {
                 .unwrap()
                 .contains("CLI Article")
         );
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(recorded.len(), 1);
     }
 
     #[test]
@@ -560,6 +633,69 @@ mod tests {
             String::from_utf8(mcp_stdout)
                 .unwrap()
                 .contains("\"result\":{}")
+        );
+    }
+
+    #[test]
+    fn cancels_stalled_fetch_within_budget_when_one_shot_stop_trips() {
+        let sandbox = TestSandbox::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+        let server_accepted_at = Arc::clone(&accepted_at);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                *server_accepted_at.lock().unwrap() = Some(std::time::Instant::now());
+                let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            }
+        });
+
+        let mut allowed_loopback_addrs = BTreeSet::new();
+        allowed_loopback_addrs.insert(addr);
+        let env = CliEnv {
+            transport_config: TransportConfig {
+                timeout: Duration::from_secs(2),
+                allowed_loopback_addrs,
+                ..TransportConfig::default()
+            },
+            resolver_config: ResolverConfig::default(),
+            staging_policy: StagingPolicy::for_sandbox(sandbox.path()),
+        };
+        let url = format!("http://{addr}/stalled.md");
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = run_from_args_with_io(
+            ["adfontes", "fetch", &url],
+            &env,
+            Cursor::new(b""),
+            &mut stdout,
+            &mut stderr,
+            || {
+                let server_ready = accepted_at.lock().unwrap().is_some();
+                server_ready
+                    && !fired.load(Ordering::Relaxed)
+                    && fired
+                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+            },
+        );
+        let cancel_elapsed = accepted_at
+            .lock()
+            .unwrap()
+            .expect("stalled test server must have accepted the client connection")
+            .elapsed();
+        let _ = release_tx.send(());
+        server.join().unwrap();
+
+        assert_eq!(exit_code, EXIT_OK);
+        assert_eq!(stderr, b"");
+        assert_eq!(stdout, b"");
+        assert!(
+            cancel_elapsed < Duration::from_millis(750),
+            "cancellation took {cancel_elapsed:?}, expected < 750ms"
         );
     }
 }

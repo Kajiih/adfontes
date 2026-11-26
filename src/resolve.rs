@@ -10,6 +10,8 @@ architecture_component!(Resolve);
 mod providers;
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use self::providers::{JsonDoc, OaCandidates};
@@ -173,21 +175,21 @@ impl ResolverConfig {
 /// Propagates [`AdfontesError::SafetyBlock`] immediately if any transport, archive, or XML safety
 /// ceiling trips, or returns [`AdfontesError::Transport`] when all upstream endpoints fail without
 /// yielding even bibliographic metadata.
-pub fn resolve_target(
+pub async fn resolve_target(
     target: &ParsedTarget,
     client: &HttpClient,
     config: &ResolverConfig,
 ) -> Result<ExtractedDocument, AdfontesError> {
     let mut visited = BTreeSet::new();
-    let mut budget = ResolveBudget::new(client);
-    resolve_target_inner(target, &mut budget, config, 0, &mut visited)
+    let budget = ResolveBudget::new(client);
+    resolve_target_inner(target, &budget, config, 0, &mut visited).await
 }
 
 struct ResolveBudget<'a> {
     client: &'a HttpClient,
     started_at: Instant,
-    requests_made: usize,
-    last_transport_error: Option<String>,
+    requests_made: AtomicUsize,
+    last_transport_error: Mutex<Option<String>>,
 }
 
 impl<'a> ResolveBudget<'a> {
@@ -195,79 +197,106 @@ impl<'a> ResolveBudget<'a> {
         Self {
             client,
             started_at: Instant::now(),
-            requests_made: 0,
-            last_transport_error: None,
+            requests_made: AtomicUsize::new(0),
+            last_transport_error: Mutex::new(None),
         }
     }
 
     fn is_exhausted(&self) -> bool {
-        self.requests_made >= MAX_WATERFALL_HTTP_REQUESTS
+        self.requests_made.load(Ordering::Acquire) >= MAX_WATERFALL_HTTP_REQUESTS
             || self.started_at.elapsed() >= MAX_WATERFALL_DURATION
     }
 
-    fn get(&mut self, url: &HttpUrl, accept: Option<&str>) -> Result<HttpResponse, AdfontesError> {
-        if self.requests_made >= MAX_WATERFALL_HTTP_REQUESTS {
-            let detail = format!(
-                "waterfall HTTP request budget exhausted ({MAX_WATERFALL_HTTP_REQUESTS} requests)"
-            );
-            if self.last_transport_error.is_none() {
-                self.last_transport_error = Some(detail.clone());
-            }
-            return Err(AdfontesError::Transport {
-                url: url.as_str().to_owned(),
-                detail,
-            });
-        }
+    async fn get(
+        &self,
+        url: &HttpUrl,
+        accept: Option<&str>,
+    ) -> Result<HttpResponse, AdfontesError> {
         if self.started_at.elapsed() >= MAX_WATERFALL_DURATION {
             let detail = format!(
                 "waterfall deadline exceeded ({}s)",
                 MAX_WATERFALL_DURATION.as_secs()
             );
-            if self.last_transport_error.is_none() {
-                self.last_transport_error = Some(detail.clone());
-            }
+            self.record_transport_error_if_unset(&detail);
             return Err(AdfontesError::Transport {
                 url: url.as_str().to_owned(),
                 detail,
             });
         }
-        self.requests_made += 1;
-        let result = self.client.get(url, accept, &[]);
+        if self
+            .requests_made
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_WATERFALL_HTTP_REQUESTS).then_some(count + 1)
+            })
+            .is_err()
+        {
+            let detail = format!(
+                "waterfall HTTP request budget exhausted ({MAX_WATERFALL_HTTP_REQUESTS} requests)"
+            );
+            self.record_transport_error_if_unset(&detail);
+            return Err(AdfontesError::Transport {
+                url: url.as_str().to_owned(),
+                detail,
+            });
+        }
+        let result = self.client.get(url, accept, &[]).await;
         if let Err(AdfontesError::Transport { ref detail, .. }) = result {
-            self.last_transport_error = Some(detail.clone());
+            self.record_transport_error(detail);
         }
         result
     }
 
     fn append_last_transport_error(&self, summary: &str) -> String {
-        match self.last_transport_error {
+        let guard = self
+            .last_transport_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match *guard {
             Some(ref detail) if !detail.is_empty() => format!("{summary} ({detail})"),
             _ => summary.to_owned(),
         }
     }
+
+    fn record_transport_error(&self, detail: &str) {
+        let mut guard = self
+            .last_transport_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *guard = Some(detail.to_owned());
+    }
+
+    fn record_transport_error_if_unset(&self, detail: &str) {
+        let mut guard = self
+            .last_transport_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if guard.is_none() {
+            *guard = Some(detail.to_owned());
+        }
+    }
 }
 
-fn resolve_target_inner(
+async fn resolve_target_inner(
     target: &ParsedTarget,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     depth: u8,
     visited: &mut BTreeSet<String>,
 ) -> Result<ExtractedDocument, AdfontesError> {
     visited.insert(target_visit_key(target));
     match target {
-        ParsedTarget::Arxiv(id) => resolve_arxiv(id, budget, config),
-        ParsedTarget::Doi(doi) => resolve_doi(doi, budget, config, depth, visited),
-        ParsedTarget::PmcId(pmcid) => resolve_pmcid(pmcid, budget, config),
-        ParsedTarget::Pmid(pmid) => resolve_pmid(pmid, budget, config, depth, visited),
-        ParsedTarget::Rfc(rfc) => resolve_rfc(*rfc, budget, config),
-        ParsedTarget::Url(url) => resolve_url(url, budget, config, depth, visited),
+        ParsedTarget::Arxiv(id) => resolve_arxiv(id, budget, config).await,
+        ParsedTarget::Doi(doi) => resolve_doi(doi, budget, config, depth, visited).await,
+        ParsedTarget::PmcId(pmcid) => resolve_pmcid(pmcid, budget, config).await,
+        ParsedTarget::Pmid(pmid) => resolve_pmid(pmid, budget, config, depth, visited).await,
+        ParsedTarget::Rfc(rfc) => resolve_rfc(*rfc, budget, config).await,
+        ParsedTarget::Url(url) => resolve_url(url, budget, config, depth, visited).await,
     }
 }
 
-fn resolve_arxiv(
+async fn resolve_arxiv(
     id: &ArxivId,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
 ) -> Result<ExtractedDocument, AdfontesError> {
     let mut metadata = WorkMetadata {
@@ -278,7 +307,7 @@ fn resolve_arxiv(
     let mut failures = Vec::new();
 
     // 1. Metadata via Atom API (gracefully survive rate-limiting / HTTP 429 / 503).
-    fetch_arxiv_atom_metadata(id, budget, config, &mut metadata, &mut failures)?;
+    fetch_arxiv_atom_metadata(id, budget, config, &mut metadata, &mut failures).await?;
 
     // 2. Official arXiv LaTeXML HTML (`arxiv.org/html/<id>`).
     if let Some(doc) = try_arxiv_html_endpoint(
@@ -291,7 +320,9 @@ fn resolve_arxiv(
         &mut metadata,
         &mut failures,
         "arxiv-html",
-    )? {
+    )
+    .await?
+    {
         return Ok(doc);
     }
 
@@ -306,12 +337,15 @@ fn resolve_arxiv(
         &mut metadata,
         &mut failures,
         "ar5iv",
-    )? {
+    )
+    .await?
+    {
         return Ok(doc);
     }
 
     // 4. LaTeX source archive (`export.arxiv.org/src/<id>`).
-    if let Some(doc) = try_arxiv_source_endpoint(id, budget, config, &mut metadata, &mut failures)?
+    if let Some(doc) =
+        try_arxiv_source_endpoint(id, budget, config, &mut metadata, &mut failures).await?
     {
         return Ok(doc);
     }
@@ -322,7 +356,9 @@ fn resolve_arxiv(
         config.endpoints.arxiv_org.trim_end_matches('/'),
         id.as_str()
     ))?;
-    if let Some(doc) = try_arxiv_pdf_endpoint(&pdf_url, budget, &mut metadata, &mut failures)? {
+    if let Some(doc) =
+        try_arxiv_pdf_endpoint(&pdf_url, budget, &mut metadata, &mut failures).await?
+    {
         return Ok(doc);
     }
 
@@ -353,21 +389,19 @@ fn resolve_arxiv(
     })
 }
 
-fn fetch_arxiv_atom_metadata(
+async fn fetch_arxiv_atom_metadata(
     id: &ArxivId,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     metadata: &mut WorkMetadata,
     failures: &mut Vec<String>,
 ) -> Result<(), AdfontesError> {
-    let Ok(atom_base_url) = HttpUrl::parse(&format!(
+    let atom_base_url = HttpUrl::parse(&format!(
         "{}/api/query",
         config.endpoints.export_arxiv_org.trim_end_matches('/'),
-    )) else {
-        return Ok(());
-    };
+    ))?;
     let atom_url = atom_base_url.with_query_pairs([("id_list", id.as_str())]);
-    match budget.get(&atom_url, Some(ACCEPT_XML)) {
+    match budget.get(&atom_url, Some(ACCEPT_XML)).await {
         Ok(resp) if resp.status == HTTP_OK => {
             let xml = resp.decode_text();
             match parse_arxiv_atom_feed(&xml) {
@@ -388,15 +422,15 @@ fn fetch_arxiv_atom_metadata(
     Ok(())
 }
 
-fn try_arxiv_html_endpoint(
+async fn try_arxiv_html_endpoint(
     raw_url: &str,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     metadata: &mut WorkMetadata,
     failures: &mut Vec<String>,
     label: &str,
 ) -> Result<Option<ExtractedDocument>, AdfontesError> {
     let url = HttpUrl::parse(raw_url)?;
-    match budget.get(&url, Some(ACCEPT_HTML)) {
+    match budget.get(&url, Some(ACCEPT_HTML)).await {
         Ok(resp) if resp.status == HTTP_OK => {
             if is_arxiv_abs_url(&resp.final_url) {
                 failures.push(format!("{label}: redirected to /abs/"));
@@ -444,9 +478,9 @@ fn try_arxiv_html_endpoint(
     }
 }
 
-fn try_arxiv_source_endpoint(
+async fn try_arxiv_source_endpoint(
     id: &ArxivId,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     metadata: &mut WorkMetadata,
     failures: &mut Vec<String>,
@@ -456,7 +490,7 @@ fn try_arxiv_source_endpoint(
         config.endpoints.export_arxiv_org.trim_end_matches('/'),
         id.as_str()
     ))?;
-    match budget.get(&src_url, None) {
+    match budget.get(&src_url, None).await {
         Ok(resp) if resp.status == HTTP_OK => {
             if is_pdf_response(&resp) {
                 let byte_len = resp.body.len();
@@ -505,13 +539,13 @@ fn try_arxiv_source_endpoint(
     }
 }
 
-fn try_arxiv_pdf_endpoint(
+async fn try_arxiv_pdf_endpoint(
     pdf_url: &HttpUrl,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     metadata: &mut WorkMetadata,
     failures: &mut Vec<String>,
 ) -> Result<Option<ExtractedDocument>, AdfontesError> {
-    match budget.get(pdf_url, Some(ACCEPT_PDF)) {
+    match budget.get(pdf_url, Some(ACCEPT_PDF)).await {
         Ok(resp) if resp.status == HTTP_OK && is_pdf_response(&resp) => {
             let byte_len = resp.body.len();
             metadata.source_url = Some(resp.final_url);
@@ -533,9 +567,9 @@ fn try_arxiv_pdf_endpoint(
     }
 }
 
-fn resolve_pmid(
+async fn resolve_pmid(
     pmid: &Pmid,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     depth: u8,
     visited: &mut BTreeSet<String>,
@@ -557,7 +591,7 @@ fn resolve_pmid(
     };
     let mut oa_pdf_urls = Vec::new();
 
-    let Some(search_doc) = fetch_optional_json(&search_url, ACCEPT_JSON, budget)? else {
+    let Some(search_doc) = fetch_optional_json(&search_url, ACCEPT_JSON, budget).await? else {
         return Err(AdfontesError::Transport {
             url: search_url.as_str().to_owned(),
             detail: budget.append_last_transport_error("Europe PMC PMID lookup failed"),
@@ -575,7 +609,7 @@ fn resolve_pmid(
     if let Some(pmcid) = ids.pmcid
         && visited.insert(target_visit_key(&ParsedTarget::PmcId(pmcid.clone())))
     {
-        match resolve_pmcid(&pmcid, budget, config) {
+        match resolve_pmcid(&pmcid, budget, config).await {
             Ok(pmc_doc) if !matches!(pmc_doc.payload, ExtractedPayload::MetadataOnly { .. }) => {
                 return Ok(merge_caller_priority_metadata(pmc_doc, metadata));
             }
@@ -593,7 +627,15 @@ fn resolve_pmid(
         && let Some(parsed_target) = ids.follow_up_target
         && !visited.contains(&target_visit_key(&parsed_target))
     {
-        match resolve_target_inner(&parsed_target, budget, config, depth + 1, visited) {
+        match Box::pin(resolve_target_inner(
+            &parsed_target,
+            budget,
+            config,
+            depth + 1,
+            visited,
+        ))
+        .await
+        {
             Ok(doc) if !matches!(doc.payload, ExtractedPayload::MetadataOnly { .. }) => {
                 return Ok(merge_caller_priority_metadata(doc, metadata));
             }
@@ -606,7 +648,7 @@ fn resolve_pmid(
         }
     }
 
-    if let Some(pdf_doc) = try_oa_pdf_urls(&oa_pdf_urls, &mut metadata, budget)? {
+    if let Some(pdf_doc) = try_oa_pdf_urls(&oa_pdf_urls, &mut metadata, budget).await? {
         return Ok(pdf_doc);
     }
 
@@ -622,9 +664,9 @@ fn resolve_pmid(
     })
 }
 
-fn resolve_doi(
+async fn resolve_doi(
     doi: &Doi,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     depth: u8,
     visited: &mut BTreeSet<String>,
@@ -641,31 +683,45 @@ fn resolve_doi(
     };
     let mut oa_candidates = OaCandidates::default();
 
+    let openalex_url = build_openalex_doi_url(config, &encoded_doi)?;
+    let unpaywall_url = config
+        .usable_contact_email()
+        .map(|email| {
+            HttpUrl::parse(&format!(
+                "{}/v2/{encoded_doi}",
+                config.endpoints.unpaywall.trim_end_matches('/')
+            ))
+            .map(|base| base.with_query_pairs([("email", email)]))
+        })
+        .transpose()?;
+
+    // Run independent metadata legs concurrently, cancelling siblings immediately on fatal errors
+    // such as `SafetyBlock`, while preserving deterministic 1 -> 2 -> 3 merges.
+    let (csl_opt, oa_opt, upw_opt) = tokio::try_join!(
+        fetch_optional_json(&doi_canonical_url, ACCEPT_CSL_JSON, budget),
+        fetch_optional_json(&openalex_url, ACCEPT_JSON, budget),
+        async {
+            match unpaywall_url.as_ref() {
+                Some(url) => fetch_optional_json(url, ACCEPT_JSON, budget).await,
+                None => Ok(None),
+            }
+        },
+    )?;
+    let metadata_found = csl_opt.is_some() || oa_opt.is_some() || upw_opt.is_some();
+
     // 1. CSL-JSON content negotiation via `doi.org`.
-    let mut metadata_found = fetch_optional_json(&doi_canonical_url, ACCEPT_CSL_JSON, budget)?
-        .is_some_and(|csl_json| {
-            csl_json.merge_csl_work(&mut metadata);
-            true
-        });
+    if let Some(csl) = csl_opt {
+        csl.merge_csl_work(&mut metadata);
+    }
 
     // 2. OpenAlex work record (authors, venue, inverted-index abstract, PMCID, OA locations).
-    let openalex_url = build_openalex_doi_url(config, &encoded_doi)?;
-    if let Some(oa_json) = fetch_optional_json(&openalex_url, ACCEPT_JSON, budget)? {
-        oa_json.merge_openalex_work(&mut metadata, &mut oa_candidates);
-        metadata_found = true;
+    if let Some(oa_work) = oa_opt {
+        oa_work.merge_openalex_work(&mut metadata, &mut oa_candidates);
     }
 
     // 3. Optional Unpaywall OA lookup when a real non-placeholder contact email is configured.
-    if let Some(email) = config.usable_contact_email() {
-        let unpaywall_url = HttpUrl::parse(&format!(
-            "{}/v2/{encoded_doi}",
-            config.endpoints.unpaywall.trim_end_matches('/')
-        ))?
-        .with_query_pairs([("email", email)]);
-        if let Some(upw_json) = fetch_optional_json(&unpaywall_url, ACCEPT_JSON, budget)? {
-            upw_json.merge_unpaywall_work(&mut metadata, &mut oa_candidates);
-            metadata_found = true;
-        }
+    if let Some(upw_work) = upw_opt {
+        upw_work.merge_unpaywall_work(&mut metadata, &mut oa_candidates);
     }
 
     let mut saw_body_restricted = false;
@@ -674,7 +730,7 @@ fn resolve_doi(
     if let Some(pmcid) = oa_candidates.pmcid()
         && visited.insert(target_visit_key(&ParsedTarget::PmcId(pmcid.clone())))
     {
-        match resolve_pmcid(pmcid, budget, config) {
+        match resolve_pmcid(pmcid, budget, config).await {
             Ok(pmc_doc) if !matches!(pmc_doc.payload, ExtractedPayload::MetadataOnly { .. }) => {
                 return Ok(merge_caller_priority_metadata(pmc_doc, metadata));
             }
@@ -696,7 +752,9 @@ fn resolve_doi(
         depth,
         visited,
         &mut saw_body_restricted,
-    )? {
+    )
+    .await?
+    {
         return Ok(doc);
     }
 
@@ -720,10 +778,10 @@ fn resolve_doi(
     })
 }
 
-fn try_oa_candidates(
+async fn try_oa_candidates(
     candidates: &OaCandidates,
     metadata: &mut WorkMetadata,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     depth: u8,
     visited: &mut BTreeSet<String>,
@@ -744,7 +802,15 @@ fn try_oa_candidates(
                     continue;
                 }
                 attempted_targets += 1;
-                match resolve_target_inner(&target, budget, config, depth + 1, visited) {
+                match Box::pin(resolve_target_inner(
+                    &target,
+                    budget,
+                    config,
+                    depth + 1,
+                    visited,
+                ))
+                .await
+                {
                     Ok(doc) if !matches!(doc.payload, ExtractedPayload::MetadataOnly { .. }) => {
                         return Ok(Some(merge_caller_priority_metadata(doc, metadata.clone())));
                     }
@@ -760,7 +826,7 @@ fn try_oa_candidates(
     }
 
     // 2. Try OA PDF URLs while verifying real PDF MIME/magic (rejecting HTML paywall pages).
-    if let Some(pdf_doc) = try_oa_pdf_urls(candidates.pdf_urls(), metadata, budget)? {
+    if let Some(pdf_doc) = try_oa_pdf_urls(candidates.pdf_urls(), metadata, budget).await? {
         return Ok(Some(pdf_doc));
     }
 
@@ -774,12 +840,13 @@ fn try_oa_candidates(
         visited,
         saw_body_restricted,
     )
+    .await
 }
 
-fn try_oa_landing_pages(
+async fn try_oa_landing_pages(
     landing_urls: &[HttpUrl],
     metadata: &mut WorkMetadata,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     depth: u8,
     visited: &mut BTreeSet<String>,
@@ -789,14 +856,22 @@ fn try_oa_landing_pages(
         if budget.is_exhausted() {
             break;
         }
-        match budget.get(landing_url, Some(ACCEPT_WEB_PREFERRED)) {
+        match budget.get(landing_url, Some(ACCEPT_WEB_PREFERRED)).await {
             Ok(resp) => {
                 if depth < MAX_RECLASSIFICATION_DEPTH
                     && let Some(target @ (ParsedTarget::Arxiv(_) | ParsedTarget::PmcId(_))) =
                         classify_known_scholarly_url(&resp.final_url)
                     && !visited.contains(&target_visit_key(&target))
                 {
-                    match resolve_target_inner(&target, budget, config, depth + 1, visited) {
+                    match Box::pin(resolve_target_inner(
+                        &target,
+                        budget,
+                        config,
+                        depth + 1,
+                        visited,
+                    ))
+                    .await
+                    {
                         Ok(doc)
                             if !matches!(doc.payload, ExtractedPayload::MetadataOnly { .. }) =>
                         {
@@ -872,9 +947,9 @@ fn extract_oa_landing_response(
     None
 }
 
-fn resolve_pmcid(
+async fn resolve_pmcid(
     pmcid: &PmcId,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
 ) -> Result<ExtractedDocument, AdfontesError> {
     let base = config.endpoints.europe_pmc.trim_end_matches('/');
@@ -889,19 +964,23 @@ fn resolve_pmcid(
     };
     let mut oa_pdf_urls = Vec::new();
 
-    let mut saw_metadata =
-        fetch_optional_json(&search_url, ACCEPT_JSON, budget)?.is_some_and(|search_json| {
-            search_json
-                .extract_europe_pmc_record(&mut metadata, &mut oa_pdf_urls)
-                .is_some()
-        });
+    let mut saw_metadata = if let Some(search_doc) =
+        fetch_optional_json(&search_url, ACCEPT_JSON, budget).await?
+        && search_doc
+            .extract_europe_pmc_record(&mut metadata, &mut oa_pdf_urls)
+            .is_some()
+    {
+        true
+    } else {
+        false
+    };
 
     let xml_url = HttpUrl::parse(&format!(
         "{base}/webservices/rest/{}/fullTextXML",
         pmcid.as_str()
     ))?;
     let mut body_restricted = false;
-    match budget.get(&xml_url, Some(ACCEPT_XML)) {
+    match budget.get(&xml_url, Some(ACCEPT_XML)).await {
         Ok(resp) if resp.status == HTTP_OK => {
             let xml = resp.decode_text();
             match extract_jats_xml(&xml) {
@@ -942,7 +1021,7 @@ fn resolve_pmcid(
         Ok(_) | Err(_) => {}
     }
 
-    if let Some(pdf_doc) = try_oa_pdf_urls(&oa_pdf_urls, &mut metadata, budget)? {
+    if let Some(pdf_doc) = try_oa_pdf_urls(&oa_pdf_urls, &mut metadata, budget).await? {
         return Ok(pdf_doc);
     }
 
@@ -966,16 +1045,16 @@ fn resolve_pmcid(
     })
 }
 
-fn try_oa_pdf_urls(
+async fn try_oa_pdf_urls(
     pdf_urls: &[HttpUrl],
     metadata: &mut WorkMetadata,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
 ) -> Result<Option<ExtractedDocument>, AdfontesError> {
     for pdf_url in pdf_urls.iter().take(MAX_OA_CANDIDATES) {
         if budget.is_exhausted() {
             break;
         }
-        match budget.get(pdf_url, Some(ACCEPT_PDF)) {
+        match budget.get(pdf_url, Some(ACCEPT_PDF)).await {
             Ok(resp) if resp.status == HTTP_OK && is_pdf_response(&resp) => {
                 let byte_len = resp.body.len();
                 metadata.source_url = Some(resp.final_url);
@@ -992,9 +1071,9 @@ fn try_oa_pdf_urls(
     Ok(None)
 }
 
-fn resolve_rfc(
+async fn resolve_rfc(
     rfc: RfcNumber,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
 ) -> Result<ExtractedDocument, AdfontesError> {
     let rfc_number = rfc.get();
@@ -1009,9 +1088,10 @@ fn resolve_rfc(
         "{}/doc/rfc{rfc_number}/doc.json",
         config.endpoints.ietf_datatracker.trim_end_matches('/')
     ))?;
-    let saw_metadata =
-        fetch_optional_json(&tracker_url, ACCEPT_JSON, budget)?.is_some_and(|doc_json| {
-            doc_json.merge_ietf_doc(&mut metadata);
+    let saw_metadata = fetch_optional_json(&tracker_url, ACCEPT_JSON, budget)
+        .await?
+        .is_some_and(|doc_meta| {
+            doc_meta.merge_ietf_doc(&mut metadata);
             true
         });
 
@@ -1020,7 +1100,7 @@ fn resolve_rfc(
         "{}/rfc/rfc{rfc_number}.xml",
         config.endpoints.rfc_editor.trim_end_matches('/')
     ))?;
-    match budget.get(&xml_url, Some(ACCEPT_XML)) {
+    match budget.get(&xml_url, Some(ACCEPT_XML)).await {
         Ok(resp) if resp.status == HTTP_OK => {
             let xml = resp.decode_text();
             match extract_rfc_xml(&xml) {
@@ -1051,7 +1131,7 @@ fn resolve_rfc(
         "{}/rfc/rfc{rfc_number}.txt",
         config.endpoints.rfc_editor.trim_end_matches('/')
     ))?;
-    let txt_failure_detail = match budget.get(&txt_url, Some(MIME_PLAIN_TEXT)) {
+    let txt_failure_detail = match budget.get(&txt_url, Some(MIME_PLAIN_TEXT)).await {
         Ok(resp) if resp.status == HTTP_OK => {
             let mime = resp.mime_type();
             if is_plain_text_mime(&mime) || mime.is_empty() {
@@ -1099,9 +1179,9 @@ fn resolve_rfc(
     })
 }
 
-fn resolve_url(
+async fn resolve_url(
     url: &HttpUrl,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     depth: u8,
     visited: &mut BTreeSet<String>,
@@ -1109,13 +1189,13 @@ fn resolve_url(
     budget.client.validate_url_policy(url)?;
     let response = if let Some(raw_github) = url.to_raw_github_url() {
         visited.insert(format!("url:{}", raw_github.as_str()));
-        match budget.get(&raw_github, Some(ACCEPT_WEB_PREFERRED)) {
+        match budget.get(&raw_github, Some(ACCEPT_WEB_PREFERRED)).await {
             Ok(resp) if resp.status == HTTP_OK => resp,
             Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-            _ => budget.get(url, Some(ACCEPT_WEB_PREFERRED))?,
+            _ => budget.get(url, Some(ACCEPT_WEB_PREFERRED)).await?,
         }
     } else {
-        budget.get(url, Some(ACCEPT_WEB_PREFERRED))?
+        budget.get(url, Some(ACCEPT_WEB_PREFERRED)).await?
     };
 
     // Reclassify intermediate and final post-redirect scholarly URLs BEFORE rejecting non-200
@@ -1131,7 +1211,14 @@ fn resolve_url(
                 && !matches!(reclassified, ParsedTarget::Url(_))
                 && !visited.contains(&target_visit_key(&reclassified))
             {
-                return resolve_target_inner(&reclassified, budget, config, depth + 1, visited);
+                return Box::pin(resolve_target_inner(
+                    &reclassified,
+                    budget,
+                    config,
+                    depth + 1,
+                    visited,
+                ))
+                .await;
             }
         }
     }
@@ -1142,7 +1229,7 @@ fn resolve_url(
         && let Some(raw_github) = response.final_url.to_raw_github_url()
         && visited.insert(format!("url:{}", raw_github.as_str()))
     {
-        match budget.get(&raw_github, Some(ACCEPT_WEB_PREFERRED)) {
+        match budget.get(&raw_github, Some(ACCEPT_WEB_PREFERRED)).await {
             Ok(raw_resp) if raw_resp.status == HTTP_OK => raw_resp,
             Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
             Ok(_) | Err(_) => response,
@@ -1317,12 +1404,12 @@ fn try_dispatch_xml_response(
     }
 }
 
-fn fetch_optional_json(
+async fn fetch_optional_json(
     url: &HttpUrl,
     accept: &str,
-    budget: &mut ResolveBudget<'_>,
+    budget: &ResolveBudget<'_>,
 ) -> Result<Option<JsonDoc>, AdfontesError> {
-    match budget.get(url, Some(accept)) {
+    match budget.get(url, Some(accept)).await {
         Ok(resp) if resp.status == HTTP_OK => Ok(JsonDoc::parse(&resp.body)),
         Err(safety @ AdfontesError::SafetyBlock { .. }) => Err(safety),
         Ok(_) | Err(_) => Ok(None),
@@ -1544,13 +1631,14 @@ fn is_xml_mime(mime: &str) -> bool {
 }
 
 fn looks_like_markdown_path(path: &str) -> bool {
-    let has_markdown_extension = std::path::Path::new(path)
-        .extension()
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
-        });
-    let lower = path.to_ascii_lowercase();
-    has_markdown_extension || lower.ends_with("/llms.txt") || lower.ends_with("/llms-full.txt")
+    let segment = path.rsplit('/').next().unwrap_or("");
+    let has_markdown_extension = segment.rsplit_once('.').is_some_and(|(stem, extension)| {
+        !stem.is_empty()
+            && (extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown"))
+    });
+    has_markdown_extension
+        || segment.eq_ignore_ascii_case("llms.txt")
+        || segment.eq_ignore_ascii_case("llms-full.txt")
 }
 
 fn is_usable_contact_email(raw: &str) -> bool {
@@ -1612,89 +1700,126 @@ fn is_valid_contact_email_domain(lower_domain: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
-    use std::io::{Read, Write};
+    use std::io::{BufRead as _, BufReader, Write as _};
     use std::net::{SocketAddr, TcpListener};
-    use std::sync::Arc;
+    use std::sync::{Arc, Condvar};
     use std::thread;
 
     use indoc::indoc;
     use rstest::rstest;
+    use serde_json::json;
+    use wiremock::matchers::{any, method, path, path_regex};
+    use wiremock::{Mock, MockServer, Request as WiremockRequest, ResponseTemplate};
 
     use super::*;
     use crate::transport::TransportConfig;
 
-    type RouteHandler =
-        Arc<dyn Fn(&str) -> (u16, String, Vec<u8>, Vec<(String, String)>) + Send + Sync>;
-
-    struct LoopbackFixture {
-        addr: SocketAddr,
-        base_url: String,
+    fn resolver_config_for(base_url: &str, contact_email: Option<&str>) -> ResolverConfig {
+        ResolverConfig {
+            contact_email: contact_email.map(str::to_owned),
+            endpoints: ResolverEndpoints {
+                arxiv_org: base_url.to_owned(),
+                export_arxiv_org: base_url.to_owned(),
+                ar5iv: format!("{base_url}/ar5iv"),
+                doi_org: format!("{base_url}/doi"),
+                openalex: format!("{base_url}/openalex"),
+                unpaywall: format!("{base_url}/unpaywall"),
+                europe_pmc: format!("{base_url}/epmc"),
+                ietf_datatracker: format!("{base_url}/datatracker"),
+                rfc_editor: format!("{base_url}/rfceditor"),
+            },
+        }
     }
 
-    impl LoopbackFixture {
-        fn spawn<F>(max_requests: usize, handler: F) -> Self
-        where
-            F: Fn(&str) -> (u16, String, Vec<u8>, Vec<(String, String)>) + Send + Sync + 'static,
-        {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let shared: RouteHandler = Arc::new(handler);
-            thread::spawn(move || {
-                for _ in 0..max_requests {
-                    let Ok((mut stream, _)) = listener.accept() else {
-                        break;
-                    };
-                    let mut buf = [0_u8; 4096];
-                    let bytes_read = stream.read(&mut buf).unwrap_or(0);
-                    let request = String::from_utf8_lossy(&buf[..bytes_read]);
-                    let path = request
-                        .lines()
-                        .next()
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .unwrap_or("/");
-                    let (status, content_type, body, extra_headers) = shared(path);
-                    let mut header = String::new();
-                    let _ = write!(header, "HTTP/1.1 {status} OK\r\n");
-                    let _ = write!(header, "Content-Type: {content_type}\r\n");
-                    let _ = write!(header, "Content-Length: {}\r\n", body.len());
-                    header.push_str("Connection: close\r\n");
-                    for (name, value) in extra_headers {
-                        let _ = write!(header, "{name}: {value}\r\n");
+    fn http_client_for(addrs: &[SocketAddr]) -> HttpClient {
+        let mut config = TransportConfig::default();
+        config.allowed_loopback_addrs.extend(addrs.iter().copied());
+        HttpClient::new(config)
+    }
+
+    fn spawn_concurrent_doi_barrier_server(
+        expected_legs: usize,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let barrier = Arc::new((Mutex::new(0_usize), Condvar::new()));
+
+        let handle = thread::spawn(move || {
+            let mut workers = Vec::with_capacity(expected_legs);
+            for _ in 0..expected_legs {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let leg_barrier = Arc::clone(&barrier);
+                workers.push(thread::spawn(move || {
+                    let mut reader = BufReader::new(&stream);
+                    let mut request_line = String::new();
+                    let _ = reader.read_line(&mut request_line);
+                    let req_path = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_owned();
+
+                    let (lock, cvar) = &*leg_barrier;
+                    {
+                        let mut count = lock.lock().unwrap();
+                        *count += 1;
+                        drop(count);
+                        cvar.notify_all();
                     }
-                    header.push_str("\r\n");
+                    let arrived = cvar
+                        .wait_timeout_while(
+                            lock.lock().unwrap(),
+                            Duration::from_secs(2),
+                            |pending| *pending < expected_legs,
+                        )
+                        .is_ok_and(|(_guard, timeout)| !timeout.timed_out());
+
+                    let (status, content_type, body) = if !arrived {
+                        (504, "text/plain", b"sequential deadlock".as_slice())
+                    } else if req_path.starts_with("/doi/") {
+                        (
+                            200,
+                            "application/vnd.citationstyles.csl+json",
+                            br#"{"title":"Concurrent CSL Title","issued":{"date-parts":[[2026]]}}"#
+                                .as_slice(),
+                        )
+                    } else if req_path.starts_with("/openalex/") {
+                        (
+                            200,
+                            "application/json",
+                            br#"{"title":"Fallback OA Title","abstract_inverted_index":{"Parallel":[0],"legs":[1],"pass.":[2]},"best_oa_location":null,"locations":[]}"#
+                                .as_slice(),
+                        )
+                    } else if req_path.starts_with("/unpaywall/") {
+                        (
+                            200,
+                            "application/json",
+                            br#"{"title":"Fallback Unpaywall Title","journal_name":"Unpaywall Journal","year":2025,"best_oa_location":null,"oa_locations":[]}"#
+                                .as_slice(),
+                        )
+                    } else {
+                        (404, "text/plain", b"not found".as_slice())
+                    };
+                    let header = [
+                        format!("HTTP/1.1 {status} OK"),
+                        format!("Content-Type: {content_type}"),
+                        format!("Content-Length: {}", body.len()),
+                        "Connection: close".to_owned(),
+                        String::new(),
+                        String::new(),
+                    ]
+                    .join("\r\n");
                     let _ = stream.write_all(header.as_bytes());
-                    let _ = stream.write_all(&body);
-                }
-            });
-            Self {
-                addr,
-                base_url: format!("http://127.0.0.1:{}", addr.port()),
+                    let _ = stream.write_all(body);
+                }));
             }
-        }
-
-        fn resolver_config(&self, contact_email: Option<&str>) -> ResolverConfig {
-            ResolverConfig {
-                contact_email: contact_email.map(str::to_owned),
-                endpoints: ResolverEndpoints {
-                    arxiv_org: self.base_url.clone(),
-                    export_arxiv_org: self.base_url.clone(),
-                    ar5iv: format!("{}/ar5iv", self.base_url),
-                    doi_org: format!("{}/doi", self.base_url),
-                    openalex: format!("{}/openalex", self.base_url),
-                    unpaywall: format!("{}/unpaywall", self.base_url),
-                    europe_pmc: format!("{}/epmc", self.base_url),
-                    ietf_datatracker: format!("{}/datatracker", self.base_url),
-                    rfc_editor: format!("{}/rfceditor", self.base_url),
-                },
+            for worker in workers {
+                worker.join().unwrap();
             }
-        }
-
-        fn http_client(&self) -> HttpClient {
-            let mut config = TransportConfig::default();
-            config.allowed_loopback_addrs.insert(self.addr);
-            HttpClient::new(config)
-        }
+        });
+        (addr, handle)
     }
 
     #[rstest]
@@ -1712,8 +1837,8 @@ mod tests {
         assert_eq!(is_usable_contact_email(email), expected);
     }
 
-    #[test]
-    fn arxiv_survives_atom_429_rejects_ar5iv_abs_redirect_and_extracts_tex_source() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn arxiv_survives_atom_429_rejects_ar5iv_abs_redirect_and_extracts_tex_source() {
         let tex = indoc! {r"
             \documentclass{article}
             \title{Surviving Rate Limits}
@@ -1726,47 +1851,38 @@ mod tests {
             \end{equation}
             \end{document}
         "};
-        let tex_bytes = tex.as_bytes().to_vec();
-        let fixture = LoopbackFixture::spawn(8, move |path| {
-            if path.starts_with("/api/query") {
-                return (
-                    429,
-                    "text/plain".to_owned(),
-                    b"Rate exceeded.".to_vec(),
-                    vec![],
-                );
-            }
-            if path.starts_with("/html/") {
-                return (404, "text/html".to_owned(), b"Not Found".to_vec(), vec![]);
-            }
-            if path.starts_with("/ar5iv/html/") {
-                return (
-                    302,
-                    "text/html".to_owned(),
-                    Vec::new(),
-                    vec![("Location".to_owned(), "/abs/2409.13740".to_owned())],
-                );
-            }
-            if path.starts_with("/abs/") {
-                return (
-                    200,
-                    "text/html".to_owned(),
-                    b"<article><p>Abstract only</p></article>".to_vec(),
-                    vec![],
-                );
-            }
-            if path.starts_with("/src/") {
-                return (200, "text/plain".to_owned(), tex_bytes.clone(), vec![]);
-            }
-            (404, "text/plain".to_owned(), b"missing".to_vec(), vec![])
-        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/api/query"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Rate exceeded."))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/ar5iv/html/"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/abs/2409.13740"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/abs/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<article><p>Abstract only</p></article>", "text/html"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/src/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tex))
+            .mount(&server)
+            .await;
 
         let target = ParsedTarget::parse("2409.13740").unwrap();
         let doc = resolve_target(
             &target,
-            &fixture.http_client(),
-            &fixture.resolver_config(None),
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
         )
+        .await
         .unwrap();
         let ExtractedPayload::FullText { format, markdown } = doc.payload else {
             panic!("expected LaTeX full text");
@@ -1776,33 +1892,34 @@ mod tests {
         assert!(markdown.contains(r"g(f) = \mu f - \frac{1}{2} \sigma^2 f^2"));
     }
 
-    #[test]
-    fn closed_access_doi_returns_honest_metadata_only_with_inverted_abstract() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_access_doi_returns_honest_metadata_only_with_inverted_abstract() {
         let csl = br#"{"title":"Closed Access Study","author":[{"given":"Ada","family":"Lovelace"}],"issued":{"date-parts":[[2026]]},"container-title":"Journal of Science"}"#;
         let openalex = br#"{"abstract_inverted_index":{"Empirical":[0],"findings":[1],"hold.":[2]},"best_oa_location":null,"locations":[]}"#;
-        let csl_bytes = csl.to_vec();
-        let oa_bytes = openalex.to_vec();
-        let fixture = LoopbackFixture::spawn(4, move |path| {
-            if path.starts_with("/doi/") {
-                return (
-                    200,
-                    "application/vnd.citationstyles.csl+json".to_owned(),
-                    csl_bytes.clone(),
-                    vec![],
-                );
-            }
-            if path.starts_with("/openalex/") {
-                return (200, "application/json".to_owned(), oa_bytes.clone(), vec![]);
-            }
-            (404, "text/plain".to_owned(), b"nope".to_vec(), vec![])
-        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/doi/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(csl.as_slice(), "application/vnd.citationstyles.csl+json"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(openalex.as_slice(), "application/json"),
+            )
+            .mount(&server)
+            .await;
 
         let target = ParsedTarget::parse("10.1000/closed-paper").unwrap();
         let doc = resolve_target(
             &target,
-            &fixture.http_client(),
-            &fixture.resolver_config(None),
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
         )
+        .await
         .unwrap();
         assert_eq!(
             doc.payload,
@@ -1817,33 +1934,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn europe_pmc_bodyless_jats_reports_body_restricted() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn europe_pmc_bodyless_jats_reports_body_restricted() {
         let jats_front_only = indoc! {r"
             <article>
               <front><article-meta><title-group><article-title>Embargoed Trial</article-title></title-group></article-meta></front>
             </article>
         "};
-        let xml_bytes = jats_front_only.as_bytes().to_vec();
-        let fixture = LoopbackFixture::spawn(4, move |path| {
-            if path.contains("fullTextXML") {
-                return (200, "application/xml".to_owned(), xml_bytes.clone(), vec![]);
-            }
-            (
-                200,
-                "application/json".to_owned(),
-                br#"{"resultList":{"result":[{"title":"Embargoed Trial","pubYear":"2025"}]}}"#
-                    .to_vec(),
-                vec![],
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("fullTextXML"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(jats_front_only, "application/xml"),
             )
-        });
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resultList": {"result": [{"title": "Embargoed Trial", "pubYear": "2025"}]}
+            })))
+            .with_priority(10)
+            .mount(&server)
+            .await;
 
         let target = ParsedTarget::parse("PMC9999999").unwrap();
         let doc = resolve_target(
             &target,
-            &fixture.http_client(),
-            &fixture.resolver_config(None),
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
         )
+        .await
         .unwrap();
         assert_eq!(
             doc.payload,
@@ -1854,9 +1974,15 @@ mod tests {
         assert_eq!(doc.metadata.title.as_deref(), Some("Embargoed Trial"));
     }
 
-    #[test]
-    fn rfc_waterfall_attaches_obsoleted_by_notes_and_falls_back_from_xml_to_txt() {
-        let tracker_json = br#"{"title":"HTTP/1.1 Semantics","time":"2014-06-01T00:00:00Z","std_level":"Proposed Standard","obsoleted_by":["/doc/rfc9110/"],"updated_by":[]}"#;
+    #[tokio::test(flavor = "current_thread")]
+    async fn rfc_waterfall_attaches_obsoleted_by_notes_and_falls_back_from_xml_to_txt() {
+        let tracker_json = json!({
+            "title": "HTTP/1.1 Semantics",
+            "time": "2014-06-01T00:00:00Z",
+            "std_level": "Proposed Standard",
+            "obsoleted_by": ["/doc/rfc9110/"],
+            "updated_by": []
+        });
         let rfc_txt = indoc! {r"
             Internet Engineering Task Force (IETF)                        R. Fielding
             Request for Comments: 7231                                      June 2014
@@ -1867,32 +1993,30 @@ mod tests {
 
                Defines HTTP/1.1 semantics.
         "};
-        let tracker_bytes = tracker_json.to_vec();
-        let txt_bytes = rfc_txt.as_bytes().to_vec();
-        let fixture = LoopbackFixture::spawn(6, move |path| {
-            if path.ends_with("/doc.json") {
-                return (
-                    200,
-                    "application/json".to_owned(),
-                    tracker_bytes.clone(),
-                    vec![],
-                );
-            }
-            if std::path::Path::new(path)
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"))
-            {
-                return (404, "text/plain".to_owned(), b"no xml".to_vec(), vec![]);
-            }
-            (200, "text/plain".to_owned(), txt_bytes.clone(), vec![])
-        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/doc\.json$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(tracker_json))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"\.xml$"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(rfc_txt))
+            .with_priority(10)
+            .mount(&server)
+            .await;
 
         let target = ParsedTarget::parse("RFC 7231").unwrap();
         let doc = resolve_target(
             &target,
-            &fixture.http_client(),
-            &fixture.resolver_config(None),
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
         )
+        .await
         .unwrap();
         let ExtractedPayload::FullText { format, markdown } = doc.payload else {
             panic!("expected RFC text fallback");
@@ -1902,36 +2026,36 @@ mod tests {
         assert!(markdown.contains("Defines HTTP/1.1 semantics."));
     }
 
-    #[test]
-    fn url_dispatch_handles_markdown_and_unsupported_binary_mime() {
-        let fixture = LoopbackFixture::spawn(4, |path| {
-            if path == "/doc.md" {
-                let md = indoc! {r"
-                    # Native Markdown
+    #[tokio::test(flavor = "current_thread")]
+    async fn url_dispatch_handles_markdown_and_unsupported_binary_mime() {
+        let server = MockServer::start().await;
+        let md = indoc! {r"
+            # Native Markdown
 
-                    Direct body.
-                "};
-                return (
-                    200,
-                    "text/markdown; charset=utf-8".to_owned(),
-                    md.as_bytes().to_vec(),
-                    vec![],
-                );
-            }
-            (
-                200,
-                "application/octet-stream".to_owned(),
-                vec![0, 1, 2, 3],
-                vec![],
+            Direct body.
+        "};
+        Mock::given(method("GET"))
+            .and(path("/doc.md"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(md, "text/markdown; charset=utf-8"),
             )
-        });
-        let client = fixture.http_client();
-        let config = fixture.resolver_config(None);
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/blob.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(vec![0, 1, 2, 3], "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client = http_client_for(&[*server.address()]);
+        let config = resolver_config_for(&server.uri(), None);
 
-        let md_target = ParsedTarget::parse(&format!("{}/doc.md", fixture.base_url)).unwrap();
-        let bin_target = ParsedTarget::parse(&format!("{}/blob.bin", fixture.base_url)).unwrap();
-        let md_doc = resolve_target(&md_target, &client, &config).unwrap();
-        let bin_doc = resolve_target(&bin_target, &client, &config).unwrap();
+        let md_target = ParsedTarget::parse(&format!("{}/doc.md", server.uri())).unwrap();
+        let bin_target = ParsedTarget::parse(&format!("{}/blob.bin", server.uri())).unwrap();
+        let md_doc = resolve_target(&md_target, &client, &config).await.unwrap();
+        let bin_doc = resolve_target(&bin_target, &client, &config).await.unwrap();
 
         assert!(matches!(
             md_doc.payload,
@@ -1948,34 +2072,39 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn doi_propagates_safety_block_from_pmcid_xml_dtd_attack() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn doi_propagates_safety_block_from_pmcid_xml_dtd_attack() {
         let openalex = br#"{"title":"Target Study","ids":{"pmcid":"https://pmc.ncbi.nlm.nih.gov/articles/PMC7654321/"},"locations":[]}"#;
         let xxe_xml = b"<!DOCTYPE article [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><article><body/></article>";
-        let oa_bytes = openalex.to_vec();
-        let xxe_bytes = xxe_xml.to_vec();
-        let fixture = LoopbackFixture::spawn(6, move |path| {
-            if path.starts_with("/openalex/") {
-                return (200, "application/json".to_owned(), oa_bytes.clone(), vec![]);
-            }
-            if path.contains("fullTextXML") {
-                return (200, "application/xml".to_owned(), xxe_bytes.clone(), vec![]);
-            }
-            (404, "text/plain".to_owned(), b"missing".to_vec(), vec![])
-        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(openalex.as_slice(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("fullTextXML"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(xxe_xml.as_slice(), "application/xml"),
+            )
+            .mount(&server)
+            .await;
 
         let target = ParsedTarget::parse("10.1000/xxe-pmc").unwrap();
         let failure = resolve_target(
             &target,
-            &fixture.http_client(),
-            &fixture.resolver_config(None),
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
         )
+        .await
         .unwrap_err();
         assert!(matches!(failure, AdfontesError::SafetyBlock { .. }));
     }
 
-    #[test]
-    fn html_and_tex_mentioning_pdf_magic_are_not_misclassified_as_pdf() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn html_and_tex_mentioning_pdf_magic_are_not_misclassified_as_pdf() {
         let html = b"<article><h1>PDF Format Guide</h1><p>Every valid PDF starts with the header %PDF-1.7 followed by binary markers.</p></article>";
         let tex = indoc! {r"
             %PDF-1.7 compatibility note in a TeX comment
@@ -1988,29 +2117,28 @@ mod tests {
             ensuring both section headings and full explanatory paragraphs are preserved intact.
             \end{document}
         "};
-        let html_bytes = html.to_vec();
-        let tex_bytes = tex.as_bytes().to_vec();
-        let fixture = LoopbackFixture::spawn(8, move |path| {
-            if path == "/guide.html" {
-                return (200, "text/html".to_owned(), html_bytes.clone(), vec![]);
-            }
-            if path.starts_with("/src/") {
-                return (
-                    200,
-                    "application/x-eprint".to_owned(),
-                    tex_bytes.clone(),
-                    vec![],
-                );
-            }
-            (404, "text/plain".to_owned(), b"missing".to_vec(), vec![])
-        });
-        let client = fixture.http_client();
-        let config = fixture.resolver_config(None);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/guide.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(html.as_slice(), "text/html"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/src/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(tex.as_bytes(), "application/x-eprint"),
+            )
+            .mount(&server)
+            .await;
+        let client = http_client_for(&[*server.address()]);
+        let config = resolver_config_for(&server.uri(), None);
 
-        let web_target = ParsedTarget::parse(&format!("{}/guide.html", fixture.base_url)).unwrap();
+        let web_target = ParsedTarget::parse(&format!("{}/guide.html", server.uri())).unwrap();
         let arxiv_target = ParsedTarget::parse("2409.13740").unwrap();
-        let web_doc = resolve_target(&web_target, &client, &config).unwrap();
-        let arxiv_doc = resolve_target(&arxiv_target, &client, &config).unwrap();
+        let web_doc = resolve_target(&web_target, &client, &config).await.unwrap();
+        let arxiv_doc = resolve_target(&arxiv_target, &client, &config)
+            .await
+            .unwrap();
 
         assert!(matches!(
             web_doc.payload,
@@ -2028,46 +2156,39 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn paywalled_oa_landing_html_returns_metadata_only_not_full_text() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn paywalled_oa_landing_html_returns_metadata_only_not_full_text() {
         let abstract_pad =
             "Abstract details about clinical trial endpoints and study design. ".repeat(35);
         let paywall_html = format!(
             "<article><h1>Paywalled Journal Study</h1><h2>Abstract</h2><p>{abstract_pad}</p><p>Buy this article or sign in to access via institutional access.</p></article>"
         );
-        let paywall_bytes = paywall_html.into_bytes();
-        let fixture = LoopbackFixture::spawn(6, move |path| {
-            if path.starts_with("/openalex/") {
-                let body = br#"{"title":"Paywalled Study","primary_location":{"source":{"display_name":"Nature"}},"best_oa_location":{"is_oa":true,"landing_page_url":"REPLACE_URL"}}"#;
-                return (200, "application/json".to_owned(), body.to_vec(), vec![]);
-            }
-            if path == "/paywall" {
-                return (200, "text/html".to_owned(), paywall_bytes.clone(), vec![]);
-            }
-            (404, "text/plain".to_owned(), b"none".to_vec(), vec![])
-        });
-        // Point OpenAlex directly at our loopback `/paywall` URL via a dedicated fixture.
-        let paywall_url = format!("{}/paywall", fixture.base_url);
-        let openalex_json = format!(
-            r#"{{"title":"Paywalled Study","primary_location":{{"source":{{"display_name":"Nature"}}}},"best_oa_location":{{"is_oa":true,"landing_page_url":"{paywall_url}"}}}}"#
-        );
-        let oa_bytes = openalex_json.into_bytes();
-        let oa_fixture = LoopbackFixture::spawn(4, move |path| {
-            if path.starts_with("/openalex/") {
-                return (200, "application/json".to_owned(), oa_bytes.clone(), vec![]);
-            }
-            (404, "text/plain".to_owned(), b"none".to_vec(), vec![])
-        });
+        let paywall_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/paywall"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(paywall_html.into_bytes(), "text/html"),
+            )
+            .mount(&paywall_server)
+            .await;
 
-        let mut config = oa_fixture.resolver_config(None);
-        config.endpoints.doi_org = format!("{}/doi", oa_fixture.base_url);
-        let mut transport = TransportConfig::default();
-        transport.allowed_loopback_addrs.insert(fixture.addr);
-        transport.allowed_loopback_addrs.insert(oa_fixture.addr);
-        let client = HttpClient::new(transport);
+        let paywall_url = format!("{}/paywall", paywall_server.uri());
+        let oa_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "title": "Paywalled Study",
+                "primary_location": {"source": {"display_name": "Nature"}},
+                "best_oa_location": {"is_oa": true, "landing_page_url": paywall_url}
+            })))
+            .mount(&oa_server)
+            .await;
+
+        let config = resolver_config_for(&oa_server.uri(), None);
+        let client = http_client_for(&[*paywall_server.address(), *oa_server.address()]);
 
         let target = ParsedTarget::parse("10.1038/paywall-test").unwrap();
-        let doc = resolve_target(&target, &client, &config).unwrap();
+        let doc = resolve_target(&target, &client, &config).await.unwrap();
         assert_eq!(
             doc.payload,
             ExtractedPayload::MetadataOnly {
@@ -2076,8 +2197,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pmid_falls_back_from_body_restricted_pmcid_to_doi_and_preserves_metadata() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn pmid_falls_back_from_body_restricted_pmcid_to_doi_and_preserves_metadata() {
         let jats_front_only = b"<article><front><article-meta><title-group><article-title>Trial</article-title></title-group></article-meta></front></article>";
         let tex = indoc! {r"
             \documentclass{article}
@@ -2088,38 +2209,43 @@ mod tests {
             sufficient body length to satisfy full-text validation thresholds completely.
             \end{document}
         "};
-        let front_bytes = jats_front_only.to_vec();
-        let tex_bytes = tex.as_bytes().to_vec();
-        let fixture = LoopbackFixture::spawn(12, move |path| {
-            if path.contains("EXT_ID:38123456") {
-                return (
-                    200,
-                    "application/json".to_owned(),
-                    br#"{"resultList":{"result":[{"title":"Published Trial","journalTitle":"NEJM","pubYear":"2025","pmcid":"PMC1111111","doi":"10.48550/arXiv.2409.13740"}]}}"#
-                        .to_vec(),
-                    vec![],
-                );
-            }
-            if path.contains("PMC1111111/fullTextXML") {
-                return (
-                    200,
-                    "application/xml".to_owned(),
-                    front_bytes.clone(),
-                    vec![],
-                );
-            }
-            if path.starts_with("/src/2409.13740") {
-                return (200, "text/plain".to_owned(), tex_bytes.clone(), vec![]);
-            }
-            (404, "text/plain".to_owned(), b"none".to_vec(), vec![])
-        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(|req: &WiremockRequest| req.url.as_str().contains("EXT_ID:38123456"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resultList": {
+                    "result": [{
+                        "title": "Published Trial",
+                        "journalTitle": "NEJM",
+                        "pubYear": "2025",
+                        "pmcid": "PMC1111111",
+                        "doi": "10.48550/arXiv.2409.13740"
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("PMC1111111/fullTextXML"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(jats_front_only.as_slice(), "application/xml"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/src/2409\.13740"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tex))
+            .mount(&server)
+            .await;
 
         let target = ParsedTarget::parse("PMID:38123456").unwrap();
         let doc = resolve_target(
             &target,
-            &fixture.http_client(),
-            &fixture.resolver_config(None),
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
         )
+        .await
         .unwrap();
         assert!(matches!(
             doc.payload,
@@ -2138,8 +2264,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn xml_dispatch_handles_namespaced_jats_and_body_restricted_response() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn xml_dispatch_handles_namespaced_jats_and_body_restricted_response() {
         let namespaced_jats = indoc! {r#"
             <?xml version="1.0" encoding="UTF-8"?>
             <!-- leading comment -->
@@ -2147,21 +2273,21 @@ mod tests {
               <jats:front><jats:article-meta><jats:title-group><jats:article-title>Namespaced Trial</jats:article-title></jats:title-group></jats:article-meta></jats:front>
             </jats:article>
         "#};
-        let xml_bytes = namespaced_jats.as_bytes().to_vec();
-        let fixture = LoopbackFixture::spawn(2, move |_| {
-            (
-                200,
-                "application/jats+xml".to_owned(),
-                xml_bytes.clone(),
-                vec![],
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/paper.xml"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(namespaced_jats, "application/jats+xml"),
             )
-        });
-        let target = ParsedTarget::parse(&format!("{}/paper.xml", fixture.base_url)).unwrap();
+            .mount(&server)
+            .await;
+        let target = ParsedTarget::parse(&format!("{}/paper.xml", server.uri())).unwrap();
         let doc = resolve_target(
             &target,
-            &fixture.http_client(),
-            &fixture.resolver_config(None),
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
         )
+        .await
         .unwrap();
         assert_eq!(
             doc.payload,
@@ -2172,38 +2298,38 @@ mod tests {
         assert_eq!(doc.metadata.title.as_deref(), Some("Namespaced Trial"));
     }
 
-    #[test]
-    fn doi_deduplicates_pmcid_and_preserves_body_restricted_status() {
-        let xml_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let xml_hits_clone = Arc::clone(&xml_hits);
-        let openalex = br#"{"title":"Restricted Study","ids":{"pmcid":"https://pmc.ncbi.nlm.nih.gov/articles/PMC9999999/"},"locations":[{"is_oa":true,"landing_page_url":"https://pmc.ncbi.nlm.nih.gov/articles/PMC9999999/"}]}"#.to_vec();
-        let front_only = b"<article><front><article-meta><title-group><article-title>Restricted Study</article-title></title-group></article-meta></front></article>".to_vec();
+    #[tokio::test(flavor = "current_thread")]
+    async fn doi_deduplicates_pmcid_and_preserves_body_restricted_status() {
+        let openalex = br#"{"title":"Restricted Study","ids":{"pmcid":"https://pmc.ncbi.nlm.nih.gov/articles/PMC9999999/"},"locations":[{"is_oa":true,"landing_page_url":"https://pmc.ncbi.nlm.nih.gov/articles/PMC9999999/"}]}"#;
+        let front_only = b"<article><front><article-meta><title-group><article-title>Restricted Study</article-title></title-group></article-meta></front></article>";
 
-        let fixture = LoopbackFixture::spawn(8, move |path| {
-            if path.starts_with("/openalex/") {
-                return (200, "application/json".to_owned(), openalex.clone(), vec![]);
-            }
-            if path.contains("PMC9999999/fullTextXML") {
-                xml_hits_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                return (
-                    200,
-                    "application/xml".to_owned(),
-                    front_only.clone(),
-                    vec![],
-                );
-            }
-            (404, "text/plain".to_owned(), b"none".to_vec(), vec![])
-        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(openalex.as_slice(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("PMC9999999/fullTextXML"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(front_only.as_slice(), "application/xml"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let target = ParsedTarget::parse("10.1000/restricted-pmc").unwrap();
         let doc = resolve_target(
             &target,
-            &fixture.http_client(),
-            &fixture.resolver_config(None),
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
         )
+        .await
         .unwrap();
 
-        assert_eq!(xml_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.verify().await;
         assert_eq!(
             doc.payload,
             ExtractedPayload::MetadataOnly {
@@ -2212,8 +2338,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn doi_surfaces_unsupported_proxy_error_instead_of_generic_failure() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn doi_surfaces_unsupported_proxy_error_instead_of_generic_failure() {
         let transport = TransportConfig {
             proxy: crate::transport::ProxyConfig {
                 all_proxy: Some("socks5://127.0.0.1:1080".to_owned()),
@@ -2231,16 +2357,14 @@ mod tests {
             },
         };
         let target = ParsedTarget::parse("10.1000/proxy-check").unwrap();
-        let failure = resolve_target(&target, &client, &config).unwrap_err();
+        let failure = resolve_target(&target, &client, &config).await.unwrap_err();
         assert!(
             matches!(failure, AdfontesError::Transport { ref detail, .. } if detail.contains("socks5"))
         );
     }
 
-    #[test]
-    fn doi_caps_total_waterfall_http_requests_within_budget() {
-        let total_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let hits_clone = Arc::clone(&total_hits);
+    #[tokio::test(flavor = "current_thread")]
+    async fn doi_caps_total_waterfall_http_requests_within_budget() {
         let openalex = indoc! {r#"{
             "title": "Many Mirrors",
             "locations": [
@@ -2251,84 +2375,162 @@ mod tests {
                 {"is_oa": true, "landing_page_url": "https://arxiv.org/abs/2401.00005"},
                 {"is_oa": true, "landing_page_url": "https://arxiv.org/abs/2401.00006"}
             ]
-        }"#}
-        .as_bytes()
-        .to_vec();
+        }"#};
 
-        let fixture = LoopbackFixture::spawn(40, move |path| {
-            hits_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if path.starts_with("/openalex/") {
-                return (200, "application/json".to_owned(), openalex.clone(), vec![]);
-            }
-            (404, "text/plain".to_owned(), b"none".to_vec(), vec![])
-        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(openalex, "application/json"))
+            .mount(&server)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .with_priority(10)
+            .mount(&server)
+            .await;
 
         let target = ParsedTarget::parse("10.1000/budget-cap").unwrap();
         let doc = resolve_target(
             &target,
-            &fixture.http_client(),
-            &fixture.resolver_config(None),
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
         )
+        .await
         .unwrap();
 
-        assert!(
-            total_hits.load(std::sync::atomic::Ordering::SeqCst) <= MAX_WATERFALL_HTTP_REQUESTS
-        );
+        let recorded = server.received_requests().await.unwrap();
+        assert!(recorded.len() <= MAX_WATERFALL_HTTP_REQUESTS);
         assert!(matches!(doc.payload, ExtractedPayload::MetadataOnly { .. }));
     }
 
-    #[test]
-    fn doi_includes_encoded_contact_email_in_openalex_and_unpaywall_queries() {
-        let openalex_seen = Arc::new(std::sync::Mutex::new(None));
-        let unpaywall_seen = Arc::new(std::sync::Mutex::new(None));
-        let openalex_capture = Arc::clone(&openalex_seen);
-        let unpaywall_capture = Arc::clone(&unpaywall_seen);
-
+    #[tokio::test(flavor = "current_thread")]
+    async fn doi_includes_encoded_contact_email_in_openalex_and_unpaywall_queries() {
         let unpaywall_body = indoc! {r#"{
             "title": "Unpaywall Routed Title",
             "is_oa": false
-        }"#}
-        .as_bytes()
-        .to_vec();
+        }"#};
 
-        let fixture = LoopbackFixture::spawn(4, move |path| {
-            if path.starts_with("/openalex/") {
-                *openalex_capture.lock().unwrap() = Some(path.to_owned());
-                return (200, "application/json".to_owned(), b"{}".to_vec(), vec![]);
-            }
-            if path.starts_with("/unpaywall/") {
-                *unpaywall_capture.lock().unwrap() = Some(path.to_owned());
-                return (
-                    200,
-                    "application/json".to_owned(),
-                    unpaywall_body.clone(),
-                    vec![],
-                );
-            }
-            (404, "text/plain".to_owned(), b"none".to_vec(), vec![])
-        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .and(|req: &WiremockRequest| {
+                req.url.query() == Some("mailto=alice%2Btag%40university.edu")
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/unpaywall/"))
+            .and(|req: &WiremockRequest| {
+                req.url.query() == Some("email=alice%2Btag%40university.edu")
+            })
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(unpaywall_body, "application/json"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let target = ParsedTarget::parse("10.1000/contact-check").unwrap();
         let doc = resolve_target(
             &target,
-            &fixture.http_client(),
-            &fixture.resolver_config(Some("alice+tag@university.edu")),
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), Some("alice+tag@university.edu")),
         )
+        .await
         .unwrap();
 
-        assert_eq!(
-            openalex_seen.lock().unwrap().as_deref(),
-            Some(
-                "/openalex/works/https://doi.org/10.1000/contact-check?mailto=alice%2Btag%40university.edu"
-            )
-        );
-        assert_eq!(
-            unpaywall_seen.lock().unwrap().as_deref(),
-            Some("/unpaywall/v2/10.1000/contact-check?email=alice%2Btag%40university.edu")
-        );
+        server.verify().await;
         assert_eq!(
             doc.metadata.title.as_deref(),
             Some("Unpaywall Routed Title")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn doi_executes_metadata_legs_concurrently_with_deterministic_merge() {
+        let (addr, server) = spawn_concurrent_doi_barrier_server(2);
+        let client = http_client_for(&[addr]);
+        let base_url = format!("http://{addr}");
+        let config = ResolverConfig {
+            contact_email: None,
+            endpoints: ResolverEndpoints {
+                doi_org: format!("{base_url}/doi"),
+                openalex: format!("{base_url}/openalex"),
+                ..ResolverEndpoints::production()
+            },
+        };
+        let target = ParsedTarget::parse("10.1000/concurrent-legs").unwrap();
+        let doc = resolve_target(&target, &client, &config).await.unwrap();
+        server.join().unwrap();
+
+        assert_eq!(doc.metadata.title.as_deref(), Some("Concurrent CSL Title"));
+        assert_eq!(
+            doc.metadata.abstract_text.as_deref(),
+            Some("Parallel legs pass.")
+        );
+        assert_eq!(
+            doc.payload,
+            ExtractedPayload::MetadataOnly {
+                reason: UnavailableReason::NoOpenAccessCopy
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn doi_executes_three_concurrent_legs_preserving_unpaywall_priority() {
+        let (addr, server) = spawn_concurrent_doi_barrier_server(3);
+        let client = http_client_for(&[addr]);
+        let base_url = format!("http://{addr}");
+        let config = resolver_config_for(&base_url, Some("researcher@university.edu"));
+        let target = ParsedTarget::parse("10.1000/three-legs").unwrap();
+        let doc = resolve_target(&target, &client, &config).await.unwrap();
+        server.join().unwrap();
+
+        assert_eq!(doc.metadata.title.as_deref(), Some("Concurrent CSL Title"));
+        assert_eq!(doc.metadata.year, Some(2026));
+        assert_eq!(
+            doc.metadata.abstract_text.as_deref(),
+            Some("Parallel legs pass.")
+        );
+        assert_eq!(
+            doc.metadata.venue_or_source.as_deref(),
+            Some("Unpaywall Journal")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn doi_cancels_slow_sibling_leg_immediately_on_safety_block() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({}))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/doi/"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", "http://10.0.0.1/evil"),
+            )
+            .mount(&server)
+            .await;
+
+        let target = ParsedTarget::parse("10.1000/safety-short-circuit").unwrap();
+        let client = http_client_for(&[*server.address()]);
+        let config = resolver_config_for(&server.uri(), None);
+        let started = Instant::now();
+        let failure = resolve_target(&target, &client, &config).await.unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(failure, AdfontesError::SafetyBlock { .. }));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "slow sibling delayed SafetyBlock fail-fast: {elapsed:?}"
         );
     }
 }
