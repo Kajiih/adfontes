@@ -109,7 +109,7 @@ define_architecture! {
     /// Pure-Rust PDF page indexing and lossless vector page slicing (`pdf`).
     Pdf          => [Model] (owns_external: ["lopdf"]),
     /// Math-preserving HTML5, JATS/RFCXML/Atom XML, RFC, TeX, and title extractors (`extract`).
-    Extract      => [Archive, Model] (owns_external: ["scraper", "roxmltree", "pulldown_cmark"]) (modules: {
+    Extract      => [Archive, Model] (owns_external: ["cssparser", "cssparser_color", "scraper", "roxmltree", "pulldown_cmark"]) (modules: {
         title => [],
         html  => [title],
         xml   => [title],

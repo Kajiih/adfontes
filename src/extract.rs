@@ -11,7 +11,7 @@ mod tex;
 mod title;
 mod xml;
 
-pub use self::html::extract_html_to_markdown;
+pub use self::html::{clean_html_fragment, extract_html_to_markdown};
 pub use self::rfc::clean_rfc_text;
 pub use self::tex::{extract_arxiv_source_archive, flatten_and_convert_tex};
 pub use self::title::{

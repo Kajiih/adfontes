@@ -243,6 +243,22 @@ pub(super) fn push_markdown_heading(out: &mut String, level: usize, text: &str) 
     let _ = writeln!(out, " {text}\n");
 }
 
+/// Normalizes and prefixes non-empty Markdown blockquote lines with `> ` into `out`.
+pub(super) fn push_markdown_blockquote(out: &mut String, inner: &str) {
+    let normalized = normalize_markdown_spacing(inner);
+    if normalized.is_empty() {
+        return;
+    }
+    for line in normalized.lines() {
+        if line.is_empty() {
+            out.push_str(">\n");
+        } else {
+            let _ = writeln!(out, "> {line}");
+        }
+    }
+    out.push('\n');
+}
+
 fn collect_fenced_code_ranges(unified: &str) -> Vec<Range<usize>> {
     if !unified.contains("```") && !unified.contains("~~~") {
         return Vec::new();

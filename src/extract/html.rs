@@ -1,43 +1,107 @@
-//! Iterative WHATWG HTML5-to-Markdown extractor preserving mathematical notation and tables.
+//! Iterative WHATWG HTML5-to-Markdown and inline-fragment extractors preserving mathematical notation and tables.
 //!
 //! Traverses `scraper::Html` iteratively using an explicit heap stack so arbitrarily deep DOM
 //! trees never overflow the call stack. Preserves KaTeX, MathJax v2/v3, Distill, and LaTeXML
-//! equations verbatim while stripping boilerplate, HTML comments, hidden controls, and
-//! CSS-comment-stripped, `!important`-normalized invisible prompt-injection vectors.
+//! equations verbatim in full documents and decodes HTML entities cleanly inside snippets via
+//! `clean_html_fragment` while stripping boilerplate, HTML comments, hidden controls, and
+//! `cssparser`-validated invisible prompt-injection vectors.
 
 use std::fmt::Write as _;
 
+use cssparser::{Delimiter, ParseError, Parser as CssParser, Token, parse_important};
+use cssparser_color::Color as CssColor;
 use scraper::node::{Element, Node};
 use scraper::{ElementRef, Html};
 
 use super::title::{
     ExtractedText, normalize_markdown_spacing, push_fenced_code_block, push_inline_code,
-    render_gfm_table, sanitize_inline_text,
+    push_markdown_blockquote, render_gfm_table, sanitize_inline_text,
 };
 
-const TAG_H1: &str = "h1";
-const TAG_OL: &str = "ol";
-const TAG_ARTICLE: &str = "article";
+const TAG_BR: &str = "br";
+const TAG_HORIZONTAL_RULE: &str = "hr";
+const TAG_PRE: &str = "pre";
+const TAG_LI: &str = "li";
+const TAG_BLOCKQUOTE: &str = "blockquote";
+const TAG_TITLE: &str = "title";
 const TAG_MATH: &str = "math";
 const TAG_SCRIPT: &str = "script";
-const TAG_TABLE: &str = "table";
 const TAG_TR: &str = "tr";
+const TAG_TD: &str = "td";
+const TAG_TH: &str = "th";
 const ATTR_ALTTEXT: &str = "alttext";
 const ATTR_CLASS: &str = "class";
-const ATTR_DISPLAY: &str = "display";
 const ATTR_BLOCK: &str = "block";
-const ATTR_HIDDEN: &str = "hidden";
+const ATTR_DISPLAY: &str = "display";
 const ATTR_TYPE: &str = "type";
-const CSS_CLIP: &str = "clip";
+const CSS_PROP_DISPLAY: &str = "display";
+const CSS_PROP_CLIP: &str = "clip";
 const VALUE_TRUE: &str = "true";
+const ATTR_HIDDEN: &str = "hidden";
+const KW_AUTO: &str = "auto";
+const KW_CLIP: &str = "clip";
+const KW_HIDDEN: &str = "hidden";
+const KW_NONE: &str = "none";
+const CSS_RECT_ARG_COUNT: usize = 4;
+const CSS_INSET_MAX_ARGS: usize = 4;
+const CSS_SCALE3D_ARG_COUNT: usize = 3;
+const CSS_GLOBAL_KEYWORDS: &[&str] = &["initial", "inherit", "unset", "revert", "revert-layer"];
+const FONT_SIZE_KEYWORDS: &[&str] = &[
+    "xx-small",
+    "x-small",
+    "small",
+    "medium",
+    "large",
+    "x-large",
+    "xx-large",
+    "xxx-large",
+    "smaller",
+    "larger",
+    "math",
+];
+const BOX_DIMENSION_KEYWORDS: &[&str] = &[
+    "auto",
+    "none",
+    "min-content",
+    "max-content",
+    "fit-content",
+    "stretch",
+];
+const GEOMETRY_BOX_KEYWORDS: &[&str] = &[
+    "border-box",
+    "padding-box",
+    "content-box",
+    "margin-box",
+    "fill-box",
+    "stroke-box",
+    "view-box",
+];
+const TRANSFORM_OTHER_FUNCTIONS: &[&str] = &[
+    "matrix",
+    "matrix3d",
+    "translate",
+    "translatex",
+    "translatey",
+    "translatez",
+    "translate3d",
+    "rotate",
+    "rotatex",
+    "rotatey",
+    "rotatez",
+    "rotate3d",
+    "skew",
+    "skewx",
+    "skewy",
+    "perspective",
+];
+const CLIP_OTHER_SHAPE_FUNCTIONS: &[&str] = &[
+    "circle", "ellipse", "polygon", "path", "xywh", "rect", "shape",
+];
 const CLASS_KATEX_DISPLAY: &str = "katex-display";
 const MAX_SCORE_CHARS: usize = 50_000;
 const MIN_BODY_FALLBACK_CHARS: usize = 200;
 const ARTICLE_COVERAGE_DENOMINATOR: usize = 5;
 const ARTICLE_COVERAGE_NUMERATOR: usize = 2;
-const CSS_RECT_ARG_COUNT: usize = 4;
-const CSS_HEX_RGBA_SHORT_LEN: usize = 4;
-const CSS_HEX_RGBA_LONG_LEN: usize = 8;
 const MAX_BLOCKQUOTE_DEPTH: usize = 8;
 
 const SKIPPED_HTML_TAGS: &[&str] = &[
@@ -75,43 +139,48 @@ pub fn extract_html_to_markdown(html: &str) -> ExtractedText {
     }
 }
 
-/// Returns `true` when an inline CSS `style` attribute visually hides content (stripping CSS
-/// comments and `!important`), protecting agents from invisible prompt-injection payloads.
+/// Sanitizes an HTML or JATS inline markup snippet into clean single-line text.
+///
+/// Decodes HTML entities once via `html5ever`, skips `<script>`, `<style>`, `<noscript>`,
+/// `<template>`, and hidden elements, preserves spaces at block/break boundaries, and collapses
+/// whitespace without stripping decoded `<` or `>` math inequalities such as `"p < 0.05"`.
+///
+/// Parsed under WHATWG HTML5 fragment rules, so self-closing `/>` syntax on non-void tags such as
+/// `<aside/>` or `<span style="display:none"/>` opens an HTML element rather than acting as an XML
+/// empty element.
 #[must_use]
-pub fn is_hidden_inline_style(style: &str) -> bool {
-    let stripped = strip_css_comments(style);
-    let mut zero_width = false;
-    let mut zero_height = false;
-    let mut overflow_hidden = false;
-
-    for declaration in stripped.split(';') {
-        let Some((raw_prop, raw_val)) = declaration.split_once(':') else {
-            continue;
-        };
-        let prop = raw_prop.trim().to_ascii_lowercase();
-        let val = strip_css_important(raw_val).to_ascii_lowercase();
-        match prop.as_str() {
-            ATTR_DISPLAY if val == "none" => return true,
-            "visibility" if matches!(val.as_str(), ATTR_HIDDEN | "collapse") => return true,
-            "content-visibility" if val == ATTR_HIDDEN => return true,
-            "opacity" if is_zero_css_opacity(&val) => return true,
-            "font-size" if is_zero_css_length(&val) => return true,
-            "color" if is_transparent_css_color(&val) => return true,
-            "transform" if has_zero_scale_transform(&val) => return true,
-            "clip-path" if is_hidden_clip_path(&val) => return true,
-            CSS_CLIP if is_zero_clip_rect(&val) => return true,
-            "width" | "max-width" if is_zero_css_length(&val) => zero_width = true,
-            "height" | "max-height" if is_zero_css_length(&val) => zero_height = true,
-            "overflow" | "overflow-x" | "overflow-y"
-                if matches!(val.as_str(), ATTR_HIDDEN | CSS_CLIP) =>
-            {
-                overflow_hidden = true;
-            }
-            _ => {}
+pub fn clean_html_fragment(fragment: &str) -> String {
+    let parsed = Html::parse_fragment(fragment);
+    let mut output = String::new();
+    let mut stack: Vec<WalkStep<'_>> = Vec::new();
+    for child in parsed.tree.root().children().rev() {
+        if let Some(root_elem) = ElementRef::wrap(child) {
+            stack.push(WalkStep::EnterElement(root_elem));
+        } else if let Node::Text(chunk) = child.value() {
+            stack.push(WalkStep::Text(chunk.text.as_ref()));
         }
     }
 
-    zero_width && zero_height && overflow_hidden
+    while let Some(step) = stack.pop() {
+        match step {
+            WalkStep::Text(text) => output.push_str(text),
+            WalkStep::Exit(_) => output.push(' '),
+            WalkStep::EnterElement(elem_ref) => {
+                let element = elem_ref.value();
+                let tag = element.name();
+                if tag == TAG_SCRIPT || should_skip_element(tag, element) {
+                    continue;
+                }
+                if is_fragment_break_tag(tag) {
+                    output.push(' ');
+                    stack.push(WalkStep::Exit(CloseAction::None));
+                }
+                push_children_reversed(elem_ref, &mut stack);
+            }
+        }
+    }
+
+    sanitize_inline_text(&output)
 }
 
 struct HtmlRenderState {
@@ -168,7 +237,7 @@ impl HtmlRenderState {
 
     fn enter_element(&mut self, elem_ref: ElementRef<'_>) -> Option<CloseAction> {
         let element = elem_ref.value();
-        let tag = element.name().to_ascii_lowercase();
+        let tag = element.name();
 
         if is_explicitly_hidden(element) {
             return None;
@@ -186,7 +255,7 @@ impl HtmlRenderState {
             return None;
         }
 
-        if should_skip_element(&tag, element) {
+        if should_skip_element(tag, element) {
             return None;
         }
 
@@ -194,34 +263,31 @@ impl HtmlRenderState {
             return self.enter_katex_element(elem_ref, element);
         }
 
-        if self.try_handle_special_element(&tag, elem_ref, element) {
+        if self.try_handle_special_element(tag, elem_ref, element) {
             return None;
         }
 
-        match tag.as_str() {
-            TAG_H1 | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                let level = tag
-                    .as_bytes()
-                    .get(1)
-                    .map_or(2, |digit| usize::from(digit.saturating_sub(b'0')));
-                self.ensure_blank_line();
-                let out = self.current_output();
-                for _ in 0..level {
-                    out.push('#');
-                }
-                out.push(' ');
-                Some(CloseAction::BlankLine)
+        if let Some(level) = parse_html_heading_level(tag) {
+            self.ensure_blank_line();
+            let out = self.current_output();
+            for _ in 0..level {
+                out.push('#');
             }
-            "br" => {
+            out.push(' ');
+            return Some(CloseAction::BlankLine);
+        }
+
+        match tag {
+            TAG_BR => {
                 self.current_output().push('\n');
                 None
             }
-            "hr" => {
+            TAG_HORIZONTAL_RULE => {
                 self.ensure_blank_line();
                 self.current_output().push_str("---\n\n");
                 None
             }
-            "pre" => {
+            TAG_PRE => {
                 self.ensure_blank_line();
                 let lang = detect_code_block_language(elem_ref).unwrap_or_default();
                 let body = collect_visible_raw_text(elem_ref);
@@ -229,7 +295,7 @@ impl HtmlRenderState {
                 None
             }
             "code" => {
-                let inline = sanitize_inline_text(&collect_visible_text(elem_ref));
+                let inline = collect_visible_inline_text(elem_ref);
                 push_inline_code(self.current_output(), &inline);
                 None
             }
@@ -248,16 +314,10 @@ impl HtmlRenderState {
                 }
                 Some(CloseAction::Link(href))
             }
-            "ul" | TAG_OL => {
-                self.ensure_newline();
-                self.list_stack.push(ListContext {
-                    ordered: tag == TAG_OL,
-                    next_index: 1,
-                });
-                Some(CloseAction::List)
-            }
-            "li" => Some(self.enter_list_item()),
-            "blockquote" => {
+            "ul" => Some(self.enter_list(false)),
+            "ol" => Some(self.enter_list(true)),
+            TAG_LI => Some(self.enter_list_item()),
+            TAG_BLOCKQUOTE => {
                 self.ensure_blank_line();
                 if self.buffers.len() <= MAX_BLOCKQUOTE_DEPTH {
                     self.buffers.push(String::new());
@@ -272,6 +332,15 @@ impl HtmlRenderState {
             }
             _ => Some(CloseAction::None),
         }
+    }
+
+    fn enter_list(&mut self, ordered: bool) -> CloseAction {
+        self.ensure_newline();
+        self.list_stack.push(ListContext {
+            ordered,
+            next_index: 1,
+        });
+        CloseAction::List
     }
 
     fn enter_katex_element(
@@ -335,18 +404,7 @@ impl HtmlRenderState {
             }
             CloseAction::Blockquote => {
                 let inner = self.buffers.pop().unwrap_or_default();
-                let normalized = normalize_markdown_spacing(&inner);
-                if !normalized.is_empty() {
-                    let out = self.current_output();
-                    for line in normalized.lines() {
-                        if line.is_empty() {
-                            out.push_str(">\n");
-                        } else {
-                            let _ = writeln!(out, "> {line}");
-                        }
-                    }
-                    out.push('\n');
-                }
+                push_markdown_blockquote(self.current_output(), &inner);
             }
         }
     }
@@ -409,7 +467,7 @@ impl HtmlRenderState {
             return true;
         }
 
-        if tag == TAG_TABLE {
+        if tag == "table" {
             if self.in_table_cell {
                 // GFM pipe tables cannot nest tables; flatten nested tables on the iterative
                 // heap stack so arbitrarily deep `<table><tr><td>` markup never recurses.
@@ -442,12 +500,12 @@ impl HtmlRenderState {
             let mut eqno: Option<String> = None;
 
             for cell in tr.children().filter_map(ElementRef::wrap) {
-                let cell_tag = cell.value().name().to_ascii_lowercase();
-                if should_skip_element(&cell_tag, cell.value()) {
+                let cell_tag = cell.value().name();
+                if should_skip_element(cell_tag, cell.value()) {
                     continue;
                 }
                 if has_class(cell.value(), "ltx_eqn_eqno") {
-                    let label = sanitize_inline_text(&collect_visible_text(cell));
+                    let label = collect_visible_inline_text(cell);
                     if !label.is_empty() {
                         eqno = Some(label);
                     }
@@ -466,7 +524,7 @@ impl HtmlRenderState {
             }
         }
         if !emitted {
-            let fallback = sanitize_inline_text(&collect_visible_text(table));
+            let fallback = collect_visible_inline_text(table);
             if !fallback.is_empty() {
                 self.push_math(&fallback, true);
             }
@@ -620,9 +678,9 @@ fn score_visible_root_candidates(root: ElementRef<'_>) -> RootCandidates<'_> {
                 }
             }
             ScoreStep::Enter(elem) => {
-                let tag = elem.value().name().to_ascii_lowercase();
+                let tag = elem.value().name();
                 if (tag == TAG_SCRIPT && !is_math_tex_script(elem.value()))
-                    || should_skip_element(&tag, elem.value())
+                    || should_skip_element(tag, elem.value())
                 {
                     continue;
                 }
@@ -655,14 +713,14 @@ fn score_visible_root_candidates(root: ElementRef<'_>) -> RootCandidates<'_> {
                     pre_order,
                 };
                 let name = element.value().name();
-                if name.eq_ignore_ascii_case(TAG_ARTICLE) {
+                if name == "article" {
                     if has_class(element.value(), "ltx_document") {
                         update_best_candidate(&mut candidates.best_ltx, candidate);
                     }
                     update_best_candidate(&mut candidates.best_article, candidate);
-                } else if name.eq_ignore_ascii_case("main") {
+                } else if name == "main" {
                     update_best_candidate(&mut candidates.best_main, candidate);
-                } else if name.eq_ignore_ascii_case("body") {
+                } else if name == "body" {
                     update_best_candidate(&mut candidates.visible_body, candidate);
                 }
             }
@@ -701,7 +759,7 @@ fn extract_html_title(document: &Html) -> Option<String> {
         let Some(elem) = ElementRef::wrap(descendant) else {
             continue;
         };
-        if elem.value().name().eq_ignore_ascii_case("meta") {
+        if elem.value().name() == "meta" {
             let prop = elem
                 .value()
                 .attr("property")
@@ -727,7 +785,7 @@ fn extract_html_title(document: &Html) -> Option<String> {
         let Some(elem) = ElementRef::wrap(node) else {
             continue;
         };
-        if elem.value().name().eq_ignore_ascii_case("title") {
+        if elem.value().name() == TAG_TITLE {
             let cleaned = sanitize_inline_text(&collect_element_raw_text(elem));
             if !cleaned.is_empty() {
                 return Some(cleaned);
@@ -740,12 +798,12 @@ fn extract_html_title(document: &Html) -> Option<String> {
 fn find_first_visible_h1(root: ElementRef<'_>) -> Option<String> {
     let mut stack = vec![root];
     while let Some(elem) = stack.pop() {
-        let tag = elem.value().name().to_ascii_lowercase();
-        if tag == TAG_SCRIPT || should_skip_element(&tag, elem.value()) {
+        let tag = elem.value().name();
+        if tag == TAG_SCRIPT || should_skip_element(tag, elem.value()) {
             continue;
         }
-        if tag == TAG_H1 {
-            let cleaned = sanitize_inline_text(&collect_visible_text(elem));
+        if tag == "h1" {
+            let cleaned = collect_visible_inline_text(elem);
             if !cleaned.is_empty() {
                 return Some(cleaned);
             }
@@ -759,162 +817,12 @@ fn find_first_visible_h1(root: ElementRef<'_>) -> Option<String> {
     None
 }
 
-fn strip_css_comments(style: &str) -> String {
-    let mut out = String::with_capacity(style.len());
-    let mut cursor: usize = 0;
-    while let Some(rest) = style.get(cursor..) {
-        let Some(start_rel) = rest.find("/*") else {
-            out.push_str(rest);
-            break;
-        };
-        if let Some(before) = rest.get(..start_rel) {
-            out.push_str(before);
-        }
-        let after_open = start_rel + 2;
-        if let Some(end_rel) = rest.get(after_open..).and_then(|slice| slice.find("*/")) {
-            out.push(' ');
-            cursor += after_open + end_rel + 2;
-        } else {
-            break;
-        }
-    }
-    out
-}
-
-fn strip_css_important(raw_value: &str) -> &str {
-    let trimmed = raw_value.trim();
-    if let Some(bang_index) = trimmed.rfind('!') {
-        let after_bang = trimmed.get(bang_index + 1..).unwrap_or_default().trim();
-        if after_bang.eq_ignore_ascii_case("important") {
-            return trimmed.get(..bang_index).unwrap_or_default().trim();
-        }
-    }
-    trimmed
-}
-
-fn is_transparent_css_color(value: &str) -> bool {
-    if value == "transparent" {
-        return true;
-    }
-    if let Some(hex) = value.strip_prefix('#')
-        && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && ((hex.len() == CSS_HEX_RGBA_SHORT_LEN && hex.ends_with('0'))
-            || (hex.len() == CSS_HEX_RGBA_LONG_LEN && hex.ends_with("00")))
-    {
-        return true;
-    }
-    for prefix in ["rgba(", "hsla(", "rgb(", "hsl("] {
-        if let Some(rest) = value.strip_prefix(prefix)
-            && let Some(inner) = rest.strip_suffix(')')
-        {
-            let alpha_candidate = inner
-                .rsplit_once('/')
-                .map(|(_, after)| after.trim())
-                .or_else(|| {
-                    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
-                    (parts.len() == CSS_RECT_ARG_COUNT).then(|| parts[3])
-                });
-            if alpha_candidate.is_some_and(is_zero_css_opacity) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn has_zero_scale_transform(value: &str) -> bool {
-    for func in ["scale(", "scalex(", "scaley(", "scale3d("] {
-        if let Some(pos) = value.find(func)
-            && let Some(rest) = value.get(pos + func.len()..)
-            && let Some(end) = rest.find(')')
-            && let Some(args) = rest.get(..end)
-            && args.split(',').any(|arg| is_zero_css_number(arg.trim()))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_hidden_clip_path(value: &str) -> bool {
-    if let Some(rest) = value.strip_prefix("inset(")
-        && let Some(inner) = rest.strip_suffix(')')
-    {
-        return inner.split_whitespace().any(|tok| {
-            tok.strip_suffix('%')
-                .and_then(|percent| percent.parse::<f64>().ok())
-                .is_some_and(|pct| pct >= 100.0)
-        });
-    }
-    false
-}
-
-fn is_zero_clip_rect(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix("rect(") else {
-        return false;
-    };
-    let Some(inner) = rest.strip_suffix(')') else {
-        return false;
-    };
-    let tokens: Vec<&str> = inner
-        .split([',', ' ', '\t'])
-        .map(str::trim)
-        .filter(|tok| !tok.is_empty())
-        .collect();
-    tokens.len() == CSS_RECT_ARG_COUNT && tokens.iter().all(|tok| is_zero_css_length(tok))
-}
-
-fn is_zero_css_opacity(value: &str) -> bool {
-    let numeric = value.strip_suffix('%').unwrap_or(value).trim();
-    is_zero_css_number(numeric)
-}
-
-fn is_zero_css_length(value: &str) -> bool {
-    let trimmed = value.trim();
-    let Some(split_pos) = split_css_number_prefix(trimmed) else {
-        return false;
-    };
-    let (number_part, unit_part) = trimmed.split_at(split_pos);
-    let unit_ok = unit_part.is_empty()
-        || unit_part == "%"
-        || unit_part.bytes().all(|byte| byte.is_ascii_alphabetic());
-    unit_ok && is_zero_css_number(number_part)
-}
-
-fn split_css_number_prefix(trimmed: &str) -> Option<usize> {
-    let bytes = trimmed.as_bytes();
-    let mut index: usize = 0;
-    if matches!(bytes.first(), Some(b'+' | b'-')) {
-        index += 1;
-    }
-    let mut saw_digit = false;
-    let mut saw_dot = false;
-    while let Some(&byte) = bytes.get(index) {
-        if byte.is_ascii_digit() {
-            saw_digit = true;
-            index += 1;
-        } else if byte == b'.' && !saw_dot {
-            saw_dot = true;
-            index += 1;
-        } else {
-            break;
-        }
-    }
-    saw_digit.then_some(index)
-}
-
-fn is_zero_css_number(value: &str) -> bool {
-    value
-        .parse::<f64>()
-        .is_ok_and(|number| number.is_finite() && number <= 0.0)
-}
-
 fn find_math_alttext(elem: ElementRef<'_>) -> Option<String> {
     for descendant in elem.descendants() {
         let Some(child) = ElementRef::wrap(descendant) else {
             continue;
         };
-        if child.value().name().eq_ignore_ascii_case(TAG_MATH)
+        if child.value().name() == TAG_MATH
             && let Some(alt) = child.value().attr(ATTR_ALTTEXT)
         {
             let cleaned = sanitize_inline_text(alt);
@@ -931,12 +839,8 @@ fn find_assistive_mathml_text(elem: ElementRef<'_>) -> Option<String> {
         let Some(child) = ElementRef::wrap(descendant) else {
             continue;
         };
-        if child
-            .value()
-            .name()
-            .eq_ignore_ascii_case("mjx-assistive-mml")
-            || child.value().name().eq_ignore_ascii_case(TAG_MATH)
-        {
+        let name = child.value().name();
+        if name == "mjx-assistive-mml" || name == TAG_MATH {
             let cleaned = sanitize_inline_text(&collect_visible_raw_text(child));
             if !cleaned.is_empty() {
                 return Some(cleaned);
@@ -949,8 +853,8 @@ fn find_assistive_mathml_text(elem: ElementRef<'_>) -> Option<String> {
 fn collect_visible_math_formulas(root: ElementRef<'_>, formulas: &mut Vec<String>) {
     let mut stack: Vec<ElementRef<'_>> = vec![root];
     while let Some(elem) = stack.pop() {
-        let tag = elem.value().name().to_ascii_lowercase();
-        if should_skip_element(&tag, elem.value()) {
+        let tag = elem.value().name();
+        if should_skip_element(tag, elem.value()) {
             continue;
         }
         if tag == TAG_MATH {
@@ -977,7 +881,7 @@ fn find_tex_annotation(elem: ElementRef<'_>) -> Option<String> {
         let Some(child) = ElementRef::wrap(descendant) else {
             continue;
         };
-        if !child.value().name().eq_ignore_ascii_case("annotation") {
+        if child.value().name() != "annotation" {
             continue;
         }
         let encoding = child
@@ -1024,8 +928,8 @@ fn render_html_gfm_table(table: ElementRef<'_>) -> String {
             .children()
             .filter_map(ElementRef::wrap)
             .filter(|cell| {
-                let name = cell.value().name().to_ascii_lowercase();
-                (name == "th" || name == "td") && !should_skip_element(&name, cell.value())
+                let name = cell.value().name();
+                (name == TAG_TH || name == TAG_TD) && !should_skip_element(name, cell.value())
             })
             .map(|cell| render_table_cell_text(cell).replace('|', "\\|"))
             .collect();
@@ -1040,8 +944,8 @@ fn collect_direct_tr_elements(table: ElementRef<'_>) -> Vec<ElementRef<'_>> {
     let mut result = Vec::new();
     let mut stack: Vec<ElementRef<'_>> = vec![table];
     while let Some(current) = stack.pop() {
-        let current_tag = current.value().name().to_ascii_lowercase();
-        if current != table && should_skip_element(&current_tag, current.value()) {
+        let current_tag = current.value().name();
+        if current != table && should_skip_element(current_tag, current.value()) {
             continue;
         }
         if current_tag == TAG_TR {
@@ -1052,8 +956,7 @@ fn collect_direct_tr_elements(table: ElementRef<'_>) -> Vec<ElementRef<'_>> {
             current.children().filter_map(ElementRef::wrap).collect();
         children.reverse();
         for child in children {
-            let tag = child.value().name().to_ascii_lowercase();
-            if matches!(tag.as_str(), TAG_TR | "thead" | "tbody" | "tfoot") {
+            if matches!(child.value().name(), TAG_TR | "thead" | "tbody" | "tfoot") {
                 stack.push(child);
             }
         }
@@ -1077,8 +980,8 @@ fn collect_element_raw_text(elem: ElementRef<'_>) -> String {
     text
 }
 
-fn collect_visible_text(elem: ElementRef<'_>) -> String {
-    collect_visible_raw_text(elem)
+fn collect_visible_inline_text(elem: ElementRef<'_>) -> String {
+    sanitize_inline_text(&collect_visible_raw_text(elem))
 }
 
 fn collect_visible_raw_text(elem: ElementRef<'_>) -> String {
@@ -1089,8 +992,8 @@ fn collect_visible_raw_text(elem: ElementRef<'_>) -> String {
         match step {
             WalkStep::Text(chunk) => out.push_str(chunk),
             WalkStep::EnterElement(child_elem) => {
-                let tag = child_elem.value().name().to_ascii_lowercase();
-                if tag != TAG_SCRIPT && !should_skip_element(&tag, child_elem.value()) {
+                let tag = child_elem.value().name();
+                if tag != TAG_SCRIPT && !should_skip_element(tag, child_elem.value()) {
                     push_children_reversed(child_elem, &mut stack);
                 }
             }
@@ -1134,6 +1037,479 @@ fn has_class(element: &Element, target: &str) -> bool {
     element
         .attr(ATTR_CLASS)
         .is_some_and(|classes| classes.split_whitespace().any(|cls| cls == target))
+}
+
+fn is_fragment_break_tag(tag_lower: &str) -> bool {
+    let local = tag_lower
+        .rsplit_once(':')
+        .map_or(tag_lower, |(_, suffix)| suffix);
+    parse_html_heading_level(local).is_some()
+        || BLOCK_NEWLINE_TAGS.contains(&local)
+        || matches!(
+            local,
+            TAG_BR
+                | TAG_HORIZONTAL_RULE
+                | TAG_PRE
+                | TAG_LI
+                | TAG_TR
+                | TAG_TD
+                | TAG_TH
+                | TAG_BLOCKQUOTE
+                | TAG_TITLE
+                | "sec"
+                | "list-item"
+                | "disp-quote"
+        )
+}
+
+fn parse_html_heading_level(tag: &str) -> Option<usize> {
+    let [b'h', level @ b'1'..=b'6'] = tag.as_bytes() else {
+        return None;
+    };
+    Some(usize::from(*level - b'0'))
+}
+
+const BIT_DISPLAY: u16 = 1 << 0;
+const BIT_VISIBILITY: u16 = 1 << 1;
+const BIT_CONTENT_VISIBILITY: u16 = 1 << 2;
+const BIT_OPACITY: u16 = 1 << 3;
+const BIT_FONT_SIZE: u16 = 1 << 4;
+const BIT_COLOR: u16 = 1 << 5;
+const BIT_TRANSFORM: u16 = 1 << 6;
+const BIT_CLIP_PATH: u16 = 1 << 7;
+const BIT_POSITION: u16 = 1 << 8;
+const BIT_CLIP: u16 = 1 << 9;
+const BIT_WIDTH: u16 = 1 << 10;
+const BIT_MAX_WIDTH: u16 = 1 << 11;
+const BIT_HEIGHT: u16 = 1 << 12;
+const BIT_MAX_HEIGHT: u16 = 1 << 13;
+const BIT_OVERFLOW_X: u16 = 1 << 14;
+const BIT_OVERFLOW_Y: u16 = 1 << 15;
+const DIRECT_HIDE_BITS: u16 = BIT_DISPLAY
+    | BIT_VISIBILITY
+    | BIT_CONTENT_VISIBILITY
+    | BIT_OPACITY
+    | BIT_FONT_SIZE
+    | BIT_COLOR
+    | BIT_TRANSFORM
+    | BIT_CLIP_PATH;
+
+fn is_hidden_inline_style(style: &str) -> bool {
+    let mut input = CssParser::new(style);
+    let mut cascade = InlineStyleCascade::default();
+    while !input.is_exhausted() {
+        let _ =
+            input.parse_until_after(Delimiter::Semicolon, |decl| cascade.parse_declaration(decl));
+    }
+    cascade.is_hidden()
+}
+
+#[derive(Default)]
+struct InlineStyleCascade {
+    hidden: u16,
+    important: u16,
+}
+
+impl InlineStyleCascade {
+    fn parse_declaration(&mut self, decl: &mut CssParser<'_>) -> Result<(), ParseError<()>> {
+        let name = decl.expect_ident()?.to_ascii_lowercase();
+        decl.expect_colon()?;
+        let update = decl.parse_until_before(Delimiter::Bang, |value| {
+            let update = parse_css_update(&name, value)?;
+            value.expect_exhausted()?;
+            Ok(update)
+        })?;
+        let important = if decl.is_exhausted() {
+            false
+        } else {
+            parse_important(decl)?;
+            decl.expect_exhausted()?;
+            true
+        };
+        match update {
+            CssUpdate::Single { bit, hidden } => self.set(bit, hidden, important),
+            CssUpdate::Overflow { x_hidden, y_hidden } => {
+                self.set(BIT_OVERFLOW_X, x_hidden, important);
+                self.set(BIT_OVERFLOW_Y, y_hidden, important);
+            }
+        }
+        Ok(())
+    }
+
+    const fn set(&mut self, bit: u16, is_hidden: bool, is_important: bool) {
+        if is_important || (self.important & bit) == 0 {
+            if is_hidden {
+                self.hidden |= bit;
+            } else {
+                self.hidden &= !bit;
+            }
+            if is_important {
+                self.important |= bit;
+            }
+        }
+    }
+
+    const fn is_hidden(&self) -> bool {
+        let clipped = (self.hidden & (BIT_CLIP | BIT_POSITION)) == (BIT_CLIP | BIT_POSITION);
+        let zero_box = (self.hidden & (BIT_WIDTH | BIT_MAX_WIDTH)) != 0
+            && (self.hidden & (BIT_HEIGHT | BIT_MAX_HEIGHT)) != 0
+            && (self.hidden & (BIT_OVERFLOW_X | BIT_OVERFLOW_Y)) != 0;
+        (self.hidden & DIRECT_HIDE_BITS) != 0 || clipped || zero_box
+    }
+}
+
+enum CssUpdate {
+    Single { bit: u16, hidden: bool },
+    Overflow { x_hidden: bool, y_hidden: bool },
+}
+
+fn parse_css_update(
+    property_name: &str,
+    input: &mut CssParser<'_>,
+) -> Result<CssUpdate, ParseError<()>> {
+    let (bit, hidden) = match property_name {
+        CSS_PROP_DISPLAY => (
+            BIT_DISPLAY,
+            input.expect_ident()?.eq_ignore_ascii_case(KW_NONE),
+        ),
+        "visibility" => {
+            let ident = input.expect_ident()?;
+            (
+                BIT_VISIBILITY,
+                ident.eq_ignore_ascii_case(KW_HIDDEN) || ident.eq_ignore_ascii_case("collapse"),
+            )
+        }
+        "content-visibility" => (
+            BIT_CONTENT_VISIBILITY,
+            input.expect_ident()?.eq_ignore_ascii_case(KW_HIDDEN),
+        ),
+        "opacity" => (
+            BIT_OPACITY,
+            match input.next()? {
+                Token::Number { value, .. }
+                | Token::Percentage {
+                    unit_value: value, ..
+                } => value.is_finite() && *value <= 0.0,
+                _ => return Err(ParseError::unexpected_token()),
+            },
+        ),
+        "font-size" => (
+            BIT_FONT_SIZE,
+            parse_box_dimension(input, FONT_SIZE_KEYWORDS)?,
+        ),
+        "width" => (
+            BIT_WIDTH,
+            parse_box_dimension(input, BOX_DIMENSION_KEYWORDS)?,
+        ),
+        "max-width" => (
+            BIT_MAX_WIDTH,
+            parse_box_dimension(input, BOX_DIMENSION_KEYWORDS)?,
+        ),
+        "height" => (
+            BIT_HEIGHT,
+            parse_box_dimension(input, BOX_DIMENSION_KEYWORDS)?,
+        ),
+        "max-height" => (
+            BIT_MAX_HEIGHT,
+            parse_box_dimension(input, BOX_DIMENSION_KEYWORDS)?,
+        ),
+        "color" => (BIT_COLOR, is_transparent_css_color(input)?),
+        "transform" => (BIT_TRANSFORM, parse_transform_hidden(input)?),
+        "clip-path" => (BIT_CLIP_PATH, parse_hidden_clip_path(input)?),
+        "position" => (BIT_POSITION, parse_position_hidden(input)?),
+        CSS_PROP_CLIP => (BIT_CLIP, parse_zero_clip_rect(input)?),
+        "overflow" => {
+            let first = parse_overflow_keyword(input)?;
+            let second = if input.is_exhausted() {
+                first
+            } else {
+                parse_overflow_keyword(input)?
+            };
+            return Ok(CssUpdate::Overflow {
+                x_hidden: first,
+                y_hidden: second,
+            });
+        }
+        "overflow-x" => (BIT_OVERFLOW_X, parse_overflow_keyword(input)?),
+        "overflow-y" => (BIT_OVERFLOW_Y, parse_overflow_keyword(input)?),
+        _ => return Err(ParseError::unexpected_token()),
+    };
+    Ok(CssUpdate::Single { bit, hidden })
+}
+
+fn parse_box_dimension(
+    input: &mut CssParser<'_>,
+    allowed_keywords: &[&str],
+) -> Result<bool, ParseError<()>> {
+    match input.next()? {
+        Token::Ident(ident)
+            if CSS_GLOBAL_KEYWORDS
+                .iter()
+                .chain(allowed_keywords.iter())
+                .any(|keyword| ident.eq_ignore_ascii_case(keyword)) =>
+        {
+            Ok(false)
+        }
+        Token::Number { value, .. } if *value == 0.0 => Ok(true),
+        Token::Dimension { value, .. } if value.is_finite() && *value >= 0.0 => Ok(*value == 0.0),
+        Token::Percentage { unit_value, .. } if unit_value.is_finite() && *unit_value >= 0.0 => {
+            Ok(*unit_value == 0.0)
+        }
+        _ => Err(ParseError::unexpected_token()),
+    }
+}
+
+fn is_transparent_css_color(input: &mut CssParser<'_>) -> Result<bool, ParseError<()>> {
+    let alpha = match CssColor::parse(input)? {
+        CssColor::CurrentColor => return Ok(false),
+        CssColor::Rgba(color) => color.alpha,
+        CssColor::Hsl(color) => color.alpha.unwrap_or(0.0),
+        CssColor::Hwb(color) => color.alpha.unwrap_or(0.0),
+        CssColor::Lab(color) => color.alpha.unwrap_or(0.0),
+        CssColor::Lch(color) => color.alpha.unwrap_or(0.0),
+        CssColor::Oklab(color) => color.alpha.unwrap_or(0.0),
+        CssColor::Oklch(color) => color.alpha.unwrap_or(0.0),
+        CssColor::ColorFunction(color) => color.alpha.unwrap_or(0.0),
+    };
+    Ok(alpha <= 0.0)
+}
+
+fn parse_transform_hidden(input: &mut CssParser<'_>) -> Result<bool, ParseError<()>> {
+    let mut saw_none = false;
+    let mut func_count = 0usize;
+    let mut zero_scale = false;
+    while !input.is_exhausted() {
+        match input.next()? {
+            Token::Ident(ident)
+                if ident.eq_ignore_ascii_case(KW_NONE) && !saw_none && func_count == 0 =>
+            {
+                saw_none = true;
+            }
+            Token::Function(name) if !saw_none => {
+                func_count += 1;
+                if name.eq_ignore_ascii_case("scale") {
+                    zero_scale |=
+                        input.parse_nested_block(|nested| parse_scale_args(nested, 1, 2))?;
+                } else if name.eq_ignore_ascii_case("scalex") || name.eq_ignore_ascii_case("scaley")
+                {
+                    zero_scale |=
+                        input.parse_nested_block(|nested| parse_scale_args(nested, 1, 1))?;
+                } else if name.eq_ignore_ascii_case("scale3d") {
+                    zero_scale |= input.parse_nested_block(|nested| {
+                        parse_scale_args(nested, CSS_SCALE3D_ARG_COUNT, CSS_SCALE3D_ARG_COUNT)
+                    })?;
+                } else if TRANSFORM_OTHER_FUNCTIONS
+                    .iter()
+                    .any(|func| name.eq_ignore_ascii_case(func))
+                {
+                    input.parse_nested_block(consume_non_empty_valid_tokens)?;
+                } else {
+                    return Err(ParseError::unexpected_token());
+                }
+            }
+            _ => return Err(ParseError::unexpected_token()),
+        }
+    }
+    if saw_none || func_count > 0 {
+        Ok(zero_scale)
+    } else {
+        Err(ParseError::unexpected_token())
+    }
+}
+
+fn parse_scale_args(
+    nested: &mut CssParser<'_>,
+    min_args: usize,
+    max_args: usize,
+) -> Result<bool, ParseError<()>> {
+    let mut count = 0usize;
+    let mut zero_xy = false;
+    loop {
+        if count > 0 {
+            if nested.is_exhausted() {
+                break;
+            }
+            nested.expect_comma()?;
+        }
+        if count >= max_args {
+            return Err(ParseError::unexpected_token());
+        }
+        let value = match nested.next()? {
+            Token::Number { value, .. }
+            | Token::Percentage {
+                unit_value: value, ..
+            } if value.is_finite() => *value,
+            _ => return Err(ParseError::unexpected_token()),
+        };
+        if count < 2 && value == 0.0 {
+            zero_xy = true;
+        }
+        count += 1;
+        if nested.is_exhausted() {
+            break;
+        }
+    }
+    if count < min_args {
+        return Err(ParseError::unexpected_token());
+    }
+    Ok(zero_xy)
+}
+
+fn parse_hidden_clip_path(input: &mut CssParser<'_>) -> Result<bool, ParseError<()>> {
+    let hidden = match input.next()? {
+        Token::Ident(ident)
+            if CSS_GLOBAL_KEYWORDS
+                .iter()
+                .chain(GEOMETRY_BOX_KEYWORDS.iter())
+                .copied()
+                .chain(std::iter::once(KW_NONE))
+                .any(|keyword| ident.eq_ignore_ascii_case(keyword)) =>
+        {
+            return Ok(false);
+        }
+        Token::Function(name) if name.eq_ignore_ascii_case("inset") => {
+            input.parse_nested_block(parse_inset_collapsed)?
+        }
+        Token::Function(name)
+            if CLIP_OTHER_SHAPE_FUNCTIONS
+                .iter()
+                .any(|func| name.eq_ignore_ascii_case(func)) =>
+        {
+            input.parse_nested_block(consume_non_empty_valid_tokens)?;
+            false
+        }
+        _ => return Err(ParseError::unexpected_token()),
+    };
+    if !input.is_exhausted() {
+        let box_ident = input.expect_ident()?;
+        if !GEOMETRY_BOX_KEYWORDS
+            .iter()
+            .any(|keyword| box_ident.eq_ignore_ascii_case(keyword))
+        {
+            return Err(ParseError::unexpected_token());
+        }
+    }
+    Ok(hidden)
+}
+
+fn parse_inset_collapsed(nested: &mut CssParser<'_>) -> Result<bool, ParseError<()>> {
+    let mut edges: [Option<f32>; CSS_INSET_MAX_ARGS] = [None; CSS_INSET_MAX_ARGS];
+    let mut count = 0usize;
+    while let Ok(token) = nested.next() {
+        if let Token::Ident(ident) = token
+            && ident.eq_ignore_ascii_case("round")
+        {
+            consume_non_empty_valid_tokens(nested)?;
+            break;
+        }
+        if count >= CSS_INSET_MAX_ARGS {
+            return Err(ParseError::unexpected_token());
+        }
+        edges[count] = match token {
+            Token::Percentage { unit_value, .. } if unit_value.is_finite() => Some(*unit_value),
+            Token::Number { value, .. } if *value == 0.0 => Some(0.0),
+            Token::Dimension { value, .. } if value.is_finite() => (*value == 0.0).then_some(0.0),
+            Token::Function(_) => None,
+            _ => return Err(ParseError::unexpected_token()),
+        };
+        count += 1;
+    }
+
+    let (top, right, bottom, left) = match edges.get(..count) {
+        Some(&[all]) => (all, all, all, all),
+        Some(&[vertical, horizontal]) => (vertical, horizontal, vertical, horizontal),
+        Some(&[top, horizontal, bottom]) => (top, horizontal, bottom, horizontal),
+        Some(&[top, right, bottom, left]) => (top, right, bottom, left),
+        _ => return Err(ParseError::unexpected_token()),
+    };
+    let collapses = |first: Option<f32>, second: Option<f32>| {
+        first.is_some_and(|first_offset| {
+            second.is_some_and(|second_offset| (first_offset + second_offset) >= 1.0)
+        })
+    };
+    Ok(collapses(top, bottom) || collapses(left, right))
+}
+
+fn parse_position_hidden(input: &mut CssParser<'_>) -> Result<bool, ParseError<()>> {
+    let ident = input.expect_ident()?;
+    if ident.eq_ignore_ascii_case("absolute") || ident.eq_ignore_ascii_case("fixed") {
+        Ok(true)
+    } else if ident.eq_ignore_ascii_case("static")
+        || ident.eq_ignore_ascii_case("relative")
+        || ident.eq_ignore_ascii_case("sticky")
+    {
+        Ok(false)
+    } else {
+        Err(ParseError::unexpected_token())
+    }
+}
+
+fn parse_zero_clip_rect(input: &mut CssParser<'_>) -> Result<bool, ParseError<()>> {
+    match input.next()? {
+        Token::Ident(ident) if ident.eq_ignore_ascii_case(KW_AUTO) => return Ok(false),
+        Token::Function(name) if name.eq_ignore_ascii_case("rect") => {}
+        _ => return Err(ParseError::unexpected_token()),
+    }
+    input.parse_nested_block(|nested| {
+        let mut collapsed = [false; CSS_RECT_ARG_COUNT];
+        let mut uses_commas = None;
+        for (index, slot) in collapsed.iter_mut().enumerate() {
+            if index > 0 {
+                let saw_comma = nested.try_parse(CssParser::expect_comma).is_ok();
+                match uses_commas {
+                    None => uses_commas = Some(saw_comma),
+                    Some(expected) if expected != saw_comma => {
+                        return Err(ParseError::unexpected_token());
+                    }
+                    Some(_) => {}
+                }
+            }
+            *slot = parse_clip_rect_arg(nested, index)?;
+        }
+        nested.expect_exhausted()?;
+        let [top, right, bottom, left] = collapsed;
+        Ok((top && bottom) || (right && left))
+    })
+}
+
+fn parse_clip_rect_arg(nested: &mut CssParser<'_>, index: usize) -> Result<bool, ParseError<()>> {
+    match nested.next()? {
+        Token::Ident(ident) if ident.eq_ignore_ascii_case(KW_AUTO) => {
+            Ok(index == 0 || index + 1 == CSS_RECT_ARG_COUNT)
+        }
+        Token::Number { value, .. } if *value == 0.0 => Ok(true),
+        Token::Dimension { value, .. } if value.is_finite() => Ok(*value == 0.0),
+        _ => Err(ParseError::unexpected_token()),
+    }
+}
+
+fn parse_overflow_keyword(input: &mut CssParser<'_>) -> Result<bool, ParseError<()>> {
+    let ident = input.expect_ident()?;
+    if ident.eq_ignore_ascii_case(KW_HIDDEN) || ident.eq_ignore_ascii_case(KW_CLIP) {
+        Ok(true)
+    } else if ident.eq_ignore_ascii_case("visible")
+        || ident.eq_ignore_ascii_case("scroll")
+        || ident.eq_ignore_ascii_case(KW_AUTO)
+    {
+        Ok(false)
+    } else {
+        Err(ParseError::unexpected_token())
+    }
+}
+
+fn consume_non_empty_valid_tokens(nested: &mut CssParser<'_>) -> Result<(), ParseError<()>> {
+    let mut saw_token = false;
+    while let Ok(token) = nested.next() {
+        if matches!(token, Token::BadUrl(_) | Token::BadString(_)) {
+            return Err(ParseError::unexpected_token());
+        }
+        saw_token = true;
+    }
+    if saw_token {
+        Ok(())
+    } else {
+        Err(ParseError::unexpected_token())
+    }
 }
 
 enum WalkStep<'a> {
@@ -1218,6 +1594,7 @@ fn sanitize_safe_markdown_href(raw: &str) -> Option<String> {
             ')' => encoded.push_str("%29"),
             '<' => encoded.push_str("%3C"),
             '>' => encoded.push_str("%3E"),
+            '\\' => encoded.push_str("%5C"),
             other => encoded.push(other),
         }
     }
@@ -1262,10 +1639,15 @@ mod tests {
             </article>
         "#};
         let extracted = extract_html_to_markdown(html);
-        assert!(extracted.markdown.contains(r"$\alpha + \beta$"));
-        assert!(!extracted.markdown.contains("α+β"));
-        assert!(extracted.markdown.contains("$f(x) = x^2$"));
-        assert!(!extracted.markdown.contains("glyphsoup"));
+        insta::assert_snapshot!(extracted.markdown, @r"
+        KaTeX: $\alpha + \beta$
+
+        MathJax2: $f(x) = x^2$
+
+        $$
+        \sum_{i=1}^n x_i
+        $$
+        ");
     }
 
     #[test]
@@ -1282,12 +1664,15 @@ mod tests {
             </article>
         "#};
         let extracted = extract_html_to_markdown(html);
-        assert!(
-            extracted
-                .markdown
-                .contains(r"\mathrm{SE} = \sqrt{\mathrm{Var}/n} \quad (4)")
-        );
-        assert!(extracted.markdown.contains(r"\int_0^1 t\,dt"));
+        insta::assert_snapshot!(extracted.markdown, @r"
+        $$
+        \mathrm{SE} = \sqrt{\mathrm{Var}/n} \quad (4)
+        $$
+
+        $$
+        \int_0^1 t\,dt
+        $$
+        ");
     }
 
     #[rstest]
@@ -1303,6 +1688,28 @@ mod tests {
     #[case("transform: scale(0)")]
     #[case("width: 0; height: 0; overflow: hidden")]
     #[case("width: 0; height: 0; overflow-x: hidden")]
+    #[case(r"\64 isplay: none")]
+    #[case("font-family: '/*'; bad: [closed] !bogus; display: none")]
+    #[case(r"123bad: x; display: \6e one")]
+    #[case("display: none !important; display: block")]
+    #[case("color: rgb(0 0 0 / 0%)")]
+    #[case("color: rgb(0 0 0 / none)")]
+    #[case("color: rgb(none none none / 0%)")]
+    #[case("color: oklch(0 0 0 / 0)")]
+    #[case("color: color(srgb 0 0 0 / 0)")]
+    #[case("clip-path: inset(50%)")]
+    #[case("clip-path: inset(60% 0 40% 0)")]
+    #[case("position: absolute; clip: rect(auto, 0, 0, auto)")]
+    #[case("position: absolute; clip: rect(0, 0, auto, 0)")]
+    #[case("position: absolute; clip: rect(0, 0, 0, 0); clip: rect(10%, 10%, 10%, 10%)")]
+    #[case("clip-path: inset(50%) border-box")]
+    #[case("clip-path: inset(50%); clip-path: inset(10)")]
+    #[case("font-size: 0; font-size: -10px")]
+    #[case("font-size: 0; font-size: 'bogus'")]
+    #[case("width: 0; height: 0; overflow: hidden; width: -1px")]
+    #[case("transform: translateX(10px) scale(0)")]
+    #[case("transform: scale(1, 0)")]
+    #[case("transform: scale(0); transform: scale(1, invalid)")]
     fn strips_hidden_css_across_blocks_special_elements_and_tables(#[case] style: &str) {
         let html = format!(
             concat!(
@@ -1342,6 +1749,30 @@ mod tests {
         assert!(leaked.is_empty(), "leaked {leaked:?} for style {style}");
     }
 
+    #[rstest]
+    #[case("color: rgb(255 0 0 / 50%)")]
+    #[case("color: #g000")]
+    #[case("opacity: 0.5 !important")]
+    #[case("transform: scale(1.2)")]
+    #[case("transform: scale(-1)")]
+    #[case("transform: scaleX(-1)")]
+    #[case("transform: scale3d(1, 1, 0)")]
+    #[case("font-size: -10px")]
+    #[case("width: -1px; height: -1px; overflow: hidden")]
+    #[case("clip-path: inset(0 round 100%)")]
+    #[case("clip: rect(0, 0, 0, 0)")]
+    #[case("clip: rect(-20px, 0, 0, -20px)")]
+    #[case("clip: rect(0, auto, auto, 0)")]
+    #[case("display: none; display: block")]
+    #[case("width: 0; width: 100px; height: 0; overflow: hidden")]
+    #[case("width: 0; height: 0; overflow: hidden; overflow: visible")]
+    #[case("display: none bogus")]
+    #[case("transform: scale(0) !important !important")]
+    #[case("overflow: hidden; overflow: visible bogus")]
+    fn preserves_visible_css_declarations(#[case] style: &str) {
+        assert!(!is_hidden_inline_style(style));
+    }
+
     #[test]
     fn selects_main_over_small_sidebar_teaser_article() {
         let html = indoc! {r"
@@ -1354,12 +1785,11 @@ mod tests {
             </body>
         "};
         let extracted = extract_html_to_markdown(html);
-        assert!(extracted.markdown.contains("Full Research Paper"));
-        assert!(
-            extracted
-                .markdown
-                .contains("actual body of the engineering paper")
-        );
+        insta::assert_snapshot!(extracted.markdown, @"
+        # Full Research Paper
+
+        This is the actual body of the engineering paper with full derivations and results.
+        ");
     }
 
     #[test]
@@ -1381,15 +1811,17 @@ mod tests {
             </article>
         "};
         let extracted = extract_html_to_markdown(html);
-        let row1 = extracted.markdown.find("| Row 1 | 10 |").unwrap();
-        let row2 = extracted.markdown.find("| Row 2 | 20 |").unwrap();
-        let row3 = extracted.markdown.find(r"| A \| B | 30 |").unwrap();
-        let first = extracted.markdown.find("| First | 1 |").unwrap();
-        let second = extracted.markdown.find("| Second | 2 |").unwrap();
+        insta::assert_snapshot!(extracted.markdown, @r"
+        | Metric | Value |
+        | --- | --- |
+        | Row 1 | 10 |
+        | Row 2 | 20 |
+        | A \| B | 30 |
 
-        assert!(row1 < row2);
-        assert!(row2 < row3);
-        assert!(first < second);
+        | First | 1 |
+        | --- | --- |
+        | Second | 2 |
+        ");
     }
 
     #[test]
@@ -1401,21 +1833,18 @@ mod tests {
               <pre><code class="language-rust">let fence = "```";</code></pre>
             </article>
         "#};
-        let expected_quote = indoc! {r"
-            > Line one.
-            >
-            > Line two.
-        "};
-        let expected_code = indoc! {r#"
-            ````rust
-            let fence = "```";
-            ````
-        "#};
         let extracted = extract_html_to_markdown(html);
-        assert!(extracted.markdown.contains(expected_quote.trim_end()));
-        assert!(extracted.markdown.contains("`alpha` `beta`"));
-        assert!(extracted.markdown.contains("`` `nested` ``"));
-        assert!(extracted.markdown.contains(expected_code.trim_end()));
+        insta::assert_snapshot!(extracted.markdown, @r#"
+        > Line one.
+        >
+        > Line two.
+
+        Compare `alpha` `beta` and `` `nested` ``.
+
+        ````rust
+        let fence = "```";
+        ````
+        "#);
     }
 
     #[test]
@@ -1424,6 +1853,7 @@ mod tests {
             <article>
               <p>
                 <a href="https://example.com/a) [evil](https://x.test">Safe</a>
+                <a href="https://example.com/p\">Slash</a>
                 <a href="file:///etc/passwd">NoFile</a>
                 <a href="java&#x09;script:alert(1)">NoJs</a>
               </p>
@@ -1434,6 +1864,11 @@ mod tests {
             extracted
                 .markdown
                 .contains("[Safe](https://example.com/a%29%20[evil]%28https://x.test)")
+        );
+        assert!(
+            extracted
+                .markdown
+                .contains("[Slash](https://example.com/p%5C)")
         );
         assert!(!extracted.markdown.contains("file:///etc/passwd"));
         assert!(!extracted.markdown.contains("alert(1)"));
@@ -1492,5 +1927,27 @@ mod tests {
         let extracted = extract_html_to_markdown(&html);
         assert!(extracted.markdown.contains("Leaf"));
         assert!(!extracted.markdown.contains("INJECT_SCRIPT"));
+    }
+
+    #[rstest]
+    #[case(
+        "<jats:p>Significance at <i>p</i> &lt; 0.05 and <b>n</b> &gt; 10.</jats:p>",
+        "Significance at p < 0.05 and n > 10."
+    )]
+    #[case("<p>First.</p><p>Second.</p>", "First. Second.")]
+    #[case(
+        "<script>secret()</script><style>.x{}</style><noscript>off</noscript><template>tpl</template><span hidden>hidden</span><span style=\"display:none\">prompt</span>Visible",
+        "Visible"
+    )]
+    #[case(
+        "<jats:list-item>Alpha</jats:list-item><jats:list-item>p < 0.05</jats:list-item>",
+        "Alpha p < 0.05"
+    )]
+    #[case("", "")]
+    fn clean_html_fragment_preserves_decoded_inequalities_breaks_and_hiding(
+        #[case] fragment: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(clean_html_fragment(fragment), expected);
     }
 }
