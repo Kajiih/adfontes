@@ -31,7 +31,7 @@ members = [".", "crates/adfontes-py"]
 default-members = ["."]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Full-text academic and technical literature reader CLI and stdio MCP server for coding agents"
 repository = "https://github.com/Kajiih/adfontes"
@@ -76,20 +76,29 @@ path = "src/bin/adfontes.rs"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
-#  TODO: Consider if this is the right level of abstraction that we need.
+# TODO: Consider if this is the right level of abstraction that we need.
 cssparser = "0.38"
 cssparser-color = "0.6"
 dunce = "1.0"
 encoding_rs = "0.8"
-flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1.1", default-features = false, features = [
+    "rust_backend"
+] }
 ipnet = "2.11"
 lopdf = { version = "0.47", default-features = false }
 mime = "0.3"
 percent-encoding = "2.3"
 pulldown-cmark = { version = "0.13", default-features = false }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "http2",
+    "rustls-no-provider"
+] }
 roxmltree = "0.21"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12"
+] }
 rustls-platform-verifier = "0.7"
 scraper = "0.29"
 serde = { version = "1.0", features = ["derive"] }
@@ -99,11 +108,14 @@ strum = { version = "0.28", features = ["derive"] }
 tar = { version = "0.4", default-features = false }
 tempfile = "3.27"
 thiserror = "2.0"
-tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "net",
+    "rt",
+    "sync",
+    "time"
+] }
 url = "2.5"
-
-[target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1", default-features = false, features = ["std", "process", "fs"] }
 
 [dev-dependencies]
 indoc = "2.0"
@@ -111,6 +123,13 @@ insta = "1.49"
 pretty_assertions = "1.4"
 rstest = "0.28"
 wiremock = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", default-features = false, features = [
+    "fs",
+    "process",
+    "std"
+] }
 
 [lints]
 workspace = true
