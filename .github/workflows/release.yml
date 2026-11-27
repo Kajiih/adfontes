@@ -16,13 +16,17 @@ concurrency:
 # Publishing workflows build from scratch with no shared caches (`zizmor` cache-poisoning rule).
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
       contents: read
     strategy:
       matrix:
-        target: [x86_64, aarch64]
+        include:
+          - runner: ubuntu-latest
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -32,6 +36,11 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --locked --out dist --strip
           manylinux: "2_28"
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: uv
+      - name: Verify wheel
+        run: uv run --no-project --with 'pytest>=8.3,<10' pytest -q -p no:cacheprovider tests/wheel --wheel-dir dist --python 3.10 --python 3.13
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-linux-${{ matrix.target }}
@@ -57,19 +66,15 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --locked --out dist
-      - name: Verify aarch64 wheel code signature
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: uv
+      - name: Verify wheel
         if: matrix.target == 'aarch64'
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import pathlib, subprocess, tempfile, zipfile
-          wheels = sorted(pathlib.Path("dist").glob("*.whl"))
-          assert len(wheels) == 1, f"expected 1 wheel, found {wheels}"
-          with tempfile.TemporaryDirectory() as tmp:
-              with zipfile.ZipFile(wheels[0]) as zf:
-                  extracted = pathlib.Path(zf.extract("adfontes/_adfontes.abi3.so", tmp))
-              subprocess.run(["codesign", "--verify", "--strict", str(extracted)], check=True)
-          PY
+        run: uv run --no-project --with 'pytest>=8.3,<10' pytest -q -p no:cacheprovider tests/wheel --wheel-dir dist --python 3.10 --python 3.13
+      - name: Verify wheel metadata
+        if: matrix.target == 'x86_64'
+        run: uv run --no-project --with 'pytest>=8.3,<10' pytest -q -p no:cacheprovider tests/wheel --wheel-dir dist -k test_wheel_
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-macos-${{ matrix.target }}
@@ -91,6 +96,11 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --locked --out dist
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: uv
+      - name: Verify wheel
+        run: uv run --no-project --with 'pytest>=8.3,<10' pytest -q -p no:cacheprovider tests/wheel --wheel-dir dist --python 3.10 --python 3.13
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-windows-${{ matrix.target }}
@@ -98,7 +108,7 @@ jobs:
 
   sdist:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -109,6 +119,12 @@ jobs:
         with:
           command: sdist
           args: --out dist
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: uv
+      - name: Verify sdist
+        run: uv run --no-project --with 'pytest>=8.3,<10' pytest -q -p no:cacheprovider tests/wheel --sdist-dir dist --python 3.10
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-sdist
