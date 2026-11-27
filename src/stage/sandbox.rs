@@ -25,6 +25,7 @@ use crate::model::AdfontesError;
 
 const MAX_LOCAL_PDF_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_STAGING_NAME: &str = "adfontes";
+#[cfg(unix)]
 const LABEL_STAGING_ROOT: &str = "staging root";
 const LABEL_STAGING_PATH: &str = "staging path";
 #[cfg(unix)]
@@ -454,6 +455,8 @@ fn push_unique_root(roots: &mut Vec<AllowedRoot>, candidate: AllowedRoot) {
         {
             existing.enforce_mode_on_root |= candidate.enforce_mode_on_root;
         }
+        #[cfg(not(unix))]
+        let _ = existing;
         return;
     }
     roots.push(candidate);
@@ -1594,6 +1597,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    #[cfg(unix)]
     use crate::pdf::build_test_pdf;
 
     struct SandboxHarness {
