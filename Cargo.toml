@@ -31,7 +31,7 @@ members = [".", "crates/adfontes-py"]
 default-members = ["."]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Full-text academic and technical literature reader CLI and stdio MCP server for coding agents"
 repository = "https://github.com/Kajiih/adfontes"

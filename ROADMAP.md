@@ -1,6 +1,6 @@
 # `adfontes` Roadmap
 
-Tracked follow-up directions and enhancements to evaluate after `v0.2.0`. Items here represent scoped design areas rather than fixed commitments.
+Tracked follow-up directions and enhancements to evaluate after `v0.3.0`. Items here represent scoped design areas rather than fixed commitments.
 
 ## 1. First-Class Text Path for PDFs
 
