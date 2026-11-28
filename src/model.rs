@@ -51,8 +51,10 @@ const DOI_MIN_REGISTRANT_DIGITS: usize = 4;
 const DOI_MAX_REGISTRANT_DIGITS: usize = 9;
 const DOI_MAX_REGISTRANT_SEGMENTS: usize = 4;
 const DOI_MAX_TOTAL_LEN: usize = 256;
-const PREPRINT_DOI_PREFIX: &str = "10.1101";
-const PREPRINT_CONTENT_PREFIX: &str = "/content/10.1101/";
+const PREPRINT_CONTENT_PREFIXES: &[(&str, &str)] = &[
+    ("10.1101", "/content/10.1101/"),
+    ("10.64898", "/content/10.64898/"),
+];
 const PREPRINT_MAX_VERSION_DIGITS: usize = 3;
 const PREPRINT_VIEW_SUFFIXES: &[&str] = &[
     ".full.pdf+html",
@@ -220,7 +222,7 @@ impl ParsedTarget {
     /// Parses a user- or agent-supplied target string into a strongly typed [`ParsedTarget`].
     ///
     /// Canonical scholarly URLs (`arxiv.org`, `ar5iv`, `doi.org`, DataCite `10.48550/arXiv.*`,
-    /// `bioRxiv` / `medRxiv` `10.1101` preprints, Europe PMC / NCBI `PMC*`, PubMed, and IETF RFC
+    /// `bioRxiv` / `medRxiv` `10.1101` / `10.64898` preprints, Europe PMC / NCBI `PMC*`, PubMed, and IETF RFC
     /// Editor / Datatracker) are classified into their [`ScholarlyId`] variant so they benefit
     /// from full multi-format waterfalls.
     ///
@@ -1453,7 +1455,12 @@ fn classify_preprint_doi_url(host: &str, path: &str) -> Option<ScholarlyId> {
     ) {
         return None;
     }
-    let rest = strip_ascii_prefix_ignore_case(path, PREPRINT_CONTENT_PREFIX)?;
+    let (doi_prefix, rest) =
+        PREPRINT_CONTENT_PREFIXES
+            .iter()
+            .find_map(|&(doi_prefix, content_prefix)| {
+                strip_ascii_prefix_ignore_case(path, content_prefix).map(|rest| (doi_prefix, rest))
+            })?;
     let decoded = percent_decode_utf8(rest.trim_end_matches('/'))?;
     if decoded.is_empty() || decoded.contains('/') {
         return None;
@@ -1478,7 +1485,7 @@ fn classify_preprint_doi_url(host: &str, path: &str) -> Option<ScholarlyId> {
     if !valid_numeric_segments {
         return None;
     }
-    Doi::parse(&format!("{PREPRINT_DOI_PREFIX}/{base_suffix}"))
+    Doi::parse(&format!("{doi_prefix}/{base_suffix}"))
         .ok()
         .map(ScholarlyId::Doi)
 }
@@ -1995,6 +2002,18 @@ mod tests {
         "https://www.biorxiv.org/content/10.1101/2023.01.15.524123%762.full/",
         "10.1101/2023.01.15.524123"
     )]
+    #[case(
+        "https://www.biorxiv.org/content/10.64898/2025.12.01.691501v1.full.pdf",
+        "10.64898/2025.12.01.691501"
+    )]
+    #[case(
+        "https://www.medrxiv.org/content/10.64898/2025.12.02.25341502v2",
+        "10.64898/2025.12.02.25341502"
+    )]
+    #[case(
+        "https://medrxiv.org/content/10.64898/2025.12.02.25341502",
+        "10.64898/2025.12.02.25341502"
+    )]
     fn classifies_biorxiv_and_medrxiv_preprint_doi_urls(
         #[case] raw: &str,
         #[case] expected_doi: &str,
@@ -2019,6 +2038,7 @@ mod tests {
     #[case("https://www.biorxiv.org/content/10.1101/early/2024/06/03/24308385")]
     #[case("https://www.biorxiv.org/content/10.1101/2024..03.24308385v1")]
     #[case("https://www.biorxiv.org/content/10.1101/not-a-doi")]
+    #[case("https://www.biorxiv.org/content/10.9999/2025.12.01.691501v1")]
     #[case("https://www.medrxiv.org/content/early/recent")]
     fn keeps_non_canonical_urls_as_url_variant(#[case] raw: &str) {
         let parsed = ParsedTarget::parse(raw).unwrap();
