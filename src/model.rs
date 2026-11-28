@@ -173,13 +173,14 @@ impl ScholarlyId {
 
     /// Returns an opaque canonical equivalence key for cycle detection and alias deduplication.
     ///
-    /// Folds `arXiv` versions via [`ArxivId::base_id`] and ASCII-lowercases DOI Basic Latin
-    /// characters per ISO 26324.
+    /// Folds `arXiv` versions via [`ArxivId::base_id`], strips optional pre-2007 legacy `.SC`
+    /// subject classes (so `math.GT/0211159` and `math/0211159` share one key), and
+    /// ASCII-lowercases DOI Basic Latin characters per ISO 26324.
     #[must_use]
     pub fn canonical_key(&self) -> ScholarlyIdKey {
         match self {
             Self::Arxiv(id) => {
-                ScholarlyIdKey(ScholarlyIdKeyKind::Arxiv(id.base_id().to_ascii_lowercase()))
+                ScholarlyIdKey(ScholarlyIdKeyKind::Arxiv(canonical_arxiv_key(id.base_id())))
             }
             Self::Doi(doi) => {
                 ScholarlyIdKey(ScholarlyIdKeyKind::Doi(doi.as_str().to_ascii_lowercase()))
@@ -1647,6 +1648,17 @@ fn canonicalize_legacy_arxiv_archive(archive: &str, raw: &str) -> Result<String,
     })
 }
 
+fn canonical_arxiv_key(base_id: &str) -> String {
+    if let Some((archive, number)) = base_id.split_once('/') {
+        let primary = archive
+            .split_once('.')
+            .map_or(archive, |(primary, _)| primary);
+        format!("{}/{number}", primary.to_ascii_lowercase())
+    } else {
+        base_id.to_ascii_lowercase()
+    }
+}
+
 fn is_hyphenated_ascii_letters(segment: &str) -> bool {
     !segment.is_empty()
         && segment
@@ -1828,6 +1840,24 @@ mod tests {
         assert_eq!(legacy_upper, legacy_lower);
         assert_eq!(doi_upper, doi_lower);
         assert_ne!(doi_lower, pmc);
+    }
+
+    #[test]
+    fn scholarly_id_canonical_key_folds_legacy_arxiv_subject_class() {
+        let with_upper_subject = ScholarlyId::parse("math.GT/0211159v1")
+            .unwrap()
+            .canonical_key();
+        let with_lower_subject = ScholarlyId::parse("math.gt/0211159")
+            .unwrap()
+            .canonical_key();
+        let without_subject = ScholarlyId::parse("math/0211159v2")
+            .unwrap()
+            .canonical_key();
+        let different_archive = ScholarlyId::parse("cs/0211159").unwrap().canonical_key();
+
+        assert_eq!(with_upper_subject, with_lower_subject);
+        assert_eq!(with_upper_subject, without_subject);
+        assert_ne!(without_subject, different_archive);
     }
 
     #[rstest]
