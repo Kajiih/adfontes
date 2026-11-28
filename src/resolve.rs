@@ -1,16 +1,17 @@
 //! Keyless open-access scholarly retrieval waterfalls and web/spec content dispatch.
 //!
 //! Resolves [`ParsedTarget`] identifiers (`arXiv`, `DOI`, `PMCID`, `PMID`, `RFC`, and web/GitHub
-//! URLs) via preference-ordered open-access sources that favor structured digital text (`Markdown`,
-//! `LaTeXML` HTML, `JATS` XML, `RFCXML`, flattened `TeX`) ahead of binary PDFs and return honest
-//! [`ExtractedPayload::MetadataOnly`] outcomes when no legal open-access copy exists.
+//! URLs) via a unified [`session::WorkResolution`] frontier that favors structured digital text
+//! (`Markdown`, `LaTeXML` HTML, `JATS` XML, `RFCXML`, flattened `TeX`) ahead of binary PDFs and
+//! returns honest [`crate::model::ExtractedPayload::MetadataOnly`] outcomes when no legal open-access copy
+//! exists.
 
 architecture_component!(Resolve);
 
 mod content;
 mod providers;
+mod session;
 
-use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -20,15 +21,18 @@ use self::content::{
     extract_arxiv_html_response, extract_oa_landing_response, is_arxiv_abs_url, is_pdf_response,
     is_plain_text_mime,
 };
-use self::providers::{JsonDoc, OaCandidates};
+use self::providers::{JsonDoc, ProviderDiscovery};
+use self::session::{
+    AliasEnqueue, DeferredFallback, FrontierEntry, ResolvedPdf, ResolvedText, UnavailableTrace,
+    WorkResolution, is_structured_repository,
+};
 use crate::extract::{
     JatsExtraction, clean_rfc_text, extract_arxiv_source_archive, extract_jats_xml,
     extract_rfc_xml, parse_arxiv_atom_feed,
 };
 use crate::model::{
-    AdfontesError, ArxivId, Doi, ExtractedDocument, ExtractedPayload, HttpUrl, ParsedTarget, PmcId,
-    Pmid, RfcNumber, ScholarlyId, ScholarlyIdKey, TextFormat, UnavailableReason, WorkMetadata,
-    classify_known_scholarly_url,
+    AdfontesError, ArxivId, Doi, ExtractedDocument, HttpUrl, ParsedTarget, PmcId, Pmid, RfcNumber,
+    ScholarlyId, TextFormat, WorkMetadata, classify_known_scholarly_url,
 };
 use crate::transport::{HttpClient, HttpResponse};
 
@@ -40,11 +44,19 @@ const ACCEPT_PDF: &str = "application/pdf, */*;q=0.1";
 const ACCEPT_WEB_PREFERRED: &str =
     "text/markdown, text/html;q=0.9, application/pdf;q=0.8, text/plain;q=0.7, */*;q=0.5";
 
+const ENDPOINT_ARXIV_ATOM: &str = "atom";
+const ENDPOINT_ARXIV_HTML: &str = "arxiv-html";
+const ENDPOINT_AR5IV: &str = "ar5iv";
+const ENDPOINT_ARXIV_SRC: &str = "src";
+const ENDPOINT_EPMC_XML: &str = "epmc-xml";
+const ENDPOINT_EPMC_PMID: &str = "epmc-pmid";
+const ENDPOINT_RFC_XML: &str = "rfc-xml";
+const ENDPOINT_RFC_TXT: &str = "rfc-txt";
+const ENDPOINT_OA_PDF: &str = "oa-pdf";
+
 const HTTP_OK: u16 = 200;
-const MAX_RECLASSIFICATION_DEPTH: u8 = 3;
 const MAX_WATERFALL_HTTP_REQUESTS: usize = 24;
 const MAX_WATERFALL_DURATION: Duration = Duration::from_secs(90);
-const MAX_OA_CANDIDATES: usize = 6;
 const MAX_EMAIL_LOCAL_LEN: usize = 64;
 const MAX_EMAIL_TOTAL_LEN: usize = 254;
 
@@ -52,8 +64,6 @@ const PLACEHOLDER_EMAIL_DOMAINS: &[&str] =
     &["example.com", "example.org", "example.net", "test.com"];
 const RESERVED_EMAIL_TLDS: &[&str] = &["example", "invalid", "test", "localhost"];
 const PLACEHOLDER_EMAIL_LOCALS: &[&str] = &["test", "user", "placeholder", "your_email", "email"];
-
-const GENERIC_REPOSITORY_VENUES: &[&str] = &["arXiv", "Europe PMC", "PubMed"];
 
 /// Base service URLs used by scholarly retrieval waterfalls.
 ///
@@ -150,9 +160,11 @@ pub async fn resolve_target(
     client: &HttpClient,
     config: &ResolverConfig,
 ) -> Result<ExtractedDocument, AdfontesError> {
-    let mut visited = BTreeSet::new();
     let budget = ResolveBudget::new(client);
-    resolve_target_inner(target, &budget, config, 0, &mut visited).await
+    match target {
+        ParsedTarget::Scholarly(id) => resolve_work(id, &[], &budget, config).await,
+        ParsedTarget::Url(url) => resolve_url(url, &budget, config).await,
+    }
 }
 
 struct ResolveBudget<'a> {
@@ -246,129 +258,213 @@ impl<'a> ResolveBudget<'a> {
     }
 }
 
-async fn resolve_target_inner(
-    target: &ParsedTarget,
+async fn resolve_url(
+    url: &HttpUrl,
     budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
-    depth: u8,
-    visited: &mut BTreeSet<ScholarlyIdKey>,
 ) -> Result<ExtractedDocument, AdfontesError> {
-    match target {
-        ParsedTarget::Scholarly(id) => {
-            visited.insert(id.canonical_key());
-            match id {
-                ScholarlyId::Arxiv(arxiv) => resolve_arxiv(arxiv, budget, config).await,
-                ScholarlyId::Doi(doi) => resolve_doi(doi, budget, config, depth, visited).await,
-                ScholarlyId::PmcId(pmcid) => resolve_pmcid(pmcid, budget, config).await,
-                ScholarlyId::Pmid(pmid) => resolve_pmid(pmid, budget, config, depth, visited).await,
-                ScholarlyId::Rfc(rfc) => resolve_rfc(*rfc, budget, config).await,
-            }
+    budget.client.validate_url_policy(url)?;
+    let initial_raw_github = url.to_raw_github_url();
+    let response = if let Some(ref raw_github) = initial_raw_github {
+        match budget.get(raw_github, Some(ACCEPT_WEB_PREFERRED)).await {
+            Ok(resp) if resp.status == HTTP_OK => resp,
+            Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
+            _ => budget.get(url, Some(ACCEPT_WEB_PREFERRED)).await?,
         }
-        ParsedTarget::Url(url) => resolve_url(url, budget, config, depth, visited).await,
-    }
-}
-
-async fn resolve_arxiv(
-    id: &ArxivId,
-    budget: &ResolveBudget<'_>,
-    config: &ResolverConfig,
-) -> Result<ExtractedDocument, AdfontesError> {
-    let mut metadata = WorkMetadata {
-        canonical_id: Some(format!("arXiv:{id}")),
-        venue_or_source: Some("arXiv".to_owned()),
-        ..WorkMetadata::default()
+    } else {
+        budget.get(url, Some(ACCEPT_WEB_PREFERRED)).await?
     };
-    let mut failures = Vec::new();
 
-    // 1. Metadata via Atom API (gracefully survive rate-limiting / HTTP 429 / 503).
-    fetch_arxiv_atom_metadata(id, budget, config, &mut metadata, &mut failures).await?;
-
-    // 2. Official arXiv LaTeXML HTML (`arxiv.org/html/<id>`).
-    if let Some(doc) = try_arxiv_html_endpoint(
-        &format!(
-            "{}/html/{}",
-            config.endpoints.arxiv_org.trim_end_matches('/'),
-            id.as_str()
-        ),
-        budget,
-        &mut metadata,
-        &mut failures,
-        "arxiv-html",
-    )
-    .await?
+    // Reclassify intermediate and final post-redirect scholarly URLs BEFORE rejecting non-200
+    // statuses (e.g., grounding redirect -> doi.org -> 403 publisher, or -> arxiv.org/html 404).
+    let mut reclassified_ids = Vec::new();
+    for hop in response
+        .redirect_chain
+        .iter()
+        .chain(std::iter::once(&response.final_url))
     {
-        return Ok(doc);
+        if hop != url
+            && let Some(reclassified) = classify_known_scholarly_url(hop)
+            && !reclassified_ids.iter().any(|existing: &ScholarlyId| {
+                existing.canonical_key() == reclassified.canonical_key()
+            })
+        {
+            reclassified_ids.push(reclassified);
+        }
+    }
+    if let Some((primary, rest)) = reclassified_ids.split_first() {
+        return resolve_work(primary, rest, budget, config).await;
     }
 
-    // 3. ar5iv HTML mirror (`ar5iv.labs.arxiv.org/html/<id>`), rejecting redirects to `/abs/`.
-    if let Some(doc) = try_arxiv_html_endpoint(
-        &format!(
-            "{}/html/{}",
-            config.endpoints.ar5iv.trim_end_matches('/'),
-            id.as_str()
-        ),
-        budget,
-        &mut metadata,
-        &mut failures,
-        "ar5iv",
-    )
-    .await?
+    // Rewrite post-redirect GitHub `/blob/` URLs to `raw.githubusercontent.com` before falling back.
+    let response = if response.final_url != *url
+        && let Some(raw_github) = response.final_url.to_raw_github_url()
+        && initial_raw_github.as_ref() != Some(&raw_github)
     {
-        return Ok(doc);
-    }
+        match budget.get(&raw_github, Some(ACCEPT_WEB_PREFERRED)).await {
+            Ok(raw_resp) if raw_resp.status == HTTP_OK => raw_resp,
+            Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
+            Ok(_) | Err(_) => response,
+        }
+    } else {
+        response
+    };
 
-    // 4. LaTeX source archive (`export.arxiv.org/src/<id>`).
-    if let Some(doc) =
-        try_arxiv_source_endpoint(id, budget, config, &mut metadata, &mut failures).await?
-    {
-        return Ok(doc);
-    }
-
-    // 5. Fallback to canonical arXiv PDF (`arxiv.org/pdf/<id>.pdf`).
-    let pdf_url = HttpUrl::parse(&format!(
-        "{}/pdf/{}.pdf",
-        config.endpoints.arxiv_org.trim_end_matches('/'),
-        id.as_str()
-    ))?;
-    if let Some(doc) =
-        try_arxiv_pdf_endpoint(&pdf_url, budget, &mut metadata, &mut failures).await?
-    {
-        return Ok(doc);
-    }
-
-    if metadata.title.is_some() || metadata.abstract_text.is_some() {
-        metadata.source_url = HttpUrl::parse(&format!(
-            "{}/abs/{}",
-            config.endpoints.arxiv_org.trim_end_matches('/'),
-            id.as_str()
-        ))
-        .ok();
-        return Ok(ExtractedDocument {
-            metadata,
-            payload: ExtractedPayload::MetadataOnly {
-                reason: UnavailableReason::UpstreamUnavailable {
-                    detail: failures.join("; "),
-                },
-            },
-            raw_bytes_fetched: 0,
+    if response.status != HTTP_OK {
+        return Err(AdfontesError::Transport {
+            url: response.final_url.as_str().to_owned(),
+            detail: format!("HTTP {}", response.status),
         });
     }
 
-    Err(AdfontesError::Transport {
-        url: pdf_url.as_str().to_owned(),
-        detail: format!(
-            "all arXiv retrieval endpoints failed ({})",
-            failures.join("; ")
-        ),
-    })
+    dispatch_http_response(response)
+}
+
+async fn resolve_work(
+    caller_id: &ScholarlyId,
+    seed_aliases: &[ScholarlyId],
+    budget: &ResolveBudget<'_>,
+    config: &ResolverConfig,
+) -> Result<ExtractedDocument, AdfontesError> {
+    let initial_url = initial_caller_source_url(caller_id, config);
+    let mut session = WorkResolution::new(caller_id.clone(), initial_url, seed_aliases);
+
+    loop {
+        while let Some(entry) = session.pop_next_frontier() {
+            if budget.is_exhausted() {
+                break;
+            }
+            if let Some(full_text) =
+                expand_frontier_entry(&entry, &mut session, budget, config).await?
+            {
+                return Ok(session.finish_full_text(full_text));
+            }
+        }
+        if let Some(deferred) = session.take_deferred_fallback() {
+            match deferred {
+                DeferredFallback::FullText(full_text) => {
+                    return Ok(session.finish_full_text(full_text));
+                }
+                DeferredFallback::Pdf(pdf) => return Ok(session.finish_pdf(pdf)),
+            }
+        }
+        if budget.is_exhausted() {
+            break;
+        }
+        if let Some(pdf) = try_oa_pdf_pool(&mut session, budget).await? {
+            return Ok(session.finish_pdf(pdf));
+        }
+        if budget.is_exhausted() {
+            break;
+        }
+        match try_oa_landing_pool(&mut session, budget).await? {
+            LandingPoolOutcome::FullText(full_text) => {
+                return Ok(session.finish_full_text(full_text));
+            }
+            LandingPoolOutcome::Pdf(pdf) => return Ok(session.finish_pdf(pdf)),
+            LandingPoolOutcome::DiscoveredAlias => {}
+            LandingPoolOutcome::Exhausted => break,
+        }
+    }
+
+    let fallback_url = fallback_metadata_source_url(caller_id, config);
+    match session.finish_unavailable(fallback_url) {
+        Ok(doc) => Ok(doc),
+        Err(trace) => Err(build_caller_transport_error(
+            caller_id, &trace, budget, config,
+        )),
+    }
+}
+
+async fn expand_frontier_entry(
+    entry: &FrontierEntry,
+    session: &mut WorkResolution,
+    budget: &ResolveBudget<'_>,
+    config: &ResolverConfig,
+) -> Result<Option<ResolvedText>, AdfontesError> {
+    match &entry.id {
+        ScholarlyId::Arxiv(id) => expand_arxiv(id, entry.depth, session, budget, config).await,
+        ScholarlyId::PmcId(pmcid) => {
+            expand_pmcid(pmcid, entry.depth, session, budget, config).await
+        }
+        ScholarlyId::Pmid(pmid) => {
+            expand_pmid(pmid, entry.depth, session, budget, config).await?;
+            Ok(None)
+        }
+        ScholarlyId::Doi(doi) => {
+            expand_doi(doi, entry.depth, session, budget, config).await?;
+            Ok(None)
+        }
+        ScholarlyId::Rfc(rfc) => expand_rfc(*rfc, session, budget, config).await,
+    }
+}
+
+async fn expand_arxiv(
+    id: &ArxivId,
+    depth: u8,
+    session: &mut WorkResolution,
+    budget: &ResolveBudget<'_>,
+    config: &ResolverConfig,
+) -> Result<Option<ResolvedText>, AdfontesError> {
+    let origin = ScholarlyId::Arxiv(id.clone());
+
+    // 1. Metadata & optional journal DOI via Atom API.
+    fetch_arxiv_atom_metadata(id, depth, session, budget, config).await?;
+
+    // 2. Official arXiv LaTeXML HTML (`arxiv.org/html/<id>`).
+    if budget.is_exhausted() {
+        return Ok(None);
+    }
+    let arxiv_html_url = format!(
+        "{}/html/{}",
+        config.endpoints.arxiv_org.trim_end_matches('/'),
+        id.as_str()
+    );
+    if let Some(full_text) = try_arxiv_html_endpoint(
+        &arxiv_html_url,
+        &origin,
+        ENDPOINT_ARXIV_HTML,
+        session,
+        budget,
+    )
+    .await?
+    {
+        return Ok(Some(full_text));
+    }
+
+    // 3. ar5iv HTML mirror (`ar5iv.labs.arxiv.org/html/<id>`).
+    if budget.is_exhausted() {
+        return Ok(None);
+    }
+    let ar5iv_url = format!(
+        "{}/html/{}",
+        config.endpoints.ar5iv.trim_end_matches('/'),
+        id.as_str()
+    );
+    if let Some(full_text) =
+        try_arxiv_html_endpoint(&ar5iv_url, &origin, ENDPOINT_AR5IV, session, budget).await?
+    {
+        return Ok(Some(full_text));
+    }
+
+    // 4. LaTeX source archive (`export.arxiv.org/src/<id>`).
+    if budget.is_exhausted() {
+        return Ok(None);
+    }
+    if let Some(full_text) = try_arxiv_source_endpoint(id, &origin, session, budget, config).await?
+    {
+        return Ok(Some(full_text));
+    }
+
+    Ok(None)
 }
 
 async fn fetch_arxiv_atom_metadata(
     id: &ArxivId,
+    depth: u8,
+    session: &mut WorkResolution,
     budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
-    metadata: &mut WorkMetadata,
-    failures: &mut Vec<String>,
 ) -> Result<(), AdfontesError> {
     let atom_base_url = HttpUrl::parse(&format!(
         "{}/api/query",
@@ -380,58 +476,68 @@ async fn fetch_arxiv_atom_metadata(
             let xml = resp.decode_text();
             match parse_arxiv_atom_feed(&xml) {
                 Ok(entry) => {
-                    metadata.title = entry.title;
-                    metadata.authors = entry.authors;
-                    metadata.year = entry.year;
-                    metadata.abstract_text = entry.abstract_text;
+                    if entry.title.is_some() || entry.abstract_text.is_some() {
+                        session.mark_metadata_seen();
+                    }
+                    session.merge_fields_if_missing(
+                        entry.title,
+                        entry.authors,
+                        entry.year,
+                        entry.abstract_text,
+                    );
+                    if let Some(raw_doi) = entry.doi
+                        && let Ok(alias) = ScholarlyId::parse(&raw_doi)
+                    {
+                        session.enqueue_alias(alias, depth.saturating_add(1));
+                    }
                 }
                 Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-                Err(other) => failures.push(format!("atom: {other}")),
+                Err(other) => {
+                    session.record_endpoint_failure(ENDPOINT_ARXIV_ATOM, other.to_string());
+                }
             }
         }
-        Ok(resp) => failures.push(format!("atom: HTTP {}", resp.status)),
+        Ok(resp) => {
+            session.record_endpoint_failure(ENDPOINT_ARXIV_ATOM, format!("HTTP {}", resp.status));
+        }
         Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-        Err(other) => failures.push(format!("atom: {other}")),
+        Err(other) => session.record_endpoint_failure(ENDPOINT_ARXIV_ATOM, other.to_string()),
     }
     Ok(())
 }
 
 async fn try_arxiv_html_endpoint(
     raw_url: &str,
+    origin: &ScholarlyId,
+    label: &'static str,
+    session: &mut WorkResolution,
     budget: &ResolveBudget<'_>,
-    metadata: &mut WorkMetadata,
-    failures: &mut Vec<String>,
-    label: &str,
-) -> Result<Option<ExtractedDocument>, AdfontesError> {
+) -> Result<Option<ResolvedText>, AdfontesError> {
     let url = HttpUrl::parse(raw_url)?;
     match budget.get(&url, Some(ACCEPT_HTML)).await {
         Ok(resp) if resp.status == HTTP_OK => match extract_arxiv_html_response(resp) {
             Ok(extracted) => {
-                if metadata.title.is_none() {
-                    metadata.title = extracted.title;
-                }
-                metadata.source_url = Some(extracted.source_url);
-                Ok(Some(ExtractedDocument {
-                    metadata: metadata.clone(),
-                    payload: ExtractedPayload::FullText {
-                        format: TextFormat::Html,
-                        markdown: extracted.markdown,
-                    },
+                session.merge_fields_if_missing(extracted.title, Vec::new(), None, None);
+                Ok(Some(ResolvedText {
+                    origin: origin.clone(),
+                    format: TextFormat::Html,
+                    markdown: extracted.markdown,
+                    source_url: extracted.source_url,
                     raw_bytes_fetched: extracted.raw_bytes_fetched,
                 }))
             }
             Err(reason) => {
-                failures.push(format!("{label}: {reason}"));
+                session.record_endpoint_failure(label, reason);
                 Ok(None)
             }
         },
         Ok(resp) => {
-            failures.push(format!("{label}: HTTP {}", resp.status));
+            session.record_endpoint_failure(label, format!("HTTP {}", resp.status));
             Ok(None)
         }
         Err(safety @ AdfontesError::SafetyBlock { .. }) => Err(safety),
         Err(other) => {
-            failures.push(format!("{label}: {other}"));
+            session.record_endpoint_failure(label, other.to_string());
             Ok(None)
         }
     }
@@ -439,210 +545,195 @@ async fn try_arxiv_html_endpoint(
 
 async fn try_arxiv_source_endpoint(
     id: &ArxivId,
+    origin: &ScholarlyId,
+    session: &mut WorkResolution,
     budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
-    metadata: &mut WorkMetadata,
-    failures: &mut Vec<String>,
-) -> Result<Option<ExtractedDocument>, AdfontesError> {
+) -> Result<Option<ResolvedText>, AdfontesError> {
     let src_url = HttpUrl::parse(&format!(
         "{}/src/{}",
         config.endpoints.export_arxiv_org.trim_end_matches('/'),
         id.as_str()
     ))?;
+    let mut cached_pdf = false;
     match budget.get(&src_url, None).await {
         Ok(resp) if resp.status == HTTP_OK => {
             if is_pdf_response(&resp) {
-                let byte_len = resp.body.len();
-                metadata.source_url = Some(resp.final_url);
-                return Ok(Some(ExtractedDocument {
-                    metadata: metadata.clone(),
-                    payload: ExtractedPayload::Pdf { bytes: resp.body },
-                    raw_bytes_fetched: byte_len,
+                let raw_bytes_fetched = resp.body.len();
+                session.record_endpoint_failure(ENDPOINT_ARXIV_SRC, "PDF-only archive");
+                session.record_deferred_fallback(DeferredFallback::Pdf(ResolvedPdf {
+                    origin: origin.clone(),
+                    bytes: resp.body,
+                    source_url: resp.final_url,
+                    raw_bytes_fetched,
                 }));
-            }
-            match extract_arxiv_source_archive(&resp.body) {
-                Ok(extracted) if extracted.markdown.len() >= MIN_FULLTEXT_CHARS => {
-                    if metadata.title.is_none() {
-                        metadata.title = extracted.title;
-                    }
-                    metadata.source_url = Some(resp.final_url);
-                    Ok(Some(ExtractedDocument {
-                        metadata: metadata.clone(),
-                        payload: ExtractedPayload::FullText {
+                cached_pdf = true;
+            } else {
+                match extract_arxiv_source_archive(&resp.body) {
+                    Ok(extracted) if extracted.markdown.len() >= MIN_FULLTEXT_CHARS => {
+                        session.merge_fields_if_missing(extracted.title, Vec::new(), None, None);
+                        return Ok(Some(ResolvedText {
+                            origin: origin.clone(),
                             format: TextFormat::Latex,
                             markdown: extracted.markdown,
-                        },
-                        raw_bytes_fetched: resp.body.len(),
-                    }))
-                }
-                Ok(_) => {
-                    failures.push("src: extracted TeX was too short".to_owned());
-                    Ok(None)
-                }
-                Err(safety @ AdfontesError::SafetyBlock { .. }) => Err(safety),
-                Err(other) => {
-                    failures.push(format!("src: {other}"));
-                    Ok(None)
+                            source_url: resp.final_url,
+                            raw_bytes_fetched: resp.body.len(),
+                        }));
+                    }
+                    Ok(_) => session
+                        .record_endpoint_failure(ENDPOINT_ARXIV_SRC, "extracted TeX was too short"),
+                    Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
+                    Err(other) => {
+                        session.record_endpoint_failure(ENDPOINT_ARXIV_SRC, other.to_string());
+                    }
                 }
             }
         }
         Ok(resp) => {
-            failures.push(format!("src: HTTP {}", resp.status));
-            Ok(None)
+            session.record_endpoint_failure(ENDPOINT_ARXIV_SRC, format!("HTTP {}", resp.status));
         }
-        Err(safety @ AdfontesError::SafetyBlock { .. }) => Err(safety),
-        Err(other) => {
-            failures.push(format!("src: {other}"));
-            Ok(None)
-        }
+        Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
+        Err(other) => session.record_endpoint_failure(ENDPOINT_ARXIV_SRC, other.to_string()),
     }
+
+    if !cached_pdf {
+        let pdf_url = HttpUrl::parse(&format!(
+            "{}/pdf/{}.pdf",
+            config.endpoints.arxiv_org.trim_end_matches('/'),
+            id.as_str()
+        ))?;
+        session.push_priority_pdf(pdf_url, origin.clone());
+    }
+    Ok(None)
 }
 
-async fn try_arxiv_pdf_endpoint(
-    pdf_url: &HttpUrl,
-    budget: &ResolveBudget<'_>,
-    metadata: &mut WorkMetadata,
-    failures: &mut Vec<String>,
-) -> Result<Option<ExtractedDocument>, AdfontesError> {
-    match budget.get(pdf_url, Some(ACCEPT_PDF)).await {
-        Ok(resp) if resp.status == HTTP_OK && is_pdf_response(&resp) => {
-            let byte_len = resp.body.len();
-            metadata.source_url = Some(resp.final_url);
-            Ok(Some(ExtractedDocument {
-                metadata: metadata.clone(),
-                payload: ExtractedPayload::Pdf { bytes: resp.body },
-                raw_bytes_fetched: byte_len,
-            }))
-        }
-        Ok(resp) => {
-            failures.push(format!("pdf: HTTP {}", resp.status));
-            Ok(None)
-        }
-        Err(safety @ AdfontesError::SafetyBlock { .. }) => Err(safety),
-        Err(other) => {
-            failures.push(format!("pdf: {other}"));
-            Ok(None)
-        }
-    }
-}
-
-async fn resolve_pmid(
-    pmid: &Pmid,
+async fn expand_pmcid(
+    pmcid: &PmcId,
+    depth: u8,
+    session: &mut WorkResolution,
     budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
+) -> Result<Option<ResolvedText>, AdfontesError> {
+    let origin = ScholarlyId::PmcId(pmcid.clone());
+    let base = config.endpoints.europe_pmc.trim_end_matches('/');
+    let search_url = HttpUrl::parse(&format!(
+        "{base}/webservices/rest/search?query=PMCID:{}&format=json&resultType=core",
+        pmcid.as_str()
+    ))?;
+
+    if let Some(search_doc) = fetch_optional_json(&search_url, ACCEPT_JSON, budget).await? {
+        let mut metadata = WorkMetadata::default();
+        let mut discovery = ProviderDiscovery::default();
+        if search_doc.extract_europe_pmc_record(&mut metadata, &mut discovery) {
+            session.mark_metadata_seen();
+            session.mark_europe_pmc_core_fetched();
+            session.merge_metadata(metadata);
+            session.ingest_discovery(discovery, &origin, depth);
+        }
+    }
+
+    if budget.is_exhausted() {
+        return Ok(None);
+    }
+    let xml_url = HttpUrl::parse(&format!(
+        "{base}/webservices/rest/{}/fullTextXML",
+        pmcid.as_str()
+    ))?;
+    match budget.get(&xml_url, Some(ACCEPT_XML)).await {
+        Ok(resp) if resp.status == HTTP_OK => {
+            let xml = resp.decode_text();
+            match extract_jats_xml(&xml) {
+                Ok(JatsExtraction::FullText {
+                    title,
+                    authors,
+                    year,
+                    abstract_text,
+                    markdown,
+                }) => {
+                    session.mark_metadata_seen();
+                    session.merge_fields_if_missing(title, authors, year, abstract_text);
+                    return Ok(Some(ResolvedText {
+                        origin,
+                        format: TextFormat::JatsXml,
+                        markdown,
+                        source_url: resp.final_url,
+                        raw_bytes_fetched: resp.body.len(),
+                    }));
+                }
+                Ok(JatsExtraction::BodyRestricted {
+                    title,
+                    authors,
+                    year,
+                    abstract_text,
+                }) => {
+                    session.mark_metadata_seen();
+                    session.mark_body_restricted();
+                    session.merge_fields_if_missing(title, authors, year, abstract_text);
+                    session.set_source_url_if_caller_depth(depth, resp.final_url);
+                    session.record_endpoint_failure(ENDPOINT_EPMC_XML, "body restricted");
+                }
+                Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
+                Err(other) => session.record_endpoint_failure(ENDPOINT_EPMC_XML, other.to_string()),
+            }
+        }
+        Ok(resp) => {
+            session.record_endpoint_failure(ENDPOINT_EPMC_XML, format!("HTTP {}", resp.status));
+        }
+        Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
+        Err(other) => session.record_endpoint_failure(ENDPOINT_EPMC_XML, other.to_string()),
+    }
+    Ok(None)
+}
+
+async fn expand_pmid(
+    pmid: &Pmid,
     depth: u8,
-    visited: &mut BTreeSet<ScholarlyIdKey>,
-) -> Result<ExtractedDocument, AdfontesError> {
+    session: &mut WorkResolution,
+    budget: &ResolveBudget<'_>,
+    config: &ResolverConfig,
+) -> Result<(), AdfontesError> {
+    if depth > 0 && session.has_europe_pmc_core() {
+        return Ok(());
+    }
+    let origin = ScholarlyId::Pmid(pmid.clone());
     let base = config.endpoints.europe_pmc.trim_end_matches('/');
     let search_url = HttpUrl::parse(&format!(
         "{base}/webservices/rest/search?query=EXT_ID:{}%20AND%20SRC:MED&format=json&resultType=core",
         pmid.as_str()
     ))?;
-    let mut metadata = WorkMetadata {
-        canonical_id: Some(format!("PMID:{}", pmid.as_str())),
-        venue_or_source: Some("PubMed".to_owned()),
-        source_url: HttpUrl::parse(&format!(
-            "https://pubmed.ncbi.nlm.nih.gov/{}/",
-            pmid.as_str()
-        ))
-        .ok(),
-        ..WorkMetadata::default()
-    };
-    let mut oa_pdf_urls = Vec::new();
 
     let Some(search_doc) = fetch_optional_json(&search_url, ACCEPT_JSON, budget).await? else {
-        return Err(AdfontesError::Transport {
-            url: search_url.as_str().to_owned(),
-            detail: budget.append_last_transport_error("Europe PMC PMID lookup failed"),
-        });
+        return Ok(());
     };
-    let Some(ids) = search_doc.extract_europe_pmc_record(&mut metadata, &mut oa_pdf_urls) else {
-        return Err(AdfontesError::Transport {
-            url: search_url.as_str().to_owned(),
-            detail: format!("PMID {} not found in Europe PMC", pmid.as_str()),
-        });
-    };
-
-    let mut saw_body_restricted = false;
-
-    if let Some(pmcid) = ids.pmcid
-        && visited.insert(ScholarlyId::PmcId(pmcid.clone()).canonical_key())
-    {
-        match resolve_pmcid(&pmcid, budget, config).await {
-            Ok(pmc_doc) if !matches!(pmc_doc.payload, ExtractedPayload::MetadataOnly { .. }) => {
-                return Ok(merge_caller_priority_metadata(pmc_doc, metadata));
-            }
-            Ok(pmc_doc) => {
-                saw_body_restricted |= is_body_restricted_doc(&pmc_doc);
-                merge_missing_metadata(&mut metadata, pmc_doc.metadata);
-            }
-            Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-            Err(_) => {}
-        }
+    let mut metadata = WorkMetadata::default();
+    let mut discovery = ProviderDiscovery::default();
+    if search_doc.extract_europe_pmc_record(&mut metadata, &mut discovery) {
+        session.mark_metadata_seen();
+        session.mark_europe_pmc_core_fetched();
+        session.merge_metadata(metadata);
+        session.ingest_discovery(discovery, &origin, depth);
+    } else if depth == 0 {
+        session.record_endpoint_failure(
+            ENDPOINT_EPMC_PMID,
+            format!("PMID {} not found in Europe PMC", pmid.as_str()),
+        );
     }
-
-    if depth < MAX_RECLASSIFICATION_DEPTH
-        && !budget.is_exhausted()
-        && let Some(follow_up) = ids.follow_up_target
-        && !visited.contains(&follow_up.canonical_key())
-    {
-        let follow_up_target = ParsedTarget::Scholarly(follow_up);
-        match Box::pin(resolve_target_inner(
-            &follow_up_target,
-            budget,
-            config,
-            depth + 1,
-            visited,
-        ))
-        .await
-        {
-            Ok(doc) if !matches!(doc.payload, ExtractedPayload::MetadataOnly { .. }) => {
-                return Ok(merge_caller_priority_metadata(doc, metadata));
-            }
-            Ok(doc) => {
-                saw_body_restricted |= is_body_restricted_doc(&doc);
-                merge_missing_metadata(&mut metadata, doc.metadata);
-            }
-            Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-            Err(_) => {}
-        }
-    }
-
-    if let Some(pdf_doc) = try_oa_pdf_urls(&oa_pdf_urls, &mut metadata, budget).await? {
-        return Ok(pdf_doc);
-    }
-
-    let reason = if saw_body_restricted {
-        UnavailableReason::BodyRestricted
-    } else {
-        UnavailableReason::NoOpenAccessCopy
-    };
-    Ok(ExtractedDocument {
-        metadata,
-        payload: ExtractedPayload::MetadataOnly { reason },
-        raw_bytes_fetched: 0,
-    })
+    Ok(())
 }
 
-async fn resolve_doi(
+async fn expand_doi(
     doi: &Doi,
+    depth: u8,
+    session: &mut WorkResolution,
     budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
-    depth: u8,
-    visited: &mut BTreeSet<ScholarlyIdKey>,
-) -> Result<ExtractedDocument, AdfontesError> {
+) -> Result<(), AdfontesError> {
+    let origin = ScholarlyId::Doi(doi.clone());
     let encoded_doi = doi.percent_encoded_path();
     let doi_canonical_url = HttpUrl::parse(&format!(
         "{}/{encoded_doi}",
         config.endpoints.doi_org.trim_end_matches('/')
     ))?;
-    let mut metadata = WorkMetadata {
-        canonical_id: Some(doi.as_str().to_owned()),
-        source_url: Some(doi_canonical_url.clone()),
-        ..WorkMetadata::default()
-    };
-    let mut oa_candidates = OaCandidates::default();
-
     let openalex_url = build_openalex_doi_url(config, &encoded_doi)?;
     let unpaywall_url = config
         .usable_contact_email()
@@ -667,379 +758,54 @@ async fn resolve_doi(
             }
         },
     )?;
-    let metadata_found = csl_opt.is_some() || oa_opt.is_some() || upw_opt.is_some();
 
-    // 1. CSL-JSON content negotiation via `doi.org`.
+    if csl_opt.is_none() && oa_opt.is_none() && upw_opt.is_none() {
+        return Ok(());
+    }
+    session.mark_metadata_seen();
+
+    let mut metadata = WorkMetadata::default();
+    let mut discovery = ProviderDiscovery::default();
     if let Some(csl) = csl_opt {
         csl.merge_csl_work(&mut metadata);
     }
-
-    // 2. OpenAlex work record (authors, venue, inverted-index abstract, PMCID, OA locations).
     if let Some(oa_work) = oa_opt {
-        oa_work.merge_openalex_work(&mut metadata, &mut oa_candidates);
+        oa_work.merge_openalex_work(&mut metadata, &mut discovery);
     }
-
-    // 3. Optional Unpaywall OA lookup when a real non-placeholder contact email is configured.
     if let Some(upw_work) = upw_opt {
-        upw_work.merge_unpaywall_work(&mut metadata, &mut oa_candidates);
+        upw_work.merge_unpaywall_work(&mut metadata, &mut discovery);
     }
 
-    let mut saw_body_restricted = false;
-
-    // 4. Structured full-text preference: discovered PMCID -> Europe PMC JATS XML.
-    if let Some(pmcid) = oa_candidates.pmcid()
-        && visited.insert(ScholarlyId::PmcId(pmcid.clone()).canonical_key())
-    {
-        match resolve_pmcid(pmcid, budget, config).await {
-            Ok(pmc_doc) if !matches!(pmc_doc.payload, ExtractedPayload::MetadataOnly { .. }) => {
-                return Ok(merge_caller_priority_metadata(pmc_doc, metadata));
-            }
-            Ok(pmc_doc) => {
-                saw_body_restricted |= is_body_restricted_doc(&pmc_doc);
-                merge_missing_metadata(&mut metadata, pmc_doc.metadata);
-            }
-            Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-            Err(_) => {}
-        }
-    }
-
-    // 5. Try scholarly repository landing URLs (`arXiv` / `PMCID`), then verified OA PDFs, then OA HTML.
-    if let Some(doc) = try_oa_candidates(
-        &oa_candidates,
-        &mut metadata,
-        budget,
-        config,
-        depth,
-        visited,
-        &mut saw_body_restricted,
-    )
-    .await?
-    {
-        return Ok(doc);
-    }
-
-    if metadata_found {
-        let reason = if saw_body_restricted {
-            UnavailableReason::BodyRestricted
-        } else {
-            UnavailableReason::NoOpenAccessCopy
-        };
-        return Ok(ExtractedDocument {
-            metadata,
-            payload: ExtractedPayload::MetadataOnly { reason },
-            raw_bytes_fetched: 0,
-        });
-    }
-
-    Err(AdfontesError::Transport {
-        url: doi_canonical_url.as_str().to_owned(),
-        detail: budget
-            .append_last_transport_error("DOI resolution failed across doi.org and OpenAlex"),
-    })
+    session.merge_metadata(metadata);
+    session.ingest_discovery(discovery, &origin, depth);
+    Ok(())
 }
 
-async fn try_oa_candidates(
-    candidates: &OaCandidates,
-    metadata: &mut WorkMetadata,
-    budget: &ResolveBudget<'_>,
-    config: &ResolverConfig,
-    depth: u8,
-    visited: &mut BTreeSet<ScholarlyIdKey>,
-    saw_body_restricted: &mut bool,
-) -> Result<Option<ExtractedDocument>, AdfontesError> {
-    // 1. Prefer OA landing links that point directly to arXiv or PMC structured repositories.
-    if depth < MAX_RECLASSIFICATION_DEPTH {
-        let mut attempted_targets = 0usize;
-        for landing in candidates.landing_urls() {
-            if attempted_targets >= MAX_OA_CANDIDATES || budget.is_exhausted() {
-                break;
-            }
-            if let Some(id @ (ScholarlyId::Arxiv(_) | ScholarlyId::PmcId(_))) =
-                classify_known_scholarly_url(landing)
-            {
-                let key = id.canonical_key();
-                if visited.contains(&key) {
-                    continue;
-                }
-                attempted_targets += 1;
-                let target = ParsedTarget::Scholarly(id);
-                match Box::pin(resolve_target_inner(
-                    &target,
-                    budget,
-                    config,
-                    depth + 1,
-                    visited,
-                ))
-                .await
-                {
-                    Ok(doc) if !matches!(doc.payload, ExtractedPayload::MetadataOnly { .. }) => {
-                        return Ok(Some(merge_caller_priority_metadata(doc, metadata.clone())));
-                    }
-                    Ok(doc) => {
-                        *saw_body_restricted |= is_body_restricted_doc(&doc);
-                        merge_missing_metadata(metadata, doc.metadata);
-                    }
-                    Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-                    Err(_) => {}
-                }
-            }
-        }
-    }
-
-    // 2. Try OA PDF URLs while verifying real PDF MIME/magic (rejecting HTML paywall pages).
-    if let Some(pdf_doc) = try_oa_pdf_urls(candidates.pdf_urls(), metadata, budget).await? {
-        return Ok(Some(pdf_doc));
-    }
-
-    // 3. Try OA landing pages only when they yield PDF, Markdown, or substantive non-paywall HTML.
-    try_oa_landing_pages(
-        candidates.landing_urls(),
-        metadata,
-        budget,
-        config,
-        depth,
-        visited,
-        saw_body_restricted,
-    )
-    .await
-}
-
-async fn try_oa_landing_pages(
-    landing_urls: &[HttpUrl],
-    metadata: &mut WorkMetadata,
-    budget: &ResolveBudget<'_>,
-    config: &ResolverConfig,
-    depth: u8,
-    visited: &mut BTreeSet<ScholarlyIdKey>,
-    saw_body_restricted: &mut bool,
-) -> Result<Option<ExtractedDocument>, AdfontesError> {
-    for landing_url in landing_urls.iter().take(MAX_OA_CANDIDATES) {
-        if budget.is_exhausted() {
-            break;
-        }
-        match budget.get(landing_url, Some(ACCEPT_WEB_PREFERRED)).await {
-            Ok(resp) => {
-                if depth < MAX_RECLASSIFICATION_DEPTH
-                    && let Some(id @ (ScholarlyId::Arxiv(_) | ScholarlyId::PmcId(_))) =
-                        classify_known_scholarly_url(&resp.final_url)
-                    && !visited.contains(&id.canonical_key())
-                {
-                    let target = ParsedTarget::Scholarly(id);
-                    match Box::pin(resolve_target_inner(
-                        &target,
-                        budget,
-                        config,
-                        depth + 1,
-                        visited,
-                    ))
-                    .await
-                    {
-                        Ok(doc)
-                            if !matches!(doc.payload, ExtractedPayload::MetadataOnly { .. }) =>
-                        {
-                            return Ok(Some(merge_caller_priority_metadata(doc, metadata.clone())));
-                        }
-                        Ok(doc) => {
-                            *saw_body_restricted |= is_body_restricted_doc(&doc);
-                            merge_missing_metadata(metadata, doc.metadata);
-                            continue;
-                        }
-                        Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-                        Err(_) => continue,
-                    }
-                }
-                if resp.status != HTTP_OK || is_arxiv_abs_url(&resp.final_url) {
-                    continue;
-                }
-                match extract_oa_landing_response(resp) {
-                    Some(LandingExtraction::Pdf {
-                        bytes,
-                        source_url,
-                        raw_bytes_fetched,
-                    }) => {
-                        metadata.source_url = Some(source_url);
-                        return Ok(Some(ExtractedDocument {
-                            metadata: metadata.clone(),
-                            payload: ExtractedPayload::Pdf { bytes },
-                            raw_bytes_fetched,
-                        }));
-                    }
-                    Some(LandingExtraction::FullText {
-                        format,
-                        title,
-                        markdown,
-                        source_url,
-                        raw_bytes_fetched,
-                    }) => {
-                        if metadata.title.is_none() {
-                            metadata.title = title;
-                        }
-                        metadata.source_url = Some(source_url);
-                        return Ok(Some(ExtractedDocument {
-                            metadata: metadata.clone(),
-                            payload: ExtractedPayload::FullText { format, markdown },
-                            raw_bytes_fetched,
-                        }));
-                    }
-                    None => {}
-                }
-            }
-            Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-            Err(_) => {}
-        }
-    }
-    Ok(None)
-}
-
-async fn resolve_pmcid(
-    pmcid: &PmcId,
-    budget: &ResolveBudget<'_>,
-    config: &ResolverConfig,
-) -> Result<ExtractedDocument, AdfontesError> {
-    let base = config.endpoints.europe_pmc.trim_end_matches('/');
-    let search_url = HttpUrl::parse(&format!(
-        "{base}/webservices/rest/search?query=PMCID:{}&format=json&resultType=core",
-        pmcid.as_str()
-    ))?;
-    let mut metadata = WorkMetadata {
-        canonical_id: Some(pmcid.as_str().to_owned()),
-        venue_or_source: Some("Europe PMC".to_owned()),
-        ..WorkMetadata::default()
-    };
-    let mut oa_pdf_urls = Vec::new();
-
-    let mut saw_metadata = if let Some(search_doc) =
-        fetch_optional_json(&search_url, ACCEPT_JSON, budget).await?
-        && search_doc
-            .extract_europe_pmc_record(&mut metadata, &mut oa_pdf_urls)
-            .is_some()
-    {
-        true
-    } else {
-        false
-    };
-
-    let xml_url = HttpUrl::parse(&format!(
-        "{base}/webservices/rest/{}/fullTextXML",
-        pmcid.as_str()
-    ))?;
-    let mut body_restricted = false;
-    match budget.get(&xml_url, Some(ACCEPT_XML)).await {
-        Ok(resp) if resp.status == HTTP_OK => {
-            let xml = resp.decode_text();
-            match extract_jats_xml(&xml) {
-                Ok(JatsExtraction::FullText {
-                    title,
-                    authors,
-                    year,
-                    abstract_text,
-                    markdown,
-                }) => {
-                    fill_metadata_if_missing(&mut metadata, title, authors, year, abstract_text);
-                    metadata.source_url = Some(resp.final_url);
-                    return Ok(ExtractedDocument {
-                        metadata,
-                        payload: ExtractedPayload::FullText {
-                            format: TextFormat::JatsXml,
-                            markdown,
-                        },
-                        raw_bytes_fetched: resp.body.len(),
-                    });
-                }
-                Ok(JatsExtraction::BodyRestricted {
-                    title,
-                    authors,
-                    year,
-                    abstract_text,
-                }) => {
-                    fill_metadata_if_missing(&mut metadata, title, authors, year, abstract_text);
-                    metadata.source_url = Some(resp.final_url);
-                    saw_metadata = true;
-                    body_restricted = true;
-                }
-                Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-                Err(_) => {}
-            }
-        }
-        Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-        Ok(_) | Err(_) => {}
-    }
-
-    if let Some(pdf_doc) = try_oa_pdf_urls(&oa_pdf_urls, &mut metadata, budget).await? {
-        return Ok(pdf_doc);
-    }
-
-    if saw_metadata {
-        let reason = if body_restricted {
-            UnavailableReason::BodyRestricted
-        } else {
-            UnavailableReason::NoOpenAccessCopy
-        };
-        return Ok(ExtractedDocument {
-            metadata,
-            payload: ExtractedPayload::MetadataOnly { reason },
-            raw_bytes_fetched: 0,
-        });
-    }
-
-    Err(AdfontesError::Transport {
-        url: xml_url.as_str().to_owned(),
-        detail: budget
-            .append_last_transport_error("Europe PMC returned neither metadata nor fullTextXML"),
-    })
-}
-
-async fn try_oa_pdf_urls(
-    pdf_urls: &[HttpUrl],
-    metadata: &mut WorkMetadata,
-    budget: &ResolveBudget<'_>,
-) -> Result<Option<ExtractedDocument>, AdfontesError> {
-    for pdf_url in pdf_urls.iter().take(MAX_OA_CANDIDATES) {
-        if budget.is_exhausted() {
-            break;
-        }
-        match budget.get(pdf_url, Some(ACCEPT_PDF)).await {
-            Ok(resp) if resp.status == HTTP_OK && is_pdf_response(&resp) => {
-                let byte_len = resp.body.len();
-                metadata.source_url = Some(resp.final_url);
-                return Ok(Some(ExtractedDocument {
-                    metadata: metadata.clone(),
-                    payload: ExtractedPayload::Pdf { bytes: resp.body },
-                    raw_bytes_fetched: byte_len,
-                }));
-            }
-            Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-            Ok(_) | Err(_) => {}
-        }
-    }
-    Ok(None)
-}
-
-async fn resolve_rfc(
+async fn expand_rfc(
     rfc: RfcNumber,
+    session: &mut WorkResolution,
     budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
-) -> Result<ExtractedDocument, AdfontesError> {
+) -> Result<Option<ResolvedText>, AdfontesError> {
+    let origin = ScholarlyId::Rfc(rfc);
     let rfc_number = rfc.get();
-    let mut metadata = WorkMetadata {
-        canonical_id: Some(rfc.to_string()),
-        venue_or_source: Some("IETF".to_owned()),
-        ..WorkMetadata::default()
-    };
 
     // 1. IETF Datatracker metadata & obsoleted-by / updated-by status notes.
     let tracker_url = HttpUrl::parse(&format!(
         "{}/doc/rfc{rfc_number}/doc.json",
         config.endpoints.ietf_datatracker.trim_end_matches('/')
     ))?;
-    let saw_metadata = fetch_optional_json(&tracker_url, ACCEPT_JSON, budget)
-        .await?
-        .is_some_and(|doc_meta| {
-            doc_meta.merge_ietf_doc(&mut metadata);
-            true
-        });
+    if let Some(doc_meta) = fetch_optional_json(&tracker_url, ACCEPT_JSON, budget).await? {
+        let mut metadata = WorkMetadata::default();
+        doc_meta.merge_ietf_doc(&mut metadata);
+        session.mark_metadata_seen();
+        session.merge_metadata(metadata);
+    }
 
     // 2. Structured RFCXML v3 (`rfc<N>.xml`).
+    if budget.is_exhausted() {
+        return Ok(None);
+    }
     let xml_url = HttpUrl::parse(&format!(
         "{}/rfc/rfc{rfc_number}.xml",
         config.endpoints.rfc_editor.trim_end_matches('/')
@@ -1049,147 +815,212 @@ async fn resolve_rfc(
             let xml = resp.decode_text();
             match extract_rfc_xml(&xml) {
                 Ok(extracted) if !extracted.markdown.is_empty() => {
-                    if metadata.title.is_none() {
-                        metadata.title = extracted.title;
-                    }
-                    metadata.source_url = Some(resp.final_url);
-                    return Ok(ExtractedDocument {
-                        metadata,
-                        payload: ExtractedPayload::FullText {
-                            format: TextFormat::RfcXml,
-                            markdown: extracted.markdown,
-                        },
+                    session.merge_fields_if_missing(extracted.title, Vec::new(), None, None);
+                    return Ok(Some(ResolvedText {
+                        origin,
+                        format: TextFormat::RfcXml,
+                        markdown: extracted.markdown,
+                        source_url: resp.final_url,
                         raw_bytes_fetched: resp.body.len(),
-                    });
+                    }));
                 }
                 Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-                Ok(_) | Err(_) => {}
+                Ok(_) => session.record_endpoint_failure(ENDPOINT_RFC_XML, "empty RFCXML body"),
+                Err(other) => session.record_endpoint_failure(ENDPOINT_RFC_XML, other.to_string()),
             }
         }
+        Ok(resp) => {
+            session.record_endpoint_failure(ENDPOINT_RFC_XML, format!("HTTP {}", resp.status));
+        }
         Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-        Ok(_) | Err(_) => {}
+        Err(other) => session.record_endpoint_failure(ENDPOINT_RFC_XML, other.to_string()),
     }
 
     // 3. Paginated plain-text RFC (`rfc<N>.txt`) with `\x0c` stripping and MIME check.
+    if budget.is_exhausted() {
+        return Ok(None);
+    }
     let txt_url = HttpUrl::parse(&format!(
         "{}/rfc/rfc{rfc_number}.txt",
         config.endpoints.rfc_editor.trim_end_matches('/')
     ))?;
-    let txt_failure_detail = match budget.get(&txt_url, Some(MIME_PLAIN_TEXT)).await {
+    match budget.get(&txt_url, Some(MIME_PLAIN_TEXT)).await {
         Ok(resp) if resp.status == HTTP_OK => {
             let mime = resp.mime_type();
             if is_plain_text_mime(&mime) || mime.is_empty() {
                 let extracted = clean_rfc_text(&resp.decode_text());
-                if metadata.title.is_none() {
-                    metadata.title = extracted.title;
-                }
-                metadata.source_url = Some(resp.final_url);
-                return Ok(ExtractedDocument {
-                    metadata,
-                    payload: ExtractedPayload::FullText {
-                        format: TextFormat::RfcText,
-                        markdown: extracted.markdown,
-                    },
+                session.merge_fields_if_missing(extracted.title, Vec::new(), None, None);
+                return Ok(Some(ResolvedText {
+                    origin,
+                    format: TextFormat::RfcText,
+                    markdown: extracted.markdown,
+                    source_url: resp.final_url,
                     raw_bytes_fetched: resp.body.len(),
-                });
+                }));
             }
-            format!("RFC text endpoint returned unexpected MIME `{mime}`")
+            session.record_endpoint_failure(
+                ENDPOINT_RFC_TXT,
+                format!("RFC text endpoint returned unexpected MIME `{mime}`"),
+            );
         }
-        Ok(resp) => format!("RFC text endpoint returned HTTP {}", resp.status),
+        Ok(resp) => session.record_endpoint_failure(
+            ENDPOINT_RFC_TXT,
+            format!("RFC text endpoint returned HTTP {}", resp.status),
+        ),
         Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-        Err(other) => format!("RFC text endpoint failed: {other}"),
-    };
-
-    if saw_metadata {
-        metadata.source_url = HttpUrl::parse(&format!(
-            "{}/doc/rfc{rfc_number}/",
-            config.endpoints.ietf_datatracker.trim_end_matches('/')
-        ))
-        .ok();
-        return Ok(ExtractedDocument {
-            metadata,
-            payload: ExtractedPayload::MetadataOnly {
-                reason: UnavailableReason::UpstreamUnavailable {
-                    detail: txt_failure_detail,
-                },
-            },
-            raw_bytes_fetched: 0,
-        });
+        Err(other) => session.record_endpoint_failure(
+            ENDPOINT_RFC_TXT,
+            format!("RFC text endpoint failed: {other}"),
+        ),
     }
-
-    Err(AdfontesError::Transport {
-        url: txt_url.as_str().to_owned(),
-        detail: txt_failure_detail,
-    })
+    Ok(None)
 }
 
-async fn resolve_url(
-    url: &HttpUrl,
+async fn try_oa_pdf_pool(
+    session: &mut WorkResolution,
     budget: &ResolveBudget<'_>,
-    config: &ResolverConfig,
-    depth: u8,
-    visited: &mut BTreeSet<ScholarlyIdKey>,
-) -> Result<ExtractedDocument, AdfontesError> {
-    budget.client.validate_url_policy(url)?;
-    let initial_raw_github = url.to_raw_github_url();
-    let response = if let Some(ref raw_github) = initial_raw_github {
-        match budget.get(raw_github, Some(ACCEPT_WEB_PREFERRED)).await {
-            Ok(resp) if resp.status == HTTP_OK => resp,
+) -> Result<Option<ResolvedPdf>, AdfontesError> {
+    while !budget.is_exhausted()
+        && let Some(candidate) = session.pop_next_pdf()
+    {
+        match budget.get(&candidate.url, Some(ACCEPT_PDF)).await {
+            Ok(resp) if resp.status == HTTP_OK && is_pdf_response(&resp) => {
+                let raw_bytes_fetched = resp.body.len();
+                return Ok(Some(ResolvedPdf {
+                    origin: candidate.origin,
+                    bytes: resp.body,
+                    source_url: resp.final_url,
+                    raw_bytes_fetched,
+                }));
+            }
+            Ok(resp) if resp.status == HTTP_OK => {
+                session.record_endpoint_failure(ENDPOINT_OA_PDF, "not a PDF");
+            }
+            Ok(resp) => {
+                session.record_endpoint_failure(ENDPOINT_OA_PDF, format!("HTTP {}", resp.status));
+            }
             Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-            _ => budget.get(url, Some(ACCEPT_WEB_PREFERRED)).await?,
+            Err(other) => session.record_endpoint_failure(ENDPOINT_OA_PDF, other.to_string()),
         }
-    } else {
-        budget.get(url, Some(ACCEPT_WEB_PREFERRED)).await?
-    };
+    }
+    Ok(None)
+}
 
-    // Reclassify intermediate and final post-redirect scholarly URLs BEFORE rejecting non-200
-    // statuses (e.g., grounding redirect -> doi.org -> 403 publisher, or -> arxiv.org/html 404).
-    if depth < MAX_RECLASSIFICATION_DEPTH {
-        for hop in response
-            .redirect_chain
-            .iter()
-            .chain(std::iter::once(&response.final_url))
-        {
-            if hop != url
-                && let Some(reclassified) = classify_known_scholarly_url(hop)
-                && !visited.contains(&reclassified.canonical_key())
-            {
-                let target = ParsedTarget::Scholarly(reclassified);
-                return Box::pin(resolve_target_inner(
-                    &target,
-                    budget,
-                    config,
-                    depth + 1,
-                    visited,
-                ))
-                .await;
+enum LandingPoolOutcome {
+    FullText(ResolvedText),
+    Pdf(ResolvedPdf),
+    DiscoveredAlias,
+    Exhausted,
+}
+
+async fn try_oa_landing_pool(
+    session: &mut WorkResolution,
+    budget: &ResolveBudget<'_>,
+) -> Result<LandingPoolOutcome, AdfontesError> {
+    while !budget.is_exhausted()
+        && let Some(candidate) = session.pop_next_landing()
+    {
+        match budget.get(&candidate.url, Some(ACCEPT_WEB_PREFERRED)).await {
+            Ok(resp) => {
+                if let Some(outcome) =
+                    process_oa_landing_response(session, candidate.origin, candidate.depth, resp)
+                {
+                    return Ok(outcome);
+                }
+            }
+            Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
+            Err(_) => {}
+        }
+    }
+    Ok(LandingPoolOutcome::Exhausted)
+}
+
+fn process_oa_landing_response(
+    session: &mut WorkResolution,
+    origin: ScholarlyId,
+    depth: u8,
+    resp: HttpResponse,
+) -> Option<LandingPoolOutcome> {
+    let mut discovered_new_alias = false;
+    let mut handled_structured_repo = false;
+    for hop in resp
+        .redirect_chain
+        .iter()
+        .chain(std::iter::once(&resp.final_url))
+    {
+        if let Some(alias) = classify_known_scholarly_url(hop) {
+            let structured = is_structured_repository(&alias);
+            let outcome = session.enqueue_alias(alias, depth.saturating_add(1));
+            if outcome == AliasEnqueue::Enqueued {
+                discovered_new_alias = true;
+            }
+            if structured && outcome != AliasEnqueue::DepthExceeded {
+                handled_structured_repo = true;
             }
         }
     }
-
-    // Rewrite post-redirect GitHub `/blob/` URLs to `raw.githubusercontent.com` before falling back.
-    let response = if depth < MAX_RECLASSIFICATION_DEPTH
-        && response.final_url != *url
-        && let Some(raw_github) = response.final_url.to_raw_github_url()
-        && initial_raw_github.as_ref() != Some(&raw_github)
-    {
-        match budget.get(&raw_github, Some(ACCEPT_WEB_PREFERRED)).await {
-            Ok(raw_resp) if raw_resp.status == HTTP_OK => raw_resp,
-            Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-            Ok(_) | Err(_) => response,
+    let skip_html = handled_structured_repo || is_arxiv_abs_url(&resp.final_url);
+    let extracted = extract_non_stub_landing(resp, origin, session, skip_html);
+    if discovered_new_alias {
+        if let Some(fallback) = extracted {
+            session.record_deferred_fallback(fallback);
         }
-    } else {
-        response
-    };
+        return Some(LandingPoolOutcome::DiscoveredAlias);
+    }
+    match extracted? {
+        DeferredFallback::FullText(text) => Some(LandingPoolOutcome::FullText(text)),
+        DeferredFallback::Pdf(pdf) => Some(LandingPoolOutcome::Pdf(pdf)),
+    }
+}
 
-    if response.status != HTTP_OK {
-        return Err(AdfontesError::Transport {
-            url: response.final_url.as_str().to_owned(),
-            detail: format!("HTTP {}", response.status),
+fn extract_non_stub_landing(
+    resp: HttpResponse,
+    origin: ScholarlyId,
+    session: &mut WorkResolution,
+    skip_html: bool,
+) -> Option<DeferredFallback> {
+    if resp.status != HTTP_OK {
+        return None;
+    }
+    if skip_html {
+        return is_pdf_response(&resp).then(|| {
+            let raw_bytes_fetched = resp.body.len();
+            DeferredFallback::Pdf(ResolvedPdf {
+                origin,
+                bytes: resp.body,
+                source_url: resp.final_url,
+                raw_bytes_fetched,
+            })
         });
     }
-
-    dispatch_http_response(response)
+    match extract_oa_landing_response(resp)? {
+        LandingExtraction::FullText {
+            format,
+            title,
+            markdown,
+            source_url,
+            raw_bytes_fetched,
+        } => {
+            session.merge_fields_if_missing(title, Vec::new(), None, None);
+            Some(DeferredFallback::FullText(ResolvedText {
+                origin,
+                format,
+                markdown,
+                source_url,
+                raw_bytes_fetched,
+            }))
+        }
+        LandingExtraction::Pdf {
+            bytes,
+            source_url,
+            raw_bytes_fetched,
+        } => Some(DeferredFallback::Pdf(ResolvedPdf {
+            origin,
+            bytes,
+            source_url,
+            raw_bytes_fetched,
+        })),
+    }
 }
 
 async fn fetch_optional_json(
@@ -1204,6 +1035,127 @@ async fn fetch_optional_json(
     }
 }
 
+fn initial_caller_source_url(caller_id: &ScholarlyId, config: &ResolverConfig) -> Option<HttpUrl> {
+    match caller_id {
+        ScholarlyId::Doi(doi) => HttpUrl::parse(&format!(
+            "{}/{}",
+            config.endpoints.doi_org.trim_end_matches('/'),
+            doi.percent_encoded_path()
+        ))
+        .ok(),
+        ScholarlyId::Pmid(pmid) => HttpUrl::parse(&format!(
+            "https://pubmed.ncbi.nlm.nih.gov/{}/",
+            pmid.as_str()
+        ))
+        .ok(),
+        ScholarlyId::Arxiv(_) | ScholarlyId::PmcId(_) | ScholarlyId::Rfc(_) => None,
+    }
+}
+
+fn fallback_metadata_source_url(
+    caller_id: &ScholarlyId,
+    config: &ResolverConfig,
+) -> Option<HttpUrl> {
+    match caller_id {
+        ScholarlyId::Arxiv(id) => HttpUrl::parse(&format!(
+            "{}/abs/{}",
+            config.endpoints.arxiv_org.trim_end_matches('/'),
+            id.as_str()
+        ))
+        .ok(),
+        ScholarlyId::PmcId(pmcid) => HttpUrl::parse(&format!(
+            "https://europepmc.org/article/PMC/{}",
+            pmcid.as_str()
+        ))
+        .ok(),
+        ScholarlyId::Rfc(rfc) => HttpUrl::parse(&format!(
+            "{}/doc/rfc{}/",
+            config.endpoints.ietf_datatracker.trim_end_matches('/'),
+            rfc.get()
+        ))
+        .ok(),
+        ScholarlyId::Doi(_) | ScholarlyId::Pmid(_) => None,
+    }
+}
+
+fn build_caller_transport_error(
+    caller_id: &ScholarlyId,
+    trace: &UnavailableTrace,
+    budget: &ResolveBudget<'_>,
+    config: &ResolverConfig,
+) -> AdfontesError {
+    match caller_id {
+        ScholarlyId::Arxiv(id) => {
+            let url = format!(
+                "{}/pdf/{}.pdf",
+                config.endpoints.arxiv_org.trim_end_matches('/'),
+                id.as_str()
+            );
+            let detail = if trace.failure_summary.is_empty() {
+                budget.append_last_transport_error("all arXiv retrieval endpoints failed")
+            } else {
+                format!(
+                    "all arXiv retrieval endpoints failed ({})",
+                    trace.failure_summary
+                )
+            };
+            AdfontesError::Transport { url, detail }
+        }
+        ScholarlyId::Doi(doi) => {
+            let url = format!(
+                "{}/{}",
+                config.endpoints.doi_org.trim_end_matches('/'),
+                doi.percent_encoded_path()
+            );
+            AdfontesError::Transport {
+                url,
+                detail: budget.append_last_transport_error(
+                    "DOI resolution failed across doi.org and OpenAlex",
+                ),
+            }
+        }
+        ScholarlyId::PmcId(pmcid) => {
+            let url = format!(
+                "{}/webservices/rest/{}/fullTextXML",
+                config.endpoints.europe_pmc.trim_end_matches('/'),
+                pmcid.as_str()
+            );
+            AdfontesError::Transport {
+                url,
+                detail: budget.append_last_transport_error(
+                    "Europe PMC returned neither metadata nor fullTextXML",
+                ),
+            }
+        }
+        ScholarlyId::Pmid(pmid) => {
+            let url = format!(
+                "{}/webservices/rest/search?query=EXT_ID:{}%20AND%20SRC:MED&format=json&resultType=core",
+                config.endpoints.europe_pmc.trim_end_matches('/'),
+                pmid.as_str()
+            );
+            let detail = if trace.failure_summary.is_empty() {
+                budget.append_last_transport_error("Europe PMC PMID lookup failed")
+            } else {
+                trace.failure_summary.clone()
+            };
+            AdfontesError::Transport { url, detail }
+        }
+        ScholarlyId::Rfc(rfc) => {
+            let url = format!(
+                "{}/rfc/rfc{}.txt",
+                config.endpoints.rfc_editor.trim_end_matches('/'),
+                rfc.get()
+            );
+            let detail = if trace.failure_summary.is_empty() {
+                budget.append_last_transport_error("all RFC retrieval endpoints failed")
+            } else {
+                trace.failure_summary.clone()
+            };
+            AdfontesError::Transport { url, detail }
+        }
+    }
+}
+
 fn build_openalex_doi_url(
     config: &ResolverConfig,
     encoded_doi: &str,
@@ -1211,92 +1163,6 @@ fn build_openalex_doi_url(
     let base = config.endpoints.openalex.trim_end_matches('/');
     let url = HttpUrl::parse(&format!("{base}/works/https://doi.org/{encoded_doi}"))?;
     Ok(url.with_query_pairs(config.usable_contact_email().map(|email| ("mailto", email))))
-}
-
-fn merge_caller_priority_metadata(
-    mut mirror_doc: ExtractedDocument,
-    mut caller_metadata: WorkMetadata,
-) -> ExtractedDocument {
-    let mirror_id = mirror_doc.metadata.canonical_id.clone();
-    let mirror_source_url = mirror_doc.metadata.source_url.clone();
-    merge_missing_metadata(&mut caller_metadata, mirror_doc.metadata);
-    if let Some(url) = mirror_source_url {
-        caller_metadata.source_url = Some(url);
-    }
-    if let Some(id) = mirror_id
-        && caller_metadata.canonical_id.as_deref() != Some(id.as_str())
-    {
-        let note = format!("Full text via {id}");
-        if !caller_metadata.notes.contains(&note) {
-            caller_metadata.notes.push(note);
-        }
-    }
-    mirror_doc.metadata = caller_metadata;
-    mirror_doc
-}
-
-fn merge_missing_metadata(target: &mut WorkMetadata, extra: WorkMetadata) {
-    fill_metadata_if_missing(
-        target,
-        extra.title,
-        extra.authors,
-        extra.year,
-        extra.abstract_text,
-    );
-    let target_is_generic = target
-        .venue_or_source
-        .as_deref()
-        .is_none_or(is_generic_repository_venue);
-    if target_is_generic
-        && let Some(extra_venue) = extra.venue_or_source
-        && (target.venue_or_source.is_none() || !is_generic_repository_venue(&extra_venue))
-    {
-        target.venue_or_source = Some(extra_venue);
-    }
-    if target.canonical_id.is_none() {
-        target.canonical_id = extra.canonical_id;
-    }
-    for note in extra.notes {
-        if !target.notes.contains(&note) {
-            target.notes.push(note);
-        }
-    }
-}
-
-fn fill_metadata_if_missing(
-    target: &mut WorkMetadata,
-    title: Option<String>,
-    authors: Vec<String>,
-    year: Option<u16>,
-    abstract_text: Option<String>,
-) {
-    if target.title.is_none() {
-        target.title = title;
-    }
-    if target.authors.is_empty() {
-        target.authors = authors;
-    }
-    if target.year.is_none() {
-        target.year = year;
-    }
-    if target.abstract_text.is_none() {
-        target.abstract_text = abstract_text;
-    }
-}
-
-fn is_generic_repository_venue(venue: &str) -> bool {
-    GENERIC_REPOSITORY_VENUES
-        .iter()
-        .any(|generic| venue.eq_ignore_ascii_case(generic))
-}
-
-const fn is_body_restricted_doc(doc: &ExtractedDocument) -> bool {
-    matches!(
-        doc.payload,
-        ExtractedPayload::MetadataOnly {
-            reason: UnavailableReason::BodyRestricted
-        }
-    )
 }
 
 fn is_usable_contact_email(raw: &str) -> bool {
@@ -1370,6 +1236,7 @@ mod tests {
     use wiremock::{Mock, MockServer, Request as WiremockRequest, ResponseTemplate};
 
     use super::*;
+    use crate::model::{ExtractedPayload, UnavailableReason};
     use crate::transport::TransportConfig;
 
     fn resolver_config_for(base_url: &str, contact_email: Option<&str>) -> ResolverConfig {
@@ -1633,6 +1500,412 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn pmcid_follows_europe_pmc_doi_to_open_access_pdf_when_jats_body_restricted() {
+        let jats_front_only = indoc! {r"
+            <article>
+              <front><article-meta><title-group><article-title>JRSS-C Trial</article-title></title-group></article-meta></front>
+            </article>
+        "};
+        let server = MockServer::start().await;
+        let pdf_url = format!("{}/oa/rssc.pdf", server.uri());
+        Mock::given(method("GET"))
+            .and(|req: &WiremockRequest| req.url.as_str().contains("PMCID:PMC10016948"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resultList": {
+                    "result": [{
+                        "title": "JRSS-C Trial",
+                        "journalTitle": "JRSS-C",
+                        "pubYear": "2023",
+                        "pmcid": "PMC10016948",
+                        "doi": "10.1111/rssc.12435"
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("PMC10016948/fullTextXML"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(jats_front_only, "application/xml"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "best_oa_location": {"is_oa": true, "pdf_url": pdf_url}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/oa/rssc.pdf"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(b"%PDF-1.7\n%mock-pdf\n".as_slice(), "application/pdf"),
+            )
+            .mount(&server)
+            .await;
+
+        let target = ParsedTarget::parse("PMC10016948").unwrap();
+        let doc = resolve_target(
+            &target,
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(doc.payload, ExtractedPayload::Pdf { .. }));
+        assert_eq!(doc.metadata.canonical_id.as_deref(), Some("PMC10016948"));
+        assert_eq!(doc.metadata.venue_or_source.as_deref(), Some("JRSS-C"));
+        assert!(
+            doc.metadata
+                .notes
+                .iter()
+                .any(|note| note == "PDF via 10.1111/rssc.12435")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pmcid_prefers_discovered_arxiv_structured_text_over_europe_pmc_pdf() {
+        let tex = indoc! {r"
+            \documentclass{article}
+            \title{Structured ArXiv Mirror}
+            \begin{document}
+            \section{Results}
+            Complete derivations from the structured arXiv source mirror that should always beat
+            a binary Europe PMC PDF when both open-access copies exist for the same scholarly work.
+            \end{document}
+        "};
+        let server = MockServer::start().await;
+        let epmc_pdf_url = format!("{}/epmc/paper.pdf", server.uri());
+        Mock::given(method("GET"))
+            .and(|req: &WiremockRequest| req.url.as_str().contains("PMCID:PMC2222222"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resultList": {
+                    "result": [{
+                        "title": "Structured ArXiv Mirror",
+                        "doi": "10.48550/arXiv.2409.13740",
+                        "fullTextUrlList": {
+                            "fullTextUrl": [{
+                                "documentStyle": "pdf",
+                                "availabilityCode": "OA",
+                                "url": epmc_pdf_url
+                            }]
+                        }
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("PMC2222222/fullTextXML"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/src/2409\.13740"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tex))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/epmc/paper.pdf"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(b"%PDF-1.7\n%should-not-win\n".as_slice(), "application/pdf"),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let target = ParsedTarget::parse("PMC2222222").unwrap();
+        let doc = resolve_target(
+            &target,
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
+        )
+        .await
+        .unwrap();
+
+        server.verify().await;
+        assert!(matches!(
+            doc.payload,
+            ExtractedPayload::FullText {
+                format: TextFormat::Latex,
+                ..
+            }
+        ));
+        assert!(
+            doc.metadata
+                .notes
+                .iter()
+                .any(|note| note == "Full text via arXiv:2409.13740")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pdf_only_arxiv_follows_atom_doi_to_pmcid_jats_before_falling_back_to_cached_pdf() {
+        let atom = indoc! {r#"
+            <?xml version="1.0" encoding="UTF-8"?>
+            <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+              <entry>
+                <title>Journal Published Preprint</title>
+                <published>2024-01-01T00:00:00Z</published>
+                <arxiv:doi>10.1000/jats-mirror</arxiv:doi>
+              </entry>
+            </feed>
+        "#};
+        let jats = indoc! {r"
+            <article>
+              <front><article-meta><title-group><article-title>Journal Published Preprint</article-title></title-group></article-meta></front>
+              <body><sec><title>Introduction</title><p>Full structured JATS text discovered through the arXiv Atom journal DOI and OpenAlex PMCID link, preventing unnecessary PDF fallback.</p></sec></body>
+            </article>
+        "};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/api/query"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(atom, "application/xml"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/src/2401\.00099"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(b"%PDF-1.7\n%pdf-only-src\n".as_slice(), "application/pdf"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ids": {"pmcid": "https://pmc.ncbi.nlm.nih.gov/articles/PMC3333333/"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("PMC3333333/fullTextXML"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(jats, "application/xml"))
+            .mount(&server)
+            .await;
+
+        let target = ParsedTarget::parse("2401.00099").unwrap();
+        let doc = resolve_target(
+            &target,
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            doc.payload,
+            ExtractedPayload::FullText {
+                format: TextFormat::JatsXml,
+                ..
+            }
+        ));
+        assert!(
+            doc.metadata
+                .notes
+                .iter()
+                .any(|note| note == "Full text via PMC3333333")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pdf_only_arxiv_reuses_cached_src_pdf_without_refetching_pdf_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/src/0710\.5005"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(b"%PDF-1.7\n%cached-src-pdf\n".as_slice(), "application/pdf"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/pdf/0710\.5005\.pdf"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let target = ParsedTarget::parse("https://ar5iv.labs.arxiv.org/html/0710.5005").unwrap();
+        let doc = resolve_target(
+            &target,
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
+        )
+        .await
+        .unwrap();
+
+        server.verify().await;
+        assert!(matches!(doc.payload, ExtractedPayload::Pdf { .. }));
+        assert_eq!(
+            doc.metadata.canonical_id.as_deref(),
+            Some("arXiv:0710.5005")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn medrxiv_url_resolves_through_doi_waterfall_to_pmcid_jats() {
+        let jats = indoc! {r"
+            <article>
+              <front><article-meta><title-group><article-title>MedRxiv Preprint</article-title></title-group></article-meta></front>
+              <body><sec><title>Methods</title><p>Cohort analysis recovered from Europe PMC JATS XML after classifying the medRxiv URL as its Crossref 10.1101 DOI.</p></sec></body>
+            </article>
+        "};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/openalex/works/https://doi\.org/10\.1101/2024\.06\.03\.24308385",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ids": {"pmcid": "PMC4444444"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("PMC4444444/fullTextXML"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(jats, "application/xml"))
+            .mount(&server)
+            .await;
+
+        let target = ParsedTarget::parse(
+            "https://www.medrxiv.org/content/10.1101/2024.06.03.24308385v2.full",
+        )
+        .unwrap();
+        let doc = resolve_target(
+            &target,
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            doc.payload,
+            ExtractedPayload::FullText {
+                format: TextFormat::JatsXml,
+                ..
+            }
+        ));
+        assert_eq!(
+            doc.metadata.canonical_id.as_deref(),
+            Some("10.1101/2024.06.03.24308385")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn openalex_arxiv_pdf_url_upgrades_to_structured_arxiv_tex_source() {
+        let tex = indoc! {r"
+            \documentclass{article}
+            \title{Upgraded From PDF URL}
+            \begin{document}
+            \section{Proof}
+            OpenAlex listed only an arXiv PDF link, which the session upgraded into a structured
+            arXiv frontier entry so LaTeX source won over the binary PDF mirror.
+            \end{document}
+        "};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "title": "Upgraded From PDF URL",
+                "best_oa_location": {
+                    "is_oa": true,
+                    "pdf_url": "https://arxiv.org/pdf/2409.13740.pdf"
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/src/2409\.13740"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tex))
+            .mount(&server)
+            .await;
+
+        let target = ParsedTarget::parse("10.1000/arxiv-pdf-upgrade").unwrap();
+        let doc = resolve_target(
+            &target,
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            doc.payload,
+            ExtractedPayload::FullText {
+                format: TextFormat::Latex,
+                ..
+            }
+        ));
+        assert!(
+            doc.metadata
+                .notes
+                .iter()
+                .any(|note| note == "Full text via arXiv:2409.13740")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn arxiv_metadata_only_preserves_abs_source_url_when_alias_pmcid_is_body_restricted() {
+        let atom = indoc! {r#"
+            <?xml version="1.0" encoding="UTF-8"?>
+            <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+              <entry>
+                <title>Embargoed Preprint</title>
+                <published>2024-01-01T00:00:00Z</published>
+                <arxiv:doi>10.1000/embargoed</arxiv:doi>
+              </entry>
+            </feed>
+        "#};
+        let front_only = b"<article><front><article-meta><title-group><article-title>Embargoed Preprint</article-title></title-group></article-meta></front></article>";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/api/query"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(atom, "application/xml"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ids": {"pmcid": "PMC5555555"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("PMC5555555/fullTextXML"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(front_only.as_slice(), "application/xml"),
+            )
+            .mount(&server)
+            .await;
+
+        let target = ParsedTarget::parse("2401.00077").unwrap();
+        let doc = resolve_target(
+            &target,
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            doc.payload,
+            ExtractedPayload::MetadataOnly {
+                reason: UnavailableReason::BodyRestricted
+            }
+        );
+        assert_eq!(
+            doc.metadata.source_url.as_ref().map(HttpUrl::path),
+            Some("/abs/2401.00077")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn rfc_waterfall_attaches_obsoleted_by_notes_and_falls_back_from_xml_to_txt() {
         let tracker_json = json!({
             "title": "HTTP/1.1 Semantics",
@@ -1751,6 +2024,32 @@ mod tests {
             .await;
 
         let target = ParsedTarget::parse("10.1000/xxe-pmc").unwrap();
+        let failure = resolve_target(
+            &target,
+            &http_client_for(&[*server.address()]),
+            &resolver_config_for(&server.uri(), None),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(failure, AdfontesError::SafetyBlock { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oa_pool_propagates_ssrf_safety_block_fail_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "title": "SSRF Test",
+                "best_oa_location": {
+                    "is_oa": true,
+                    "pdf_url": "http://169.254.169.254/latest/meta-data"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let target = ParsedTarget::parse("10.1000/ssrf-pool").unwrap();
         let failure = resolve_target(
             &target,
             &http_client_for(&[*server.address()]),
@@ -1923,6 +2222,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn missing_pmid_reports_not_found_and_still_allows_seed_aliases() {
+        let tex = indoc! {r"
+            \documentclass{article}
+            \title{Seeded Preprint}
+            \begin{document}
+            \section{Body}
+            Resolved via seed alias even when Europe PMC returned an empty PMID resultList for
+            the primary PubMed identifier in a multi-hop redirect chain.
+            \end{document}
+        "};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("webservices/rest/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resultList": {"result": []}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/src/2409\.13740"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tex))
+            .mount(&server)
+            .await;
+
+        let client = http_client_for(&[*server.address()]);
+        let config = resolver_config_for(&server.uri(), None);
+        let missing_target = ParsedTarget::parse("PMID:99999999").unwrap();
+        let missing_error = resolve_target(&missing_target, &client, &config)
+            .await
+            .unwrap_err();
+        let budget = ResolveBudget::new(&client);
+        let pmid = ScholarlyId::parse("PMID:99999999").unwrap();
+        let seed = ScholarlyId::parse("2409.13740").unwrap();
+        let seeded_doc = resolve_work(&pmid, &[seed], &budget, &config)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            missing_error,
+            AdfontesError::Transport { ref detail, .. }
+                if detail.contains("PMID 99999999 not found in Europe PMC")
+        ));
+        assert!(matches!(
+            seeded_doc.payload,
+            ExtractedPayload::FullText {
+                format: TextFormat::Latex,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn xml_dispatch_handles_namespaced_jats_and_body_restricted_response() {
         let namespaced_jats = indoc! {r#"
             <?xml version="1.0" encoding="UTF-8"?>
@@ -1997,7 +2348,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn doi_surfaces_unsupported_proxy_error_instead_of_generic_failure() {
+    async fn doi_and_arxiv_surface_unsupported_proxy_error_instead_of_generic_failure() {
         let transport = TransportConfig {
             proxy: crate::transport::ProxyConfig {
                 all_proxy: Some("socks5://127.0.0.1:1080".to_owned()),
@@ -2009,15 +2360,28 @@ mod tests {
         let config = ResolverConfig {
             contact_email: None,
             endpoints: ResolverEndpoints {
+                arxiv_org: "https://example.org/arxiv".to_owned(),
+                export_arxiv_org: "https://example.org/export".to_owned(),
+                ar5iv: "https://example.org/ar5iv".to_owned(),
                 doi_org: "https://example.org/doi".to_owned(),
                 openalex: "https://example.org/openalex".to_owned(),
                 ..ResolverEndpoints::production()
             },
         };
-        let target = ParsedTarget::parse("10.1000/proxy-check").unwrap();
-        let failure = resolve_target(&target, &client, &config).await.unwrap_err();
+        let doi_target = ParsedTarget::parse("10.1000/proxy-check").unwrap();
+        let arxiv_target = ParsedTarget::parse("2409.13740").unwrap();
+        let doi_failure = resolve_target(&doi_target, &client, &config)
+            .await
+            .unwrap_err();
+        let arxiv_failure = resolve_target(&arxiv_target, &client, &config)
+            .await
+            .unwrap_err();
+
         assert!(
-            matches!(failure, AdfontesError::Transport { ref detail, .. } if detail.contains("socks5"))
+            matches!(doi_failure, AdfontesError::Transport { ref detail, .. } if detail.contains("socks5"))
+        );
+        assert!(
+            matches!(arxiv_failure, AdfontesError::Transport { ref detail, .. } if detail.contains("socks5"))
         );
     }
 
@@ -2107,20 +2471,89 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn pmcid_and_doi_achieve_identical_pdf_recovery_without_redundant_epmc_search() {
+        let jats_front_only = indoc! {r"
+            <article>
+              <front><article-meta><title-group><article-title>JRSS-C Trial</article-title></title-group></article-meta></front>
+            </article>
+        "};
+        let server = MockServer::start().await;
+        let pdf_url = format!("{}/oa/rssc.pdf", server.uri());
+        Mock::given(method("GET"))
+            .and(path_regex("^/epmc/webservices/rest/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resultList": {
+                    "result": [{
+                        "title": "JRSS-C Trial",
+                        "journalTitle": "JRSS-C",
+                        "pubYear": "2023",
+                        "pmcid": "PMC10016948",
+                        "pmid": "36998643",
+                        "doi": "10.1111/rssc.12435"
+                    }]
+                }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("PMC10016948/fullTextXML"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(jats_front_only, "application/xml"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/openalex/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ids": {
+                    "pmcid": "https://pmc.ncbi.nlm.nih.gov/articles/PMC10016948/",
+                    "pmid": "https://pubmed.ncbi.nlm.nih.gov/36998643"
+                },
+                "best_oa_location": {"is_oa": true, "pdf_url": pdf_url}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/oa/rssc.pdf"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(b"%PDF-1.7\n%mock-pdf\n".as_slice(), "application/pdf"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = http_client_for(&[*server.address()]);
+        let config = resolver_config_for(&server.uri(), None);
+        let pmc_target = ParsedTarget::parse("PMC10016948").unwrap();
+        let doi_target = ParsedTarget::parse("10.1111/rssc.12435").unwrap();
+        let pmc_doc = resolve_target(&pmc_target, &client, &config).await.unwrap();
+        let doi_doc = resolve_target(&doi_target, &client, &config).await.unwrap();
+
+        server.verify().await;
+        assert!(matches!(pmc_doc.payload, ExtractedPayload::Pdf { .. }));
+        assert!(matches!(doi_doc.payload, ExtractedPayload::Pdf { .. }));
+        assert_eq!(pmc_doc.metadata.source_url, doi_doc.metadata.source_url);
+        assert!(
+            pmc_doc
+                .metadata
+                .notes
+                .iter()
+                .any(|note| note == "PDF via 10.1111/rssc.12435")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn doi_executes_metadata_legs_concurrently_with_deterministic_merge() {
         let (addr, server) = spawn_concurrent_doi_barrier_server(2);
-        let client = http_client_for(&[addr]);
-        let base_url = format!("http://{addr}");
-        let config = ResolverConfig {
-            contact_email: None,
-            endpoints: ResolverEndpoints {
-                doi_org: format!("{base_url}/doi"),
-                openalex: format!("{base_url}/openalex"),
-                ..ResolverEndpoints::production()
-            },
-        };
-        let target = ParsedTarget::parse("10.1000/concurrent-legs").unwrap();
-        let doc = resolve_target(&target, &client, &config).await.unwrap();
+        let target = ParsedTarget::parse("10.1000/concurrent-two").unwrap();
+        let doc = resolve_target(
+            &target,
+            &http_client_for(&[addr]),
+            &resolver_config_for(&format!("http://{addr}"), None),
+        )
+        .await
+        .unwrap();
         server.join().unwrap();
 
         assert_eq!(doc.metadata.title.as_deref(), Some("Concurrent CSL Title"));
@@ -2139,11 +2572,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn doi_executes_three_concurrent_legs_preserving_unpaywall_priority() {
         let (addr, server) = spawn_concurrent_doi_barrier_server(3);
-        let client = http_client_for(&[addr]);
-        let base_url = format!("http://{addr}");
-        let config = resolver_config_for(&base_url, Some("researcher@university.edu"));
-        let target = ParsedTarget::parse("10.1000/three-legs").unwrap();
-        let doc = resolve_target(&target, &client, &config).await.unwrap();
+        let target = ParsedTarget::parse("10.1000/concurrent-three").unwrap();
+        let doc = resolve_target(
+            &target,
+            &http_client_for(&[addr]),
+            &resolver_config_for(&format!("http://{addr}"), Some("researcher@university.edu")),
+        )
+        .await
+        .unwrap();
         server.join().unwrap();
 
         assert_eq!(doc.metadata.title.as_deref(), Some("Concurrent CSL Title"));
@@ -2189,6 +2625,105 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "slow sibling delayed SafetyBlock fail-fast: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn landing_pool_recovers_open_access_html_and_pdf_across_distinct_candidates() {
+        let body_pad = "Empirical hierarchical estimation converges cleanly with tight posterior calibration. ".repeat(38);
+        let html_article = format!(
+            "<article><h1>Open Access Monograph</h1><h2>1 Introduction</h2><p>{body_pad}</p><h2>2 Results</h2><p>Convergence holds across all strata.</p></article>"
+        );
+        let server = MockServer::start().await;
+        let html_url = format!("{}/repo/article.html", server.uri());
+        let pdf_url = format!("{}/repo/paper.pdf", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/openalex/works/https://doi.org/10.1000/landing-html"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "title": "Landing HTML",
+                "best_oa_location": {"is_oa": true, "landing_page_url": html_url}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repo/article.html"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(html_article.into_bytes(), "text/html"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/openalex/works/https://doi.org/10.1000/landing-pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "title": "Landing PDF",
+                "best_oa_location": {"is_oa": true, "landing_page_url": pdf_url}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repo/paper.pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                b"%PDF-1.7\n%mock-landing-pdf\n".as_slice(),
+                "application/pdf",
+            ))
+            .mount(&server)
+            .await;
+
+        let client = http_client_for(&[*server.address()]);
+        let config = resolver_config_for(&server.uri(), None);
+        let html_doc = resolve_target(
+            &ParsedTarget::parse("10.1000/landing-html").unwrap(),
+            &client,
+            &config,
+        )
+        .await
+        .unwrap();
+        let pdf_doc = resolve_target(
+            &ParsedTarget::parse("10.1000/landing-pdf").unwrap(),
+            &client,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            html_doc.payload,
+            ExtractedPayload::FullText {
+                format: TextFormat::Html,
+                ..
+            }
+        ));
+        assert!(matches!(pdf_doc.payload, ExtractedPayload::Pdf { .. }));
+    }
+
+    #[test]
+    fn landing_redirect_to_alias_defers_open_access_html_instead_of_discarding_body() {
+        let caller = ScholarlyId::parse("10.1000/outer-work").unwrap();
+        let mut session = WorkResolution::new(caller.clone(), None, &[]);
+        let _ = session.pop_next_frontier();
+        let body_pad =
+            "Complete open-access empirical results and theoretical proofs across cohorts. "
+                .repeat(38);
+        let html_article = format!(
+            "<article><h1>Deferred Article</h1><h2>1 Setup</h2><p>{body_pad}</p><h2>2 Proofs</h2><p>All theorems follow directly.</p></article>"
+        );
+        let response = HttpResponse {
+            status: HTTP_OK,
+            content_type: Some("text/html; charset=utf-8".to_owned()),
+            headers: std::collections::BTreeMap::new(),
+            body: html_article.into_bytes(),
+            final_url: HttpUrl::parse("https://publisher.example.org/open-article").unwrap(),
+            redirect_chain: vec![HttpUrl::parse("https://doi.org/10.1000/inner-doi").unwrap()],
+        };
+
+        let outcome = process_oa_landing_response(&mut session, caller, 0, response);
+        let discovered = session.pop_next_frontier().unwrap();
+        let deferred = session.take_deferred_fallback().unwrap();
+
+        assert!(matches!(outcome, Some(LandingPoolOutcome::DiscoveredAlias)));
+        assert_eq!(discovered.id.to_string(), "10.1000/inner-doi");
+        assert!(
+            matches!(deferred, DeferredFallback::FullText(ref text) if text.markdown.contains("All theorems follow directly."))
         );
     }
 }

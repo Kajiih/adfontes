@@ -123,6 +123,7 @@ define_architecture! {
     Resolve      => [Extract, Pdf, Transport, Model] (modules: {
         providers => [],
         content   => [],
+        session   => [providers],
     }),
     /// Confined filesystem staging, TOC/page indexing, PDF slicing, and compact manifests (`stage`).
     Stage        => [Extract, Pdf, Model] (owns_external: ["sha2", "tempfile", "rustix", "dunce"]) (modules: {

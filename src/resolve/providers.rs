@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use crate::extract::{clean_html_fragment, sanitize_inline_text};
-use crate::model::{HttpUrl, PmcId, RfcNumber, ScholarlyId, WorkMetadata};
+use crate::model::{HttpUrl, PmcId, Pmid, RfcNumber, ScholarlyId, ScholarlyIdKey, WorkMetadata};
 
 const MAX_METADATA_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INVERTED_ABSTRACT_WORDS: usize = 4_000;
@@ -19,56 +19,63 @@ const FIELD_AUTHOR: &str = "author";
 const FIELD_DISPLAY_NAME: &str = "display_name";
 const FIELD_IS_OA: &str = "is_oa";
 const FIELD_PMCID: &str = "pmcid";
+const FIELD_PMID: &str = "pmid";
+const FIELD_DOI: &str = "doi";
 const FIELD_BEST_OA_LOCATION: &str = "best_oa_location";
 const FIELD_PDF_URL: &str = "pdf_url";
 const FIELD_LANDING_PAGE_URL: &str = "landing_page_url";
 const FIELD_UNPAYWALL_PDF: &str = "url_for_pdf";
 const FIELD_UNPAYWALL_LANDING: &str = "url_for_landing_page";
 
-/// Deduplicated open-access repository, PDF, and landing URL candidates collected across providers.
-#[derive(Debug, Default)]
-pub(super) struct OaCandidates {
-    pmcid: Option<PmcId>,
-    pdf_urls: Vec<HttpUrl>,
-    landing_urls: Vec<HttpUrl>,
-    seen: BTreeSet<String>,
+/// Consumed collections of discovered scholarly aliases and open-access URLs.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct DiscoveryParts {
+    pub(super) aliases: Vec<ScholarlyId>,
+    pub(super) pdf_urls: Vec<HttpUrl>,
+    pub(super) landing_urls: Vec<HttpUrl>,
 }
 
-impl OaCandidates {
-    pub(super) const fn pmcid(&self) -> Option<&PmcId> {
-        self.pmcid.as_ref()
+/// Deduplicated scholarly aliases, PDF URLs, and landing URLs extracted from provider JSON.
+#[derive(Debug, Default)]
+pub(super) struct ProviderDiscovery {
+    aliases: Vec<ScholarlyId>,
+    pdf_urls: Vec<HttpUrl>,
+    landing_urls: Vec<HttpUrl>,
+    seen_aliases: BTreeSet<ScholarlyIdKey>,
+    seen_pdf_urls: BTreeSet<String>,
+    seen_landing_urls: BTreeSet<String>,
+}
+
+impl ProviderDiscovery {
+    pub(super) fn into_parts(self) -> DiscoveryParts {
+        DiscoveryParts {
+            aliases: self.aliases,
+            pdf_urls: self.pdf_urls,
+            landing_urls: self.landing_urls,
+        }
     }
 
-    pub(super) fn pdf_urls(&self) -> &[HttpUrl] {
-        &self.pdf_urls
+    pub(super) fn push_alias(&mut self, id: ScholarlyId) {
+        if self.seen_aliases.insert(id.canonical_key()) {
+            self.aliases.push(id);
+        }
     }
 
-    pub(super) fn landing_urls(&self) -> &[HttpUrl] {
-        &self.landing_urls
-    }
-
-    fn push_pdf(&mut self, raw: &str) {
+    pub(super) fn push_pdf(&mut self, raw: &str) {
         if let Ok(parsed) = HttpUrl::parse(raw)
-            && self.seen.insert(parsed.as_str().to_owned())
+            && self.seen_pdf_urls.insert(parsed.as_str().to_owned())
         {
             self.pdf_urls.push(parsed);
         }
     }
 
-    fn push_landing(&mut self, raw: &str) {
+    pub(super) fn push_landing(&mut self, raw: &str) {
         if let Ok(parsed) = HttpUrl::parse(raw)
-            && self.seen.insert(parsed.as_str().to_owned())
+            && self.seen_landing_urls.insert(parsed.as_str().to_owned())
         {
             self.landing_urls.push(parsed);
         }
     }
-}
-
-/// Identifiers extracted from the first Europe PMC record for follow-up waterfalls.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct EuropePmcIds {
-    pub(super) pmcid: Option<PmcId>,
-    pub(super) follow_up_target: Option<ScholarlyId>,
 }
 
 /// Size-bounded, parsed provider JSON payload encapsulating [`serde_json::Value`] inside `providers`.
@@ -110,7 +117,7 @@ impl JsonDoc {
     pub(super) fn merge_openalex_work(
         &self,
         metadata: &mut WorkMetadata,
-        candidates: &mut OaCandidates,
+        discovery: &mut ProviderDiscovery,
     ) {
         let root = self.cursor();
         set_clean_if_none(&mut metadata.title, root.key(FIELD_TITLE).str());
@@ -139,19 +146,33 @@ impl JsonDoc {
             metadata.abstract_text =
                 reconstruct_inverted_abstract(root.key("abstract_inverted_index"));
         }
-        if candidates.pmcid.is_none()
-            && let Some(raw_pmc) = root.key("ids").key(FIELD_PMCID).str()
+
+        let ids = root.key("ids");
+        if let Some(pmcid) = ids
+            .key(FIELD_PMCID)
+            .str()
+            .and_then(extract_pmcid_from_value)
         {
-            candidates.pmcid = extract_pmcid_from_value(raw_pmc);
+            discovery.push_alias(ScholarlyId::PmcId(pmcid));
+        }
+        if let Some(pmid) = ids.key(FIELD_PMID).str().and_then(extract_pmid_from_value) {
+            discovery.push_alias(ScholarlyId::Pmid(pmid));
+        }
+        if let Some(doi_id) = ids
+            .key(FIELD_DOI)
+            .str()
+            .and_then(|raw| ScholarlyId::parse(raw).ok())
+        {
+            discovery.push_alias(doi_id);
         }
 
         let best = root.key(FIELD_BEST_OA_LOCATION);
         if best.key(FIELD_IS_OA).bool() != Some(false) {
-            collect_location(best, FIELD_PDF_URL, FIELD_LANDING_PAGE_URL, candidates);
+            collect_location(best, FIELD_PDF_URL, FIELD_LANDING_PAGE_URL, discovery);
         }
         for loc in root.key("locations").array() {
             if loc.key(FIELD_IS_OA).bool() == Some(true) {
-                collect_location(loc, FIELD_PDF_URL, FIELD_LANDING_PAGE_URL, candidates);
+                collect_location(loc, FIELD_PDF_URL, FIELD_LANDING_PAGE_URL, discovery);
             }
         }
     }
@@ -159,7 +180,7 @@ impl JsonDoc {
     pub(super) fn merge_unpaywall_work(
         &self,
         metadata: &mut WorkMetadata,
-        candidates: &mut OaCandidates,
+        discovery: &mut ProviderDiscovery,
     ) {
         let root = self.cursor();
         set_clean_if_none(&mut metadata.title, root.key(FIELD_TITLE).str());
@@ -182,17 +203,12 @@ impl JsonDoc {
                 best,
                 FIELD_UNPAYWALL_PDF,
                 FIELD_UNPAYWALL_LANDING,
-                candidates,
+                discovery,
             );
         }
         for loc in root.key("oa_locations").array() {
             if loc.key(FIELD_IS_OA).bool() != Some(false) {
-                collect_location(
-                    loc,
-                    FIELD_UNPAYWALL_PDF,
-                    FIELD_UNPAYWALL_LANDING,
-                    candidates,
-                );
+                collect_location(loc, FIELD_UNPAYWALL_PDF, FIELD_UNPAYWALL_LANDING, discovery);
             }
         }
     }
@@ -200,10 +216,12 @@ impl JsonDoc {
     pub(super) fn extract_europe_pmc_record(
         &self,
         metadata: &mut WorkMetadata,
-        oa_pdf_urls: &mut Vec<HttpUrl>,
-    ) -> Option<EuropePmcIds> {
+        discovery: &mut ProviderDiscovery,
+    ) -> bool {
         let record = self.cursor().key("resultList").key("result").first();
-        record.0.filter(|val| val.is_object())?;
+        if record.0.is_none_or(|val| !val.is_object()) {
+            return false;
+        }
 
         set_clean_if_none(&mut metadata.title, record.key(FIELD_TITLE).str());
         if metadata.authors.is_empty() {
@@ -242,7 +260,6 @@ impl JsonDoc {
                 .map(clean_html_fragment)
                 .filter(|val| !val.is_empty());
         }
-        let mut seen_pdf_urls = BTreeSet::new();
         for entry in record.key("fullTextUrlList").key("fullTextUrl").array() {
             let is_pdf = entry
                 .key("documentStyle")
@@ -254,25 +271,26 @@ impl JsonDoc {
             if is_pdf
                 && is_open
                 && let Some(raw_url) = entry.key("url").str()
-                && let Ok(parsed) = HttpUrl::parse(raw_url)
-                && seen_pdf_urls.insert(parsed.as_str().to_owned())
             {
-                oa_pdf_urls.push(parsed);
+                discovery.push_pdf(raw_url);
             }
         }
 
-        let pmcid = record
+        if let Some(pmcid) = record
             .key(FIELD_PMCID)
             .str()
-            .and_then(extract_pmcid_from_value);
-        let follow_up_target = record
-            .key("doi")
+            .and_then(extract_pmcid_from_value)
+        {
+            discovery.push_alias(ScholarlyId::PmcId(pmcid));
+        }
+        if let Some(follow_up) = record
+            .key(FIELD_DOI)
             .str()
-            .and_then(|raw_doi| ScholarlyId::parse(raw_doi).ok());
-        Some(EuropePmcIds {
-            pmcid,
-            follow_up_target,
-        })
+            .and_then(|raw_doi| ScholarlyId::parse(raw_doi).ok())
+        {
+            discovery.push_alias(follow_up);
+        }
+        true
     }
 
     pub(super) fn merge_ietf_doc(&self, metadata: &mut WorkMetadata) {
@@ -387,13 +405,13 @@ fn collect_location(
     loc: JsonCursor<'_>,
     pdf_key: &str,
     landing_key: &str,
-    candidates: &mut OaCandidates,
+    discovery: &mut ProviderDiscovery,
 ) {
     if let Some(pdf_url) = loc.key(pdf_key).str() {
-        candidates.push_pdf(pdf_url);
+        discovery.push_pdf(pdf_url);
     }
     if let Some(landing_url) = loc.key(landing_key).str() {
-        candidates.push_landing(landing_url);
+        discovery.push_landing(landing_url);
     }
 }
 
@@ -410,6 +428,15 @@ fn extract_pmcid_from_value(raw: &str) -> Option<PmcId> {
     }
     let tail = trimmed.rsplit('/').next()?;
     PmcId::parse(tail).ok()
+}
+
+fn extract_pmid_from_value(raw: &str) -> Option<Pmid> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if let Ok(direct) = Pmid::parse(trimmed) {
+        return Some(direct);
+    }
+    let tail = trimmed.rsplit('/').next()?;
+    Pmid::parse(tail).ok()
 }
 
 fn append_ietf_relation_note(list: JsonCursor<'_>, label: &str, notes: &mut Vec<String>) {
@@ -492,12 +519,12 @@ mod tests {
     #[test]
     fn openalex_inverted_abstract_deduplicates_positions_and_preserves_prefix_order() {
         let mut meta = WorkMetadata::default();
-        let mut candidates = OaCandidates::default();
+        let mut discovery = ProviderDiscovery::default();
         JsonDoc::parse(
             br#"{"abstract_inverted_index":{"zebra":[0,0,0,5000],"alpha":[2],"middle":[1]}}"#,
         )
         .unwrap()
-        .merge_openalex_work(&mut meta, &mut candidates);
+        .merge_openalex_work(&mut meta, &mut discovery);
         assert_eq!(meta.abstract_text.as_deref(), Some("zebra middle alpha"));
     }
 
@@ -510,10 +537,10 @@ mod tests {
             r#"{{"title":"Bounded Study","abstract_inverted_index":{{"flood":[{out_of_range}],"ignored":[1],"bad":-1}}}}"#
         );
         let mut flood_meta = WorkMetadata::default();
-        let mut flood_candidates = OaCandidates::default();
+        let mut flood_discovery = ProviderDiscovery::default();
         JsonDoc::parse(flood_payload.as_bytes())
             .unwrap()
-            .merge_openalex_work(&mut flood_meta, &mut flood_candidates);
+            .merge_openalex_work(&mut flood_meta, &mut flood_discovery);
 
         let mid_prefix = std::iter::repeat_n("5000", 15_997)
             .collect::<Vec<_>>()
@@ -522,10 +549,10 @@ mod tests {
             r#"{{"abstract_inverted_index":{{"kept":[0],"pad":[{mid_prefix}],"tail":[1]}}}}"#
         );
         let mut mid_meta = WorkMetadata::default();
-        let mut mid_candidates = OaCandidates::default();
+        let mut mid_discovery = ProviderDiscovery::default();
         JsonDoc::parse(mid_payload.as_bytes())
             .unwrap()
-            .merge_openalex_work(&mut mid_meta, &mut mid_candidates);
+            .merge_openalex_work(&mut mid_meta, &mut mid_discovery);
 
         assert_eq!(flood_meta.title.as_deref(), Some("Bounded Study"));
         assert_eq!(flood_meta.abstract_text, None);
@@ -540,18 +567,18 @@ mod tests {
             .join(",");
         let key_payload = format!(r#"{{"abstract_inverted_index":{{{many_keys},"tail":[0]}}}}"#);
         let mut key_meta = WorkMetadata::default();
-        let mut key_candidates = OaCandidates::default();
+        let mut key_discovery = ProviderDiscovery::default();
         JsonDoc::parse(key_payload.as_bytes())
             .unwrap()
-            .merge_openalex_work(&mut key_meta, &mut key_candidates);
+            .merge_openalex_work(&mut key_meta, &mut key_discovery);
 
         let mut bad_meta = WorkMetadata::default();
-        let mut bad_candidates = OaCandidates::default();
+        let mut bad_discovery = ProviderDiscovery::default();
         JsonDoc::parse(
             br#"{"title":"Non-map Abstract","abstract_inverted_index":[1,2,3],"publication_year":-1}"#,
         )
         .unwrap()
-        .merge_openalex_work(&mut bad_meta, &mut bad_candidates);
+        .merge_openalex_work(&mut bad_meta, &mut bad_discovery);
 
         assert_eq!(key_meta.abstract_text, None);
         assert_eq!(bad_meta.title.as_deref(), Some("Non-map Abstract"));
@@ -586,14 +613,14 @@ mod tests {
     #[test]
     fn europe_pmc_degrades_leniently_on_null_authors_bad_year_and_trailing_hits() {
         let mut epmc_meta = WorkMetadata::default();
-        let mut oa_pdfs = Vec::new();
+        let mut discovery = ProviderDiscovery::default();
         let doc = JsonDoc::parse(
             br#"{"resultList":{"result":[{"authorList":{"author":null},"authorString":"Ada Lovelace.","pubYear":-1,"abstractText":"<p>First result.</p><p>Second &lt; 0.01.</p>"},{"pubYear":{"unexpected":1}}]}}"#,
         )
         .unwrap();
-        doc.extract_europe_pmc_record(&mut epmc_meta, &mut oa_pdfs)
-            .unwrap();
+        let found = doc.extract_europe_pmc_record(&mut epmc_meta, &mut discovery);
 
+        assert!(found);
         assert_eq!(epmc_meta.authors, vec!["Ada Lovelace"]);
         assert_eq!(epmc_meta.year, None);
         assert_eq!(
@@ -612,12 +639,12 @@ mod tests {
         .merge_csl_work(&mut csl_meta);
 
         let mut oa_meta = WorkMetadata::default();
-        let mut oa_candidates = OaCandidates::default();
+        let mut oa_discovery = ProviderDiscovery::default();
         JsonDoc::parse(
             br#"{"title":"Fault Isolated OA","authorships":123,"locations":"oops","abstract_inverted_index":{"Clean":[0],"abstract":[1]}}"#,
         )
         .unwrap()
-        .merge_openalex_work(&mut oa_meta, &mut oa_candidates);
+        .merge_openalex_work(&mut oa_meta, &mut oa_discovery);
 
         let oversized = vec![b' '; MAX_METADATA_JSON_BYTES + 1];
         assert!(JsonDoc::parse(&oversized).is_none());
@@ -636,10 +663,10 @@ mod tests {
             .join(",");
         let payload = format!(r#"{{"abstract_inverted_index":{{"{big_word}":[{positions}]}}}}"#);
         let mut meta = WorkMetadata::default();
-        let mut candidates = OaCandidates::default();
+        let mut discovery = ProviderDiscovery::default();
         JsonDoc::parse(payload.as_bytes())
             .unwrap()
-            .merge_openalex_work(&mut meta, &mut candidates);
+            .merge_openalex_work(&mut meta, &mut discovery);
 
         let abstract_text = meta.abstract_text.expect("abstract prefix must fit budget");
         assert_ne!(abstract_text, "");
@@ -649,18 +676,34 @@ mod tests {
     #[test]
     fn europe_pmc_falls_back_on_blank_journal_title_and_rejects_signed_year_strings() {
         let mut epmc_meta = WorkMetadata::default();
-        let mut oa_pdfs = Vec::new();
+        let mut discovery = ProviderDiscovery::default();
         let doc = JsonDoc::parse(
             br#"{"resultList":{"result":[{"journalInfo":{"journal":{"title":"   "}},"journalTitle":"Fallback Journal","pubYear":"+2025"}]}}"#,
         )
         .unwrap();
-        doc.extract_europe_pmc_record(&mut epmc_meta, &mut oa_pdfs)
-            .unwrap();
+        let found = doc.extract_europe_pmc_record(&mut epmc_meta, &mut discovery);
 
+        assert!(found);
         assert_eq!(
             epmc_meta.venue_or_source.as_deref(),
             Some("Fallback Journal")
         );
         assert_eq!(epmc_meta.year, None);
+    }
+
+    #[test]
+    fn provider_discovery_deduplicates_aliases_and_keeps_pdf_and_landing_sets_independent() {
+        let mut meta = WorkMetadata::default();
+        let mut discovery = ProviderDiscovery::default();
+        let payload = br#"{"ids":{"pmcid":"https://pmc.ncbi.nlm.nih.gov/articles/PMC10016948/","pmid":"https://pubmed.ncbi.nlm.nih.gov/36998643","doi":"https://doi.org/10.1111/RSSC.12435"},"best_oa_location":{"is_oa":true,"pdf_url":"https://mirror.example.org/shared","landing_page_url":"https://mirror.example.org/shared"}}"#;
+        JsonDoc::parse(payload)
+            .unwrap()
+            .merge_openalex_work(&mut meta, &mut discovery);
+        discovery.push_alias(ScholarlyId::parse("10.1111/rssc.12435").unwrap());
+        let parts = discovery.into_parts();
+
+        assert_eq!(parts.aliases.len(), 3);
+        assert_eq!(parts.pdf_urls.len(), 1);
+        assert_eq!(parts.landing_urls.len(), 1);
     }
 }
