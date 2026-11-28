@@ -274,6 +274,8 @@ impl CmapBuildState {
                     && let Some(range) = *bounds
                 {
                     let target = if collected.len() == 1 {
+                        // Match `lopdf` 0.47.0's convention of treating single-element `bfrange`
+                        // arrays (`[<0058>]`) as incrementing bases across the source range.
                         BfTarget::Incrementing(collected.swap_remove(0))
                     } else {
                         BfTarget::Array(collected)

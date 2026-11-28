@@ -1901,11 +1901,19 @@ mod tests {
                 Object::String(vec![0x41, 0x0E], StringFormat::Hexadecimal),
             ),
         );
+        // Pad the single shared CMap stream to ~900 KiB (< MAX_PDF_CMAP_BYTES) across 40 pages
+        // so uncached re-parsing would exceed the 32 MiB cumulative decompression budget.
+        let cmap_padding = format!("% {}", "x".repeat(900 * 1024));
         let shared_cmap = build_to_unicode_cmap_bytes(
             "<0000> <FFFF>",
-            &["1 beginbfrange", "<0000> <FFFF> <0041>", "endbfrange"],
+            &[
+                &cmap_padding,
+                "1 beginbfrange",
+                "<0000> <FFFF> <0041>",
+                "endbfrange",
+            ],
         );
-        let shared_bytes = build_shared_cmap_pages_pdf(&shared_cmap, 20);
+        let shared_bytes = build_shared_cmap_pages_pdf(&shared_cmap, 40);
 
         let ligature_indexed = index_pdf_bytes(&ligature_bytes).unwrap();
         let ligature_sliced =
@@ -1914,7 +1922,7 @@ mod tests {
 
         assert_eq!(ligature_indexed.page_texts[0].text(), "Affi");
         assert_eq!(ligature_sliced.page_texts[0].text(), "Affi");
-        assert_eq!(shared_indexed.page_texts.len(), 20);
-        assert_eq!(shared_indexed.page_texts[19].text(), "A");
+        assert_eq!(shared_indexed.page_texts.len(), 40);
+        assert_eq!(shared_indexed.page_texts[39].text(), "A");
     }
 }
