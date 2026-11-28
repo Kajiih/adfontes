@@ -47,6 +47,20 @@ const DOI_MIN_REGISTRANT_DIGITS: usize = 4;
 const DOI_MAX_REGISTRANT_DIGITS: usize = 9;
 const DOI_MAX_REGISTRANT_SEGMENTS: usize = 4;
 const DOI_MAX_TOTAL_LEN: usize = 256;
+const PREPRINT_DOI_PREFIX: &str = "10.1101";
+const PREPRINT_CONTENT_PREFIX: &str = "/content/10.1101/";
+const PREPRINT_MAX_VERSION_DIGITS: usize = 3;
+const PREPRINT_VIEW_SUFFIXES: &[&str] = &[
+    ".full.pdf+html",
+    ".full.pdf",
+    ".full-text",
+    ".abstract",
+    ".figures-only",
+    ".article-metrics",
+    ".article-info",
+    ".full",
+    ".pdf",
+];
 const PMID_MAX_DIGITS: usize = 12;
 const PMCID_MAX_DIGITS: usize = 12;
 const RFC_MAX_DIGITS: usize = 5;
@@ -202,8 +216,9 @@ impl ParsedTarget {
     /// Parses a user- or agent-supplied target string into a strongly typed [`ParsedTarget`].
     ///
     /// Canonical scholarly URLs (`arxiv.org`, `ar5iv`, `doi.org`, DataCite `10.48550/arXiv.*`,
-    /// Europe PMC / NCBI `PMC*`, PubMed, and IETF RFC Editor / Datatracker) are classified into
-    /// their [`ScholarlyId`] variant so they benefit from full multi-format waterfalls.
+    /// `bioRxiv` / `medRxiv` `10.1101` preprints, Europe PMC / NCBI `PMC*`, PubMed, and IETF RFC
+    /// Editor / Datatracker) are classified into their [`ScholarlyId`] variant so they benefit
+    /// from full multi-format waterfalls.
     ///
     /// # Errors
     ///
@@ -1157,6 +1172,7 @@ pub fn classify_known_scholarly_url(url: &HttpUrl) -> Option<ScholarlyId> {
 
     classify_arxiv_url(&host, path)
         .or_else(|| classify_doi_url(&host, path))
+        .or_else(|| classify_preprint_doi_url(&host, path))
         .or_else(|| classify_biomedical_url(&host, path))
         .or_else(|| classify_rfc_url(&host, path))
 }
@@ -1214,6 +1230,43 @@ fn classify_doi_url(host: &str, path: &str) -> Option<ScholarlyId> {
     }
     let raw_doi = path.trim_matches('/');
     parse_doi_or_arxiv_datacite(raw_doi).ok()
+}
+
+fn classify_preprint_doi_url(host: &str, path: &str) -> Option<ScholarlyId> {
+    if !matches!(
+        host,
+        "biorxiv.org" | "www.biorxiv.org" | "medrxiv.org" | "www.medrxiv.org"
+    ) {
+        return None;
+    }
+    let rest = strip_ascii_prefix_ignore_case(path, PREPRINT_CONTENT_PREFIX)?;
+    let decoded = percent_decode_utf8(rest.trim_end_matches('/'))?;
+    if decoded.is_empty() || decoded.contains('/') {
+        return None;
+    }
+    let without_view = PREPRINT_VIEW_SUFFIXES
+        .iter()
+        .find_map(|suffix| strip_ascii_suffix_ignore_case(&decoded, suffix))
+        .unwrap_or(&decoded);
+    let base_suffix = match without_view.rsplit_once(['v', 'V']) {
+        Some((prefix, version)) => {
+            if !is_positive_ascii_digits(version, Some(PREPRINT_MAX_VERSION_DIGITS)) {
+                return None;
+            }
+            prefix
+        }
+        None => without_view,
+    };
+    let valid_numeric_segments = !base_suffix.is_empty()
+        && base_suffix.split('.').all(|segment| {
+            !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    if !valid_numeric_segments {
+        return None;
+    }
+    Doi::parse(&format!("{PREPRINT_DOI_PREFIX}/{base_suffix}"))
+        .ok()
+        .map(ScholarlyId::Doi)
 }
 
 fn classify_biomedical_url(host: &str, path: &str) -> Option<ScholarlyId> {
@@ -1704,9 +1757,55 @@ mod tests {
     }
 
     #[rstest]
+    #[case(
+        "https://www.medrxiv.org/content/10.1101/2024.06.03.24308385v2.full",
+        "10.1101/2024.06.03.24308385"
+    )]
+    #[case(
+        "https://www.medrxiv.org/content/10.1101/2024.06.03.24308385v1.full.pdf+html",
+        "10.1101/2024.06.03.24308385"
+    )]
+    #[case(
+        "https://www.biorxiv.org/content/10.1101/2023.01.15.524123v3.full.pdf",
+        "10.1101/2023.01.15.524123"
+    )]
+    #[case(
+        "https://biorxiv.org/content/10.1101/123456v1.abstract",
+        "10.1101/123456"
+    )]
+    #[case(
+        "https://medrxiv.org/content/10.1101/2024.06.03.24308385",
+        "10.1101/2024.06.03.24308385"
+    )]
+    #[case(
+        "https://www.biorxiv.org/content/10.1101/2023.01.15.524123%762.full/",
+        "10.1101/2023.01.15.524123"
+    )]
+    fn classifies_biorxiv_and_medrxiv_preprint_doi_urls(
+        #[case] raw: &str,
+        #[case] expected_doi: &str,
+    ) {
+        let parsed = ParsedTarget::parse(raw).unwrap();
+        let ParsedTarget::Scholarly(ScholarlyId::Doi(doi)) = parsed else {
+            panic!("expected Doi variant for {raw}");
+        };
+        assert_eq!(doi.as_str(), expected_doi);
+    }
+
+    #[rstest]
     #[case("https://www.rfc-editor.org/errata/rfc9110")]
     #[case("https://datatracker.ietf.org/doc/rfc9110/history/")]
     #[case("https://example.org/research/article.html")]
+    #[case("https://www.medrxiv.org/content/10.1101/2024.06.03.24308385v0.full")]
+    #[case("https://www.medrxiv.org/content/10.1101/2024.06.03.24308385v01.full")]
+    #[case("https://www.medrxiv.org/content/10.1101/2024.06.03.24308385v1000.full")]
+    #[case("https://www.medrxiv.org/content/10.1101/2024.06.03.24308385v1.full.full")]
+    #[case("https://www.medrxiv.org/content/10.1101/2024.06.03.24308385v1/supplementary-material")]
+    #[case("https://www.medrxiv.org/content/10.1101/2024.06.03.24308385v1%2Fextra")]
+    #[case("https://www.biorxiv.org/content/10.1101/early/2024/06/03/24308385")]
+    #[case("https://www.biorxiv.org/content/10.1101/2024..03.24308385v1")]
+    #[case("https://www.biorxiv.org/content/10.1101/not-a-doi")]
+    #[case("https://www.medrxiv.org/content/early/recent")]
     fn keeps_non_canonical_urls_as_url_variant(#[case] raw: &str) {
         let parsed = ParsedTarget::parse(raw).unwrap();
         assert!(matches!(parsed, ParsedTarget::Url(_)));
