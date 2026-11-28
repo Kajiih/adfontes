@@ -4,19 +4,25 @@
 //! ancestor-inherited `/Pages` attributes (`Resources`, `MediaBox`, `CropBox`, `Rotate`), build a
 //! fresh spec-clean flat `/Pages` tree without `lopdf::Document::delete_pages` `/Parent`-cycle
 //! hangs or empty intermediate `/Pages` nodes, strip cross-page `Catalog`/`Page`/trailer keys, and
-//! enforce cumulative decompression budgets during both loading and indexing.
+//! enforce cumulative decompression, forward-only `/ToUnicode` `CMap`, and page text decoding
+//! budgets during loading, indexing, and slicing.
 
 architecture_component!(Pdf);
+
+mod cmap;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
+use std::rc::Rc;
 
+use lopdf::content::Content;
 use lopdf::{
-    DecompressError, Dictionary, Document, Error as LopdfError, LoadOptions, Object, ObjectId,
-    decode_text_string,
+    DecompressError, Dictionary, Document, Encoding, Error as LopdfError, LoadOptions, Object,
+    ObjectId, decode_text_string,
 };
 
+use self::cmap::ForwardToUnicodeCMap;
 use crate::model::{
     AdfontesError, PageSpan, PdfIndex, PdfPageSummary, PdfPageText, truncate_chars,
     truncate_utf8_bytes,
@@ -24,6 +30,7 @@ use crate::model::{
 
 const PDF_FORMAT_LABEL: &str = "PDF";
 const KEY_FIRST: &[u8] = b"First";
+const KEY_TO_UNICODE: &[u8] = b"ToUnicode";
 const PDF_MAGIC: &[u8] = b"%PDF-";
 const PDF_MAGIC_SCAN_WINDOW: usize = 1024;
 const MAX_PDF_LOAD_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
@@ -31,6 +38,10 @@ const MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PDF_PAGE_DECOMPRESSED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PDF_CMAP_BYTES: usize = 1024 * 1024;
 const MAX_PDF_PAGE_TEXT_BYTES: usize = 512 * 1024;
+const MAX_PDF_PAGE_RAW_TEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PDF_TEXT_ARRAY_DEPTH: usize = 8;
+const MAX_CMAP_AMPLIFICATION_RATIO: usize = 8;
+const SIMPLE_DECODE_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_PDF_DOCUMENT_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INDEXED_PDF_PAGES: usize = 250;
 const MAX_PARENT_TREE_DEPTH: usize = 64;
@@ -391,14 +402,14 @@ impl Drop for PdfLoadBudgetGuard {
 
 struct PdfExtractionBudget {
     remaining_decompressed: usize,
-    cmap_sizes: BTreeMap<ObjectId, usize>,
+    cached_cmaps: BTreeMap<ObjectId, Option<Rc<ForwardToUnicodeCMap>>>,
 }
 
 impl PdfExtractionBudget {
     const fn new() -> Self {
         Self {
             remaining_decompressed: MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES,
-            cmap_sizes: BTreeMap::new(),
+            cached_cmaps: BTreeMap::new(),
         }
     }
 
@@ -416,13 +427,25 @@ impl PdfExtractionBudget {
             });
         }
 
-        charge_page_font_cmaps(
-            doc,
-            page_number,
-            page_id,
-            &mut self.remaining_decompressed,
-            &mut self.cmap_sizes,
-        )?;
+        let mut fallback_dicts: Vec<(Vec<u8>, Dictionary)> = Vec::new();
+        let mut encodings: BTreeMap<Vec<u8>, PageFontEncoding<'_>> = BTreeMap::new();
+        if let Ok(fonts) = doc.get_page_fonts(page_id) {
+            for (font_name, font) in fonts {
+                let Ok(to_unicode_raw) = font.get(KEY_TO_UNICODE) else {
+                    if let Some(encoding) = parse_lopdf_font_encoding(doc, font, page_number)? {
+                        encodings.insert(font_name, PageFontEncoding::Lopdf(encoding));
+                    }
+                    continue;
+                };
+                if let Some(cmap) = self.load_to_unicode_cmap(doc, to_unicode_raw, page_number)? {
+                    encodings.insert(font_name, PageFontEncoding::ToUnicode(cmap));
+                } else {
+                    let mut stripped = font.clone();
+                    stripped.remove(KEY_TO_UNICODE);
+                    fallback_dicts.push((font_name, stripped));
+                }
+            }
+        }
 
         let content_limit = self
             .remaining_decompressed
@@ -446,86 +469,253 @@ impl PdfExtractionBudget {
                 ),
             });
         }
-        let page_budget = self
-            .remaining_decompressed
-            .min(MAX_PDF_PAGE_DECOMPRESSED_BYTES);
         self.remaining_decompressed = self
             .remaining_decompressed
             .saturating_sub(content_bytes.len());
 
-        match doc.extract_text_with_limit(&[page_number], page_budget) {
-            Ok(text) => Ok(text),
-            Err(LopdfError::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
-                Err(AdfontesError::SafetyBlock {
-                    reason: format!(
-                        "PDF page {page_number} text extraction exceeded {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte ceiling"
-                    ),
-                })
+        for (font_name, stripped) in &fallback_dicts {
+            if let Some(encoding) = parse_lopdf_font_encoding(doc, stripped, page_number)? {
+                encodings.insert(font_name.clone(), PageFontEncoding::Lopdf(encoding));
             }
-            Err(_) => Ok(String::new()),
         }
+
+        decode_bounded_page_content(&content_bytes, &encodings, page_number)
     }
-}
 
-fn charge_page_font_cmaps(
-    doc: &Document,
-    page_number: u32,
-    page_id: ObjectId,
-    remaining_decompressed: &mut usize,
-    cmap_sizes: &mut BTreeMap<ObjectId, usize>,
-) -> Result<(), AdfontesError> {
-    let Ok(fonts) = doc.get_page_fonts(page_id) else {
-        return Ok(());
-    };
-
-    for font in fonts.into_values() {
-        let Ok(to_unicode_raw) = font.get(b"ToUnicode") else {
-            continue;
-        };
+    fn load_to_unicode_cmap(
+        &mut self,
+        doc: &Document,
+        to_unicode_raw: &Object,
+        page_number: u32,
+    ) -> Result<Option<Rc<ForwardToUnicodeCMap>>, AdfontesError> {
         let Ok((resolved_id, resolved_object)) = doc.dereference(to_unicode_raw) else {
-            continue;
+            return Ok(None);
         };
         let Object::Stream(stream) = resolved_object else {
-            continue;
+            return Ok(None);
         };
-        let cmap_len = if let Some(cmap_id) = resolved_id {
-            if let Some(&cached_len) = cmap_sizes.get(&cmap_id) {
-                cached_len
-            } else {
-                let measured = measure_direct_stream_bytes(stream, page_number)?;
-                cmap_sizes.insert(cmap_id, measured);
-                measured
-            }
-        } else {
-            measure_direct_stream_bytes(stream, page_number)?
-        };
-        if cmap_len > *remaining_decompressed {
-            return Err(AdfontesError::SafetyBlock {
-                reason: format!(
-                    "PDF page {page_number} font ToUnicode CMap decompression exceeded cumulative {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte ceiling"
-                ),
-            });
+        if let Some(cmap_id) = resolved_id
+            && let Some(cached) = self.cached_cmaps.get(&cmap_id)
+        {
+            return Ok(cached.as_ref().map(Rc::clone));
         }
-        *remaining_decompressed = remaining_decompressed.saturating_sub(cmap_len);
+
+        let parsed =
+            parse_to_unicode_stream(stream, page_number, &mut self.remaining_decompressed)?;
+        if let Some(cmap_id) = resolved_id {
+            self.cached_cmaps
+                .insert(cmap_id, parsed.as_ref().map(Rc::clone));
+        }
+        Ok(parsed)
     }
-    Ok(())
 }
 
-fn measure_direct_stream_bytes(
+enum PageFontEncoding<'a> {
+    ToUnicode(Rc<ForwardToUnicodeCMap>),
+    Lopdf(Encoding<'a>),
+}
+
+fn parse_to_unicode_stream(
     stream: &lopdf::Stream,
     page_number: u32,
-) -> Result<usize, AdfontesError> {
-    match stream.decompressed_content_with_limit(MAX_PDF_CMAP_BYTES) {
-        Ok(data) => Ok(data.len()),
+    remaining_decompressed: &mut usize,
+) -> Result<Option<Rc<ForwardToUnicodeCMap>>, AdfontesError> {
+    let (byte_len, decompressed) = match stream.get_plain_content_with_limit(MAX_PDF_CMAP_BYTES) {
+        Ok(data) => (data.len(), Some(data)),
         Err(LopdfError::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
-            Err(AdfontesError::SafetyBlock {
+            return Err(AdfontesError::SafetyBlock {
                 reason: format!(
                     "PDF page {page_number} font ToUnicode CMap exceeded {MAX_PDF_CMAP_BYTES}-byte safety ceiling"
                 ),
+            });
+        }
+        Err(_) => (stream.content.len(), None),
+    };
+    if byte_len > *remaining_decompressed {
+        return Err(AdfontesError::SafetyBlock {
+            reason: format!(
+                "PDF page {page_number} font ToUnicode CMap decompression exceeded cumulative {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte ceiling"
+            ),
+        });
+    }
+    *remaining_decompressed = remaining_decompressed.saturating_sub(byte_len);
+
+    let Some(data) = decompressed else {
+        return Ok(None);
+    };
+    Ok(ForwardToUnicodeCMap::parse(&data, page_number)?.map(Rc::new))
+}
+
+fn parse_lopdf_font_encoding<'a>(
+    doc: &'a Document,
+    font: &'a Dictionary,
+    page_number: u32,
+) -> Result<Option<Encoding<'a>>, AdfontesError> {
+    match font.get_font_encoding_with_limit(doc, MAX_PDF_CMAP_BYTES) {
+        Ok(encoding) => Ok(Some(encoding)),
+        Err(LopdfError::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+            Err(AdfontesError::SafetyBlock {
+                reason: format!(
+                    "PDF page {page_number} font encoding stream exceeded {MAX_PDF_CMAP_BYTES}-byte safety ceiling"
+                ),
             })
         }
-        Err(_) => Ok(stream.content.len()),
+        Err(_) => Ok(None),
     }
+}
+
+fn decode_bounded_page_content(
+    content_bytes: &[u8],
+    encodings: &BTreeMap<Vec<u8>, PageFontEncoding<'_>>,
+    page_number: u32,
+) -> Result<String, AdfontesError> {
+    let mut out = String::new();
+    let mut decoded_input_bytes: usize = 0;
+    let mut current_encoding: Option<&PageFontEncoding<'_>> = None;
+
+    for op_result in Content::decode_iter(content_bytes) {
+        let Ok(operation) = op_result else {
+            break;
+        };
+        match operation.operator.as_ref() {
+            "Tf" => {
+                current_encoding = operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    .and_then(|font_name| encodings.get(font_name));
+            }
+            "Tj" | "TJ" | "'" | "\"" => {
+                let operator = operation.operator.as_ref();
+                if matches!(operator, "'" | "\"") && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                let operands = if operator == "\"" {
+                    operation
+                        .operands
+                        .get(2)
+                        .map_or(&[][..], std::slice::from_ref)
+                } else {
+                    operation.operands.as_slice()
+                };
+                if let Some(encoding) = current_encoding
+                    && collect_bounded_text(
+                        encoding,
+                        operands,
+                        &mut out,
+                        &mut decoded_input_bytes,
+                        page_number,
+                        0,
+                    )? == CollectStep::Truncated
+                {
+                    break;
+                }
+            }
+            "T*" | "ET" if !out.ends_with('\n') => out.push('\n'),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollectStep {
+    Continue,
+    Truncated,
+}
+
+fn collect_bounded_text(
+    encoding: &PageFontEncoding<'_>,
+    operands: &[Object],
+    out: &mut String,
+    decoded_input_bytes: &mut usize,
+    page_number: u32,
+    depth: usize,
+) -> Result<CollectStep, AdfontesError> {
+    for operand in operands {
+        if collect_bounded_operand(
+            encoding,
+            operand,
+            out,
+            decoded_input_bytes,
+            page_number,
+            depth,
+        )? == CollectStep::Truncated
+        {
+            return Ok(CollectStep::Truncated);
+        }
+    }
+    Ok(CollectStep::Continue)
+}
+
+fn collect_bounded_operand(
+    encoding: &PageFontEncoding<'_>,
+    operand: &Object,
+    out: &mut String,
+    decoded_input_bytes: &mut usize,
+    page_number: u32,
+    depth: usize,
+) -> Result<CollectStep, AdfontesError> {
+    match operand {
+        Object::String(bytes, _) => {
+            decode_bounded_string(encoding, bytes, out, decoded_input_bytes, page_number)
+        }
+        Object::Array(items) if depth < MAX_PDF_TEXT_ARRAY_DEPTH => {
+            if collect_bounded_text(
+                encoding,
+                items,
+                out,
+                decoded_input_bytes,
+                page_number,
+                depth + 1,
+            )? == CollectStep::Truncated
+            {
+                return Ok(CollectStep::Truncated);
+            }
+            out.push(' ');
+            Ok(CollectStep::Continue)
+        }
+        Object::Integer(kerning) if *kerning < -100 => {
+            out.push(' ');
+            Ok(CollectStep::Continue)
+        }
+        _ => Ok(CollectStep::Continue),
+    }
+}
+
+fn decode_bounded_string(
+    encoding: &PageFontEncoding<'_>,
+    bytes: &[u8],
+    out: &mut String,
+    decoded_input_bytes: &mut usize,
+    page_number: u32,
+) -> Result<CollectStep, AdfontesError> {
+    match encoding {
+        PageFontEncoding::ToUnicode(cmap) => {
+            let outcome = cmap.decode_bounded(bytes, out, MAX_PDF_PAGE_RAW_TEXT_BYTES);
+            *decoded_input_bytes = decoded_input_bytes.saturating_add(outcome.input_bytes_consumed);
+            if outcome.truncated {
+                if out.len() > decoded_input_bytes.saturating_mul(MAX_CMAP_AMPLIFICATION_RATIO) {
+                    return Err(AdfontesError::SafetyBlock {
+                        reason: format!(
+                            "PDF page {page_number} text decoding amplified output past {MAX_CMAP_AMPLIFICATION_RATIO}x and {MAX_PDF_PAGE_RAW_TEXT_BYTES}-byte ceiling"
+                        ),
+                    });
+                }
+                return Ok(CollectStep::Truncated);
+            }
+        }
+        PageFontEncoding::Lopdf(lopdf_encoding) => {
+            for chunk in bytes.chunks(SIMPLE_DECODE_CHUNK_BYTES) {
+                let _ = lopdf_encoding.write_to_string(chunk, out);
+                *decoded_input_bytes = decoded_input_bytes.saturating_add(chunk.len());
+                if out.len() > MAX_PDF_PAGE_RAW_TEXT_BYTES {
+                    return Ok(CollectStep::Truncated);
+                }
+            }
+        }
+    }
+    Ok(CollectStep::Continue)
 }
 
 fn materialize_inherited_page_attributes(doc: &mut Document, page_id: ObjectId) {
@@ -1331,5 +1521,400 @@ mod tests {
                 .contains("Inherited Font Derivation")
         );
         assert_eq!(sliced.page_texts[1].page_number().get(), 3);
+    }
+
+    fn build_to_unicode_cmap_bytes(codespace: &str, body_lines: &[&str]) -> Vec<u8> {
+        let body = body_lines.join("\n");
+        format!(
+            concat!(
+                "/CIDInit /ProcSet findresource begin\n",
+                "12 dict begin\n",
+                "begincmap\n",
+                "/CMapName /TestCMap def\n",
+                "/CMapType 2 def\n",
+                "1 begincodespacerange\n",
+                "{codespace}\n",
+                "endcodespacerange\n",
+                "{body}\n",
+                "endcmap\n",
+                "CMapName currentdict /CMap defineresource pop\n",
+                "end\n",
+                "end\n",
+            ),
+            codespace = codespace,
+            body = body,
+        )
+        .into_bytes()
+    }
+
+    fn single_font_tj_ops(font_name: &str, payload: Object) -> Vec<Operation> {
+        vec![
+            Operation::new("BT", vec![]),
+            Operation::new(
+                "Tf",
+                vec![
+                    Object::Name(font_name.as_bytes().to_vec()),
+                    Object::Integer(12),
+                ],
+            ),
+            Operation::new("Tj", vec![payload]),
+            Operation::new("ET", vec![]),
+        ]
+    }
+
+    fn save_single_page_pdf(
+        doc: &mut Document,
+        resources_id: ObjectId,
+        operations: Vec<Operation>,
+    ) -> Vec<u8> {
+        let pages_root = doc.new_object_id();
+        let encoded_ops = Content { operations }.encode().unwrap();
+        let content_id = doc.add_object(Stream::new(Dictionary::new(), encoded_ops));
+        let page_id = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Page".to_vec())),
+            ("Parent", Object::Reference(pages_root)),
+            ("Resources", Object::Reference(resources_id)),
+            ("Contents", Object::Reference(content_id)),
+        ]));
+        doc.objects.insert(
+            pages_root,
+            Object::Dictionary(Dictionary::from_iter([
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(vec![Object::Reference(page_id)])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        let catalog = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Catalog".to_vec())),
+            ("Pages", Object::Reference(pages_root)),
+        ]));
+        doc.trailer.set("Root", Object::Reference(catalog));
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn build_custom_cmap_pdf(
+        cmap_body: &[u8],
+        empty_filter: bool,
+        encoding_hops: usize,
+        operations: Vec<Operation>,
+    ) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let mut stream_headers = Dictionary::new();
+        if empty_filter {
+            stream_headers.set("Filter", Object::Array(Vec::new()));
+        }
+        let cmap_id = doc.add_object(Stream::new(stream_headers, cmap_body.to_vec()));
+        let mut encoding = Object::Name(b"Identity-H".to_vec());
+        for _ in 0..encoding_hops {
+            let ref_id = doc.add_object(encoding);
+            encoding = Object::Reference(ref_id);
+        }
+        let font_id = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Font".to_vec())),
+            ("Subtype", Object::Name(b"Type0".to_vec())),
+            ("Encoding", encoding),
+            ("ToUnicode", Object::Reference(cmap_id)),
+        ]));
+        let resources_id = doc.add_object(Dictionary::from_iter([(
+            "Font",
+            Object::Dictionary(Dictionary::from_iter([("F1", Object::Reference(font_id))])),
+        )]));
+        save_single_page_pdf(&mut doc, resources_id, operations)
+    }
+
+    fn build_shared_cmap_pages_pdf(cmap_body: &[u8], page_count: usize) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let pages_root = doc.new_object_id();
+        let cmap_id = doc.add_object(Stream::new(Dictionary::new(), cmap_body.to_vec()));
+        let mut page_ids = Vec::with_capacity(page_count);
+        for index in 0..page_count {
+            let font_name = format!("F{index}");
+            let font_id = doc.add_object(Dictionary::from_iter([
+                ("Type", Object::Name(b"Font".to_vec())),
+                ("Subtype", Object::Name(b"Type0".to_vec())),
+                ("Encoding", Object::Name(b"Identity-H".to_vec())),
+                ("ToUnicode", Object::Reference(cmap_id)),
+            ]));
+            let resources_id = doc.add_object(Dictionary::from_iter([(
+                "Font",
+                Object::Dictionary(Dictionary::from_iter([(
+                    font_name.as_str(),
+                    Object::Reference(font_id),
+                )])),
+            )]));
+            let encoded_ops = Content {
+                operations: single_font_tj_ops(
+                    &font_name,
+                    Object::String(vec![0, 0], StringFormat::Hexadecimal),
+                ),
+            }
+            .encode()
+            .unwrap();
+            let content_id = doc.add_object(Stream::new(Dictionary::new(), encoded_ops));
+            let page_id = doc.add_object(Dictionary::from_iter([
+                ("Type", Object::Name(b"Page".to_vec())),
+                ("Parent", Object::Reference(pages_root)),
+                ("Resources", Object::Reference(resources_id)),
+                ("Contents", Object::Reference(content_id)),
+            ]));
+            page_ids.push(Object::Reference(page_id));
+        }
+        let count = i64::try_from(page_ids.len()).unwrap();
+        doc.objects.insert(
+            pages_root,
+            Object::Dictionary(Dictionary::from_iter([
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(page_ids)),
+                ("Count", Object::Integer(count)),
+            ])),
+        );
+        let catalog = doc.add_object(Dictionary::from_iter([
+            ("Type", Object::Name(b"Catalog".to_vec())),
+            ("Pages", Object::Reference(pages_root)),
+        ]));
+        doc.trailer.set("Root", Object::Reference(catalog));
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn decodes_wide_bfrange_and_single_element_bfrange_array_without_reverse_map_expansion() {
+        let wide_cmap = build_to_unicode_cmap_bytes(
+            "<00000000> <FFFFFFFF>",
+            &[
+                "1 beginbfrange",
+                "<00000000> <FFFFFFFF> <0041>",
+                "endbfrange",
+            ],
+        );
+        let array_target = "0041".repeat(256);
+        let array_line = format!("<0000> <FFFF> [<{array_target}>]");
+        let single_array_cmap = build_to_unicode_cmap_bytes(
+            "<0000> <FFFF>",
+            &["1 beginbfrange", &array_line, "endbfrange"],
+        );
+        let wide_bytes = build_custom_cmap_pdf(
+            &wide_cmap,
+            false,
+            0,
+            single_font_tj_ops(
+                "F1",
+                Object::String(vec![0, 0, 0, 0, 0, 0, 0, 2], StringFormat::Hexadecimal),
+            ),
+        );
+        let array_bytes = build_custom_cmap_pdf(
+            &single_array_cmap,
+            false,
+            0,
+            single_font_tj_ops(
+                "F1",
+                Object::String(vec![0x00, 0x01], StringFormat::Hexadecimal),
+            ),
+        );
+
+        let wide_indexed = index_pdf_bytes(&wide_bytes).unwrap();
+        let wide_sliced = slice_pdf_bytes(&wide_bytes, PageSpan::new(1, 1).unwrap()).unwrap();
+        let array_indexed = index_pdf_bytes(&array_bytes).unwrap();
+        let array_sliced = slice_pdf_bytes(&array_bytes, PageSpan::new(1, 1).unwrap()).unwrap();
+
+        assert_eq!(wide_indexed.page_texts[0].text(), "AC");
+        assert_eq!(wide_sliced.page_texts[0].text(), "AC");
+        assert!(array_indexed.page_texts[0].text().ends_with("AAB"));
+        assert!(array_sliced.page_texts[0].text().ends_with("AAB"));
+    }
+
+    #[test]
+    fn blocks_to_unicode_single_and_split_op_output_amplification_bombs() {
+        let huge_target = "0041".repeat(256);
+        let char_line = format!("<41> <{huge_target}>");
+        let fanout_cmap =
+            build_to_unicode_cmap_bytes("<00> <FF>", &["1 beginbfchar", &char_line, "endbfchar"]);
+        let single_op_bomb = build_custom_cmap_pdf(
+            &fanout_cmap,
+            false,
+            0,
+            single_font_tj_ops("F1", Object::string_literal("A".repeat(40_000))),
+        );
+        let mut split_ops = single_font_tj_ops("F1", Object::string_literal("A".repeat(4_000)));
+        split_ops.splice(
+            3..3,
+            [
+                Operation::new("Tj", vec![Object::string_literal("A".repeat(4_000))]),
+                Operation::new("Tj", vec![Object::string_literal("A".repeat(4_000))]),
+            ],
+        );
+        let split_op_bomb = build_custom_cmap_pdf(&fanout_cmap, false, 0, split_ops);
+
+        let single_index_error = index_pdf_bytes(&single_op_bomb).unwrap_err();
+        let single_slice_error =
+            slice_pdf_bytes(&single_op_bomb, PageSpan::new(1, 1).unwrap()).unwrap_err();
+        let split_index_error = index_pdf_bytes(&split_op_bomb).unwrap_err();
+        let split_slice_error =
+            slice_pdf_bytes(&split_op_bomb, PageSpan::new(1, 1).unwrap()).unwrap_err();
+
+        assert!(matches!(
+            single_index_error,
+            AdfontesError::SafetyBlock { .. }
+        ));
+        assert!(matches!(
+            single_slice_error,
+            AdfontesError::SafetyBlock { .. }
+        ));
+        assert!(matches!(
+            split_index_error,
+            AdfontesError::SafetyBlock { .. }
+        ));
+        assert!(matches!(
+            split_slice_error,
+            AdfontesError::SafetyBlock { .. }
+        ));
+    }
+
+    #[test]
+    fn blocks_to_unicode_comment_smuggling_and_empty_filter_array_fanout_bombs() {
+        let comment_rest = "0041".repeat(255);
+        let continuation = format!(" {comment_rest}>");
+        let comment_cmap = build_to_unicode_cmap_bytes(
+            "<00> <FF>",
+            &[
+                "1 beginbfchar",
+                "<41> <0041 % >",
+                &continuation,
+                "endbfchar",
+            ],
+        );
+        let array_target = "0041".repeat(256);
+        let array_line = format!("<0000> <FFFF> [<{array_target}>]");
+        let array_cmap = build_to_unicode_cmap_bytes(
+            "<0000> <FFFF>",
+            &["1 beginbfrange", &array_line, "endbfrange"],
+        );
+
+        let comment_bomb = build_custom_cmap_pdf(
+            &comment_cmap,
+            false,
+            0,
+            single_font_tj_ops("F1", Object::string_literal("A".repeat(40_000))),
+        );
+        let filter_array_bomb = build_custom_cmap_pdf(
+            &array_cmap,
+            true,
+            0,
+            single_font_tj_ops(
+                "F1",
+                Object::String(vec![0u8; 40_000], StringFormat::Hexadecimal),
+            ),
+        );
+
+        let comment_index_error = index_pdf_bytes(&comment_bomb).unwrap_err();
+        let comment_slice_error =
+            slice_pdf_bytes(&comment_bomb, PageSpan::new(1, 1).unwrap()).unwrap_err();
+        let array_index_error = index_pdf_bytes(&filter_array_bomb).unwrap_err();
+        let array_slice_error =
+            slice_pdf_bytes(&filter_array_bomb, PageSpan::new(1, 1).unwrap()).unwrap_err();
+
+        assert!(matches!(
+            comment_index_error,
+            AdfontesError::SafetyBlock { .. }
+        ));
+        assert!(matches!(
+            comment_slice_error,
+            AdfontesError::SafetyBlock { .. }
+        ));
+        assert!(matches!(
+            array_index_error,
+            AdfontesError::SafetyBlock { .. }
+        ));
+        assert!(matches!(
+            array_slice_error,
+            AdfontesError::SafetyBlock { .. }
+        ));
+    }
+
+    #[test]
+    fn blocks_oversized_empty_filter_and_129_hop_encoding_to_unicode_bombs() {
+        let oversized_raw_cmap = vec![b' '; MAX_PDF_CMAP_BYTES + 4096];
+        let oversized_bomb = build_custom_cmap_pdf(
+            &oversized_raw_cmap,
+            true,
+            0,
+            single_font_tj_ops("F1", Object::string_literal("A".to_owned())),
+        );
+        let huge_target = "0041".repeat(256);
+        let char_line = format!("<41> <{huge_target}>");
+        let fanout_cmap =
+            build_to_unicode_cmap_bytes("<00> <FF>", &["1 beginbfchar", &char_line, "endbfchar"]);
+        let encoding_chain_bomb = build_custom_cmap_pdf(
+            &fanout_cmap,
+            false,
+            129,
+            single_font_tj_ops("F1", Object::string_literal("A".repeat(40_000))),
+        );
+
+        let oversized_index_error = index_pdf_bytes(&oversized_bomb).unwrap_err();
+        let oversized_slice_error =
+            slice_pdf_bytes(&oversized_bomb, PageSpan::new(1, 1).unwrap()).unwrap_err();
+        let chain_index_error = index_pdf_bytes(&encoding_chain_bomb).unwrap_err();
+        let chain_slice_error =
+            slice_pdf_bytes(&encoding_chain_bomb, PageSpan::new(1, 1).unwrap()).unwrap_err();
+
+        assert!(matches!(
+            oversized_index_error,
+            AdfontesError::SafetyBlock { .. }
+        ));
+        assert!(matches!(
+            oversized_slice_error,
+            AdfontesError::SafetyBlock { .. }
+        ));
+        assert!(matches!(
+            chain_index_error,
+            AdfontesError::SafetyBlock { .. }
+        ));
+        assert!(matches!(
+            chain_slice_error,
+            AdfontesError::SafetyBlock { .. }
+        ));
+    }
+
+    #[test]
+    fn extracts_to_unicode_ascii_ligatures_and_caches_shared_cmap_across_pages() {
+        let ligature_cmap = build_to_unicode_cmap_bytes(
+            "<00> <FF>",
+            &[
+                "2 beginbfchar",
+                "<0E> <006600660069>",
+                "<41> <0041>",
+                "endbfchar",
+            ],
+        );
+        let ligature_bytes = build_custom_cmap_pdf(
+            &ligature_cmap,
+            false,
+            0,
+            single_font_tj_ops(
+                "F1",
+                Object::String(vec![0x41, 0x0E], StringFormat::Hexadecimal),
+            ),
+        );
+        let shared_cmap = build_to_unicode_cmap_bytes(
+            "<0000> <FFFF>",
+            &["1 beginbfrange", "<0000> <FFFF> <0041>", "endbfrange"],
+        );
+        let shared_bytes = build_shared_cmap_pages_pdf(&shared_cmap, 20);
+
+        let ligature_indexed = index_pdf_bytes(&ligature_bytes).unwrap();
+        let ligature_sliced =
+            slice_pdf_bytes(&ligature_bytes, PageSpan::new(1, 1).unwrap()).unwrap();
+        let shared_indexed = index_pdf_bytes(&shared_bytes).unwrap();
+
+        assert_eq!(ligature_indexed.page_texts[0].text(), "Affi");
+        assert_eq!(ligature_sliced.page_texts[0].text(), "Affi");
+        assert_eq!(shared_indexed.page_texts.len(), 20);
+        assert_eq!(shared_indexed.page_texts[19].text(), "A");
     }
 }
