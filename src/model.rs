@@ -1081,6 +1081,15 @@ pub struct PdfIndex {
     pub pages: Vec<PdfPageSummary>,
 }
 
+/// Structured full-text endpoint failure recorded prior to falling back to a binary PDF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackSkip {
+    /// Short upstream endpoint label (for example `"arxiv-html"`, `"ar5iv"`, or `"epmc-xml"`).
+    pub endpoint: &'static str,
+    /// Concise reason the structured endpoint could not supply full text.
+    pub reason: String,
+}
+
 /// Disjoint retrieval outcome produced by scholarly resolution and extraction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtractedPayload {
@@ -1095,6 +1104,8 @@ pub enum ExtractedPayload {
     Pdf {
         /// Validated `%PDF-` document bytes.
         bytes: Vec<u8>,
+        /// Structured full-text endpoints skipped before falling back to PDF.
+        fallback_skips: Vec<FallbackSkip>,
     },
     /// Closed-access or metadata-only record with explicit unavailability reason.
     MetadataOnly {
@@ -1140,6 +1151,8 @@ pub enum StagedOutcome {
         byte_count: usize,
         /// Extracted page counts and per-page heading hints.
         pdf_index: PdfIndex,
+        /// Structured full-text endpoints skipped before falling back to PDF.
+        fallback_skips: Vec<FallbackSkip>,
     },
     /// Bibliographic metadata note staged when no open-access full text exists.
     MetadataOnly {

@@ -8,8 +8,8 @@ use std::collections::{BTreeSet, VecDeque};
 
 use super::providers::{DiscoveryParts, ProviderDiscovery};
 use crate::model::{
-    ExtractedDocument, ExtractedPayload, HttpUrl, ScholarlyId, ScholarlyIdKey, TextFormat,
-    UnavailableReason, WorkMetadata, classify_known_scholarly_url,
+    ExtractedDocument, ExtractedPayload, FallbackSkip, HttpUrl, ScholarlyId, ScholarlyIdKey,
+    TextFormat, UnavailableReason, WorkMetadata, classify_known_scholarly_url,
 };
 
 const MAX_RECLASSIFICATION_DEPTH: u8 = 3;
@@ -272,11 +272,18 @@ impl WorkResolution {
     pub(super) fn record_endpoint_failure(
         &mut self,
         endpoint: &'static str,
-        reason: impl Into<String>,
+        reason: impl AsRef<str>,
     ) {
         self.trace.record_endpoint_failure(endpoint, reason);
     }
 
+    pub(super) fn record_structured_skip(
+        &mut self,
+        endpoint: &'static str,
+        reason: impl AsRef<str>,
+    ) {
+        self.trace.record_structured_skip(endpoint, reason);
+    }
     pub(super) fn finish_full_text(mut self, resolved: ResolvedText) -> ExtractedDocument {
         self.metadata.source_url = Some(resolved.source_url);
         if resolved.origin.canonical_key() != self.caller_key {
@@ -307,6 +314,7 @@ impl WorkResolution {
             metadata: self.metadata,
             payload: ExtractedPayload::Pdf {
                 bytes: resolved.bytes,
+                fallback_skips: self.trace.into_fallback_skips(),
             },
             raw_bytes_fetched: resolved.raw_bytes_fetched,
         }
@@ -407,16 +415,33 @@ impl OaFallbackPool {
 #[derive(Debug, Default)]
 struct ResolutionTrace {
     endpoint_failures: Vec<String>,
+    structured_skips: Vec<FallbackSkip>,
 }
 
 impl ResolutionTrace {
-    fn record_endpoint_failure(&mut self, endpoint: &'static str, reason: impl Into<String>) {
+    fn record_structured_skip(&mut self, endpoint: &'static str, reason: impl AsRef<str>) {
+        let raw_reason = reason.as_ref();
+        self.record_endpoint_failure(endpoint, raw_reason);
+        let skip = FallbackSkip {
+            endpoint,
+            reason: raw_reason.to_owned(),
+        };
+        if !self.structured_skips.contains(&skip) {
+            self.structured_skips.push(skip);
+        }
+    }
+
+    fn record_endpoint_failure(&mut self, endpoint: &'static str, reason: impl AsRef<str>) {
         self.endpoint_failures
-            .push(format!("{endpoint}: {}", reason.into()));
+            .push(format!("{endpoint}: {}", reason.as_ref()));
     }
 
     fn failure_summary(&self) -> String {
         self.endpoint_failures.join("; ")
+    }
+
+    fn into_fallback_skips(self) -> Vec<FallbackSkip> {
+        self.structured_skips
     }
 }
 
@@ -692,7 +717,6 @@ mod tests {
         ));
         assert!(after.is_none());
     }
-
     #[test]
     fn depth_exceeded_structured_landing_remains_in_pool_while_visited_is_skipped() {
         let caller = ScholarlyId::parse("10.1000/depth-check").unwrap();
@@ -711,5 +735,36 @@ mod tests {
             "https://pmc.ncbi.nlm.nih.gov/articles/PMC2222222/"
         );
         assert!(session.pop_next_landing().is_none());
+    }
+
+    #[test]
+    fn finish_pdf_emits_deduplicated_raw_fallback_skips() {
+        let arxiv = ScholarlyId::parse("0710.5005").unwrap();
+        let mut session = WorkResolution::new(arxiv.clone(), None, &[]);
+        session.record_structured_skip("arxiv-html", "HTTP 404");
+        session.record_structured_skip("arxiv-html", "HTTP 404");
+        session.record_structured_skip("ar5iv", "request   \n\t  timed out");
+        session.record_structured_skip("src", "a".repeat(60));
+        session.record_structured_skip("epmc-xml", "r4");
+        session.record_structured_skip("epmc-xml", "r5");
+        session.record_structured_skip("epmc-xml", "r6");
+        session.record_structured_skip("epmc-xml", "r7");
+        session.record_structured_skip("epmc-xml", "r8");
+        session.record_structured_skip("epmc-xml", "r9");
+
+        let doc = session.finish_pdf(ResolvedPdf {
+            origin: arxiv,
+            bytes: b"%PDF-1.7\n".to_vec(),
+            source_url: HttpUrl::parse("https://arxiv.org/pdf/0710.5005.pdf").unwrap(),
+            raw_bytes_fetched: 9,
+        });
+        let ExtractedPayload::Pdf { fallback_skips, .. } = doc.payload else {
+            panic!("expected PDF payload");
+        };
+
+        assert_eq!(fallback_skips.len(), 9);
+        assert_eq!(fallback_skips[1].reason, "request   \n\t  timed out");
+        assert_eq!(fallback_skips[2].reason.chars().count(), 60);
+        assert_eq!(fallback_skips[8].reason, "r9");
     }
 }

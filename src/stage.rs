@@ -72,7 +72,10 @@ pub fn stage_document(
                 toc: prepared.toc,
             }
         }
-        ExtractedPayload::Pdf { bytes } => {
+        ExtractedPayload::Pdf {
+            bytes,
+            fallback_skips,
+        } => {
             // Validate and index PDF bytes in memory before writing PDF or index files to disk so
             // corrupt, encrypted, or bomb PDFs never touch the staging directory.
             let pdf_index = index_pdf_bytes(&bytes)?;
@@ -91,6 +94,7 @@ pub fn stage_document(
                 page_index_path,
                 byte_count: bytes.len(),
                 pdf_index,
+                fallback_skips,
             }
         }
         ExtractedPayload::MetadataOnly { reason } => {
@@ -211,6 +215,7 @@ mod tests {
             metadata: WorkMetadata::default(),
             payload: ExtractedPayload::Pdf {
                 bytes: pdf_bytes.clone(),
+                fallback_skips: Vec::new(),
             },
             raw_bytes_fetched: pdf_bytes.len(),
         };
@@ -258,6 +263,7 @@ mod tests {
                 metadata: WorkMetadata::default(),
                 payload: ExtractedPayload::Pdf {
                     bytes: pdf_bytes.clone(),
+                    fallback_skips: Vec::new(),
                 },
                 raw_bytes_fetched: pdf_bytes.len(),
             },
@@ -272,6 +278,7 @@ mod tests {
                 metadata: WorkMetadata::default(),
                 payload: ExtractedPayload::Pdf {
                     bytes: pdf_bytes.clone(),
+                    fallback_skips: Vec::new(),
                 },
                 raw_bytes_fetched: pdf_bytes.len(),
             },
@@ -328,6 +335,7 @@ mod tests {
             metadata: WorkMetadata::default(),
             payload: ExtractedPayload::Pdf {
                 bytes: b"%PDF-1.5\nnot actually a valid pdf".to_vec(),
+                fallback_skips: Vec::new(),
             },
             raw_bytes_fetched: 33,
         };

@@ -95,6 +95,7 @@ pub(super) fn dispatch_http_response(
             metadata,
             payload: ExtractedPayload::Pdf {
                 bytes: response.body,
+                fallback_skips: Vec::new(),
             },
             raw_bytes_fetched: raw_len,
         });

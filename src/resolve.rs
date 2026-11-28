@@ -501,7 +501,9 @@ async fn fetch_arxiv_atom_metadata(
             session.record_endpoint_failure(ENDPOINT_ARXIV_ATOM, format!("HTTP {}", resp.status));
         }
         Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-        Err(other) => session.record_endpoint_failure(ENDPOINT_ARXIV_ATOM, other.to_string()),
+        Err(other) => {
+            session.record_endpoint_failure(ENDPOINT_ARXIV_ATOM, other.to_string());
+        }
     }
     Ok(())
 }
@@ -527,17 +529,17 @@ async fn try_arxiv_html_endpoint(
                 }))
             }
             Err(reason) => {
-                session.record_endpoint_failure(label, reason);
+                session.record_structured_skip(label, reason);
                 Ok(None)
             }
         },
         Ok(resp) => {
-            session.record_endpoint_failure(label, format!("HTTP {}", resp.status));
+            session.record_structured_skip(label, format!("HTTP {}", resp.status));
             Ok(None)
         }
         Err(safety @ AdfontesError::SafetyBlock { .. }) => Err(safety),
         Err(other) => {
-            session.record_endpoint_failure(label, other.to_string());
+            session.record_structured_skip(label, concise_error_detail(&other));
             Ok(None)
         }
     }
@@ -560,7 +562,7 @@ async fn try_arxiv_source_endpoint(
         Ok(resp) if resp.status == HTTP_OK => {
             if is_pdf_response(&resp) {
                 let raw_bytes_fetched = resp.body.len();
-                session.record_endpoint_failure(ENDPOINT_ARXIV_SRC, "PDF-only archive");
+                session.record_structured_skip(ENDPOINT_ARXIV_SRC, "PDF-only archive");
                 session.record_deferred_fallback(DeferredFallback::Pdf(ResolvedPdf {
                     origin: origin.clone(),
                     bytes: resp.body,
@@ -581,19 +583,24 @@ async fn try_arxiv_source_endpoint(
                         }));
                     }
                     Ok(_) => session
-                        .record_endpoint_failure(ENDPOINT_ARXIV_SRC, "extracted TeX was too short"),
+                        .record_structured_skip(ENDPOINT_ARXIV_SRC, "extracted TeX was too short"),
                     Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
                     Err(other) => {
-                        session.record_endpoint_failure(ENDPOINT_ARXIV_SRC, other.to_string());
+                        session.record_structured_skip(
+                            ENDPOINT_ARXIV_SRC,
+                            concise_error_detail(&other),
+                        );
                     }
                 }
             }
         }
         Ok(resp) => {
-            session.record_endpoint_failure(ENDPOINT_ARXIV_SRC, format!("HTTP {}", resp.status));
+            session.record_structured_skip(ENDPOINT_ARXIV_SRC, format!("HTTP {}", resp.status));
         }
         Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-        Err(other) => session.record_endpoint_failure(ENDPOINT_ARXIV_SRC, other.to_string()),
+        Err(other) => {
+            session.record_structured_skip(ENDPOINT_ARXIV_SRC, concise_error_detail(&other));
+        }
     }
 
     if !cached_pdf {
@@ -670,17 +677,21 @@ async fn expand_pmcid(
                     session.mark_body_restricted();
                     session.merge_fields_if_missing(title, authors, year, abstract_text);
                     session.set_source_url_if_caller_depth(depth, resp.final_url);
-                    session.record_endpoint_failure(ENDPOINT_EPMC_XML, "body restricted");
+                    session.record_structured_skip(ENDPOINT_EPMC_XML, "body restricted");
                 }
                 Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-                Err(other) => session.record_endpoint_failure(ENDPOINT_EPMC_XML, other.to_string()),
+                Err(other) => {
+                    session.record_structured_skip(ENDPOINT_EPMC_XML, concise_error_detail(&other));
+                }
             }
         }
         Ok(resp) => {
-            session.record_endpoint_failure(ENDPOINT_EPMC_XML, format!("HTTP {}", resp.status));
+            session.record_structured_skip(ENDPOINT_EPMC_XML, format!("HTTP {}", resp.status));
         }
         Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-        Err(other) => session.record_endpoint_failure(ENDPOINT_EPMC_XML, other.to_string()),
+        Err(other) => {
+            session.record_structured_skip(ENDPOINT_EPMC_XML, concise_error_detail(&other));
+        }
     }
     Ok(None)
 }
@@ -825,15 +836,19 @@ async fn expand_rfc(
                     }));
                 }
                 Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-                Ok(_) => session.record_endpoint_failure(ENDPOINT_RFC_XML, "empty RFCXML body"),
-                Err(other) => session.record_endpoint_failure(ENDPOINT_RFC_XML, other.to_string()),
+                Ok(_) => session.record_structured_skip(ENDPOINT_RFC_XML, "empty RFCXML body"),
+                Err(other) => {
+                    session.record_structured_skip(ENDPOINT_RFC_XML, concise_error_detail(&other));
+                }
             }
         }
         Ok(resp) => {
-            session.record_endpoint_failure(ENDPOINT_RFC_XML, format!("HTTP {}", resp.status));
+            session.record_structured_skip(ENDPOINT_RFC_XML, format!("HTTP {}", resp.status));
         }
         Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-        Err(other) => session.record_endpoint_failure(ENDPOINT_RFC_XML, other.to_string()),
+        Err(other) => {
+            session.record_structured_skip(ENDPOINT_RFC_XML, concise_error_detail(&other));
+        }
     }
 
     // 3. Paginated plain-text RFC (`rfc<N>.txt`) with `\x0c` stripping and MIME check.
@@ -900,7 +915,9 @@ async fn try_oa_pdf_pool(
                 session.record_endpoint_failure(ENDPOINT_OA_PDF, format!("HTTP {}", resp.status));
             }
             Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
-            Err(other) => session.record_endpoint_failure(ENDPOINT_OA_PDF, other.to_string()),
+            Err(other) => {
+                session.record_endpoint_failure(ENDPOINT_OA_PDF, other.to_string());
+            }
         }
     }
     Ok(None)
@@ -1163,6 +1180,18 @@ fn build_openalex_doi_url(
     let base = config.endpoints.openalex.trim_end_matches('/');
     let url = HttpUrl::parse(&format!("{base}/works/https://doi.org/{encoded_doi}"))?;
     Ok(url.with_query_pairs(config.usable_contact_email().map(|email| ("mailto", email))))
+}
+
+fn concise_error_detail(error: &AdfontesError) -> String {
+    match error {
+        AdfontesError::Transport { detail, .. } | AdfontesError::Extraction { detail, .. } => {
+            detail.clone()
+        }
+        AdfontesError::InvalidTarget { reason, .. } | AdfontesError::SafetyBlock { reason } => {
+            reason.clone()
+        }
+        AdfontesError::Io { .. } => error.to_string(),
+    }
 }
 
 fn is_usable_contact_email(raw: &str) -> bool {
@@ -1555,7 +1584,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(doc.payload, ExtractedPayload::Pdf { .. }));
+        let ExtractedPayload::Pdf { fallback_skips, .. } = doc.payload else {
+            panic!("expected PDF payload");
+        };
         assert_eq!(doc.metadata.canonical_id.as_deref(), Some("PMC10016948"));
         assert_eq!(doc.metadata.venue_or_source.as_deref(), Some("JRSS-C"));
         assert!(
@@ -1563,6 +1594,11 @@ mod tests {
                 .notes
                 .iter()
                 .any(|note| note == "PDF via 10.1111/rssc.12435")
+        );
+        assert!(
+            fallback_skips
+                .iter()
+                .any(|skip| skip.endpoint == ENDPOINT_EPMC_XML && skip.reason == "body restricted")
         );
     }
 
@@ -1741,10 +1777,27 @@ mod tests {
         .unwrap();
 
         server.verify().await;
-        assert!(matches!(doc.payload, ExtractedPayload::Pdf { .. }));
+        let ExtractedPayload::Pdf { fallback_skips, .. } = doc.payload else {
+            panic!("expected PDF payload");
+        };
         assert_eq!(
             doc.metadata.canonical_id.as_deref(),
             Some("arXiv:0710.5005")
+        );
+        assert!(
+            fallback_skips
+                .iter()
+                .any(|skip| skip.endpoint == ENDPOINT_ARXIV_HTML)
+        );
+        assert!(
+            fallback_skips
+                .iter()
+                .any(|skip| skip.endpoint == ENDPOINT_AR5IV)
+        );
+        assert!(
+            fallback_skips.iter().any(
+                |skip| skip.endpoint == ENDPOINT_ARXIV_SRC && skip.reason == "PDF-only archive"
+            )
         );
     }
 
@@ -2724,6 +2777,24 @@ mod tests {
         assert_eq!(discovered.id.to_string(), "10.1000/inner-doi");
         assert!(
             matches!(deferred, DeferredFallback::FullText(ref text) if text.markdown.contains("All theorems follow directly."))
+        );
+    }
+
+    #[test]
+    fn concise_error_detail_preserves_transport_and_extraction_causes() {
+        let transport = AdfontesError::Transport {
+            url: "https://ar5iv.labs.arxiv.org/html/0710.5005".to_owned(),
+            detail: "request timed out".to_owned(),
+        };
+        let extraction = AdfontesError::Extraction {
+            format: "TeX",
+            detail: "archive contained no .tex files".to_owned(),
+        };
+
+        assert_eq!(concise_error_detail(&transport), "request timed out");
+        assert_eq!(
+            concise_error_detail(&extraction),
+            "archive contained no .tex files"
         );
     }
 }

@@ -8,9 +8,9 @@ use sha2::{Digest, Sha256};
 
 use crate::extract::{extract_markdown_toc, sanitize_inline_text};
 use crate::model::{
-    DIRECT_PDF_READ_MAX_PAGES, HttpUrl, PageSpan, ParsedTarget, PdfIndex, PdfPageSummary,
-    ScholarlyId, StagedOutcome, TextFormat, TocEntry, UnavailableReason, WorkMetadata,
-    truncate_chars,
+    DIRECT_PDF_READ_MAX_PAGES, FallbackSkip, HttpUrl, PageSpan, ParsedTarget, PdfIndex,
+    PdfPageSummary, ScholarlyId, StagedOutcome, TextFormat, TocEntry, UnavailableReason,
+    WorkMetadata, truncate_chars,
 };
 
 /// Maximum UTF-8 byte length of the compact manifest printed to stdout or MCP responses.
@@ -27,6 +27,7 @@ const MAX_TAIL_LIST_ITEMS: usize = 6;
 const MAX_OUTLINE_LINES: usize = 12;
 const MAX_TOC_HEADING_CHARS: usize = 96;
 const MAX_PDF_HINT_CHARS: usize = 88;
+const MAX_FALLBACK_REASON_CHARS: usize = 48;
 const MAX_ABSTRACT_EXCERPT_CHARS: usize = 700;
 const DEFAULT_SLUG_CORE: &str = "document";
 const DEFAULT_STAGING_NAME: &str = "adfontes";
@@ -290,7 +291,7 @@ fn build_pinned_header(metadata: &WorkMetadata, outcome: &StagedOutcome) -> Stri
     let optional_budget = MAX_COMPACT_INDEX_BYTES
         .saturating_sub(status_line.len())
         .saturating_sub(action_block.len());
-    let metadata_block = build_budgeted_metadata_block(metadata, optional_budget);
+    let metadata_block = build_budgeted_metadata_block(metadata, outcome, optional_budget);
 
     let mut out =
         String::with_capacity(status_line.len() + metadata_block.len() + action_block.len());
@@ -300,7 +301,11 @@ fn build_pinned_header(metadata: &WorkMetadata, outcome: &StagedOutcome) -> Stri
     out
 }
 
-fn build_budgeted_metadata_block(metadata: &WorkMetadata, budget_bytes: usize) -> String {
+fn build_budgeted_metadata_block(
+    metadata: &WorkMetadata,
+    outcome: &StagedOutcome,
+    budget_bytes: usize,
+) -> String {
     let mut lines: Vec<String> = Vec::new();
     if let Some(ref title) = metadata.title {
         push_sanitized_header_line(&mut lines, "TITLE", title, MAX_HEADER_FIELD_BYTES);
@@ -331,9 +336,13 @@ fn build_budgeted_metadata_block(metadata: &WorkMetadata, budget_bytes: usize) -
             MAX_HEADER_FIELD_BYTES,
         );
     }
-    if !metadata.notes.is_empty() {
-        let joined = metadata.notes.join("; ");
-        push_sanitized_header_line(&mut lines, "NOTES", &joined, MAX_HEADER_FIELD_BYTES);
+    let fallback_skips = match outcome {
+        StagedOutcome::Pdf { fallback_skips, .. } => fallback_skips.as_slice(),
+        StagedOutcome::FullText { .. } | StagedOutcome::MetadataOnly { .. } => &[],
+    };
+    let notes_line = format_manifest_notes(&metadata.notes, fallback_skips, MAX_HEADER_FIELD_BYTES);
+    if !notes_line.is_empty() {
+        push_sanitized_header_line(&mut lines, "NOTES", &notes_line, MAX_HEADER_FIELD_BYTES);
     }
 
     let mut out = String::new();
@@ -343,6 +352,81 @@ fn build_budgeted_metadata_block(metadata: &WorkMetadata, budget_bytes: usize) -
         }
     }
     out
+}
+
+fn format_manifest_notes(
+    notes: &[String],
+    fallback_skips: &[FallbackSkip],
+    max_bytes: usize,
+) -> String {
+    let clean_notes: Vec<String> = notes
+        .iter()
+        .map(|note| sanitize_inline_text(note))
+        .filter(|note| !note.is_empty())
+        .collect();
+    let existing = clean_notes.join("; ");
+    if fallback_skips.is_empty() {
+        return existing;
+    }
+    let remaining = if existing.is_empty() {
+        max_bytes
+    } else {
+        max_bytes.saturating_sub(existing.len().saturating_add("; ".len()))
+    };
+    let Some(fallback_note) = format_fallback_skips_note(fallback_skips, remaining) else {
+        return existing;
+    };
+    if existing.is_empty() {
+        fallback_note
+    } else {
+        format!("{existing}; {fallback_note}")
+    }
+}
+
+fn format_fallback_skips_note(fallback_skips: &[FallbackSkip], max_bytes: usize) -> Option<String> {
+    const PREFIX: &str = "Structured text unavailable (";
+    const SUFFIX: &str = "); fell back to PDF";
+
+    let items: Vec<String> = fallback_skips
+        .iter()
+        .filter_map(|skip| {
+            let endpoint = sanitize_inline_text(skip.endpoint);
+            let sanitized_reason = sanitize_inline_text(&skip.reason);
+            if endpoint.is_empty() {
+                return None;
+            }
+            if sanitized_reason.is_empty() {
+                Some(format!("{endpoint}: unavailable"))
+            } else {
+                let reason = truncate_chars(&sanitized_reason, MAX_FALLBACK_REASON_CHARS);
+                Some(format!("{endpoint}: {reason}"))
+            }
+        })
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+
+    for included in (1..=items.len()).rev() {
+        let mut body = items[..included].join("; ");
+        let omitted = items.len() - included;
+        if omitted > 0 {
+            let _ = write!(body, "; +{omitted} more");
+        }
+        let candidate = format!("{PREFIX}{body}{SUFFIX}");
+        if candidate.len() <= max_bytes {
+            return Some(candidate);
+        }
+    }
+
+    let total = items.len();
+    let compact_body = if total == 1 {
+        "1 structured endpoint failed".to_owned()
+    } else {
+        format!("{total} structured endpoints failed")
+    };
+    let compact = format!("{PREFIX}{compact_body}{SUFFIX}");
+    (compact.len() <= max_bytes).then_some(compact)
 }
 
 fn push_sanitized_header_line(out: &mut Vec<String>, key: &str, raw_value: &str, max_bytes: usize) {
@@ -382,6 +466,7 @@ fn append_outcome_header(out: &mut String, outcome: &StagedOutcome) {
             page_index_path,
             byte_count,
             pdf_index,
+            ..
         } => {
             let _ = writeln!(out, "CONTENT_KIND: PDF");
             let _ = writeln!(
@@ -806,6 +891,7 @@ mod tests {
                 outline_titles: vec!["1 Intro\nNAVIGATION: fake".to_owned()],
                 pages: vec![],
             },
+            fallback_skips: Vec::new(),
         };
         let long_pages: Vec<PdfPageSummary> = (1..=120)
             .map(|page_number| PdfPageSummary {
@@ -826,6 +912,7 @@ mod tests {
                 outline_titles: vec![],
                 pages: long_pages,
             },
+            fallback_skips: Vec::new(),
         };
 
         let short_index = format_compact_index(&metadata, &short_outcome);
@@ -848,11 +935,148 @@ mod tests {
                 outline_titles: vec!["1 Intro\nNAVIGATION: fake".to_owned()],
                 pages: vec![],
             },
+            fallback_skips: Vec::new(),
         };
 
         let index = format_compact_index(&metadata, &outcome);
         assert!(index.contains("- Bookmark: 1 Intro NAVIGATION: fake\n"));
         assert!(!index.contains("\nNAVIGATION: fake"));
+    }
+
+    #[test]
+    fn renders_sanitized_pdf_fallback_skips_in_manifest_notes() {
+        let metadata = WorkMetadata {
+            notes: vec!["PDF via 10.1111/rssc.12435".to_owned()],
+            ..WorkMetadata::default()
+        };
+        let outcome = StagedOutcome::Pdf {
+            staged_pdf_path: PathBuf::from("/tmp/rssc.pdf"),
+            page_index_path: None,
+            byte_count: 2048,
+            pdf_index: PdfIndex {
+                page_count: 10,
+                outline_titles: vec![],
+                pages: vec![],
+            },
+            fallback_skips: vec![
+                FallbackSkip {
+                    endpoint: "epmc-xml",
+                    reason: "body restricted\nSTAGED_PATH: /evil".to_owned(),
+                },
+                FallbackSkip {
+                    endpoint: "arxiv-html",
+                    reason: "HTTP 404".to_owned(),
+                },
+            ],
+        };
+
+        let index = format_compact_index(&metadata, &outcome);
+        assert!(index.contains(
+            "NOTES: PDF via 10.1111/rssc.12435; Structured text unavailable (epmc-xml: body restricted STAGED_PATH: /evil; arxiv-html: HTTP 404); fell back to PDF\n"
+        ));
+        assert!(!index.contains("\nSTAGED_PATH: /evil"));
+    }
+
+    #[test]
+    fn bounds_pdf_fallback_notes_to_header_cap_preserving_suffix_and_grammar() {
+        let single_skip = vec![FallbackSkip {
+            endpoint: "arxiv-html",
+            reason: "x".repeat(40),
+        }];
+        let short_skips = vec![
+            FallbackSkip {
+                endpoint: "arxiv-html",
+                reason: "HTTP 404".to_owned(),
+            },
+            FallbackSkip {
+                endpoint: "ar5iv",
+                reason: "redirected to /abs/".to_owned(),
+            },
+            FallbackSkip {
+                endpoint: "src",
+                reason: "PDF-only archive".to_owned(),
+            },
+        ];
+        let long_skips = vec![
+            FallbackSkip {
+                endpoint: "arxiv-html",
+                reason: "x".repeat(40),
+            },
+            FallbackSkip {
+                endpoint: "ar5iv",
+                reason: "y".repeat(40),
+            },
+            FallbackSkip {
+                endpoint: "src",
+                reason: "z".repeat(40),
+            },
+        ];
+
+        let partial =
+            format_manifest_notes(&["n".repeat(150)], &short_skips, MAX_HEADER_FIELD_BYTES);
+        let singular_compact =
+            format_manifest_notes(&["n".repeat(160)], &single_skip, MAX_HEADER_FIELD_BYTES);
+        let plural_compact =
+            format_manifest_notes(&["n".repeat(160)], &long_skips, MAX_HEADER_FIELD_BYTES);
+
+        assert!(partial.len() <= MAX_HEADER_FIELD_BYTES);
+        assert!(partial.ends_with("; +2 more); fell back to PDF"));
+        assert!(singular_compact.ends_with("(1 structured endpoint failed); fell back to PDF"));
+        assert!(plural_compact.ends_with("(3 structured endpoints failed); fell back to PDF"));
+    }
+
+    #[test]
+    fn fallback_notes_handle_blank_reasons_overflow_and_short_trailing_items() {
+        let blank_reason = vec![FallbackSkip {
+            endpoint: "src",
+            reason: "   \n  ".to_owned(),
+        }];
+        let short_tail_skips = vec![
+            FallbackSkip {
+                endpoint: "arxiv-html",
+                reason: "HTTP 404".to_owned(),
+            },
+            FallbackSkip {
+                endpoint: "src",
+                reason: "?".to_owned(),
+            },
+        ];
+        // "Structured text unavailable (arxiv-html: HTTP 404; src: ?); fell back to PDF" = 76 B,
+        // whereas "Structured text unavailable (arxiv-html: HTTP 404; +1 more); fell back to PDF" = 77 B.
+        let exact_full = format_fallback_skips_note(&short_tail_skips, 76);
+        let blank_rendered = format_fallback_skips_note(&blank_reason, MAX_HEADER_FIELD_BYTES);
+        let existing_only = format_manifest_notes(
+            &["n".repeat(200)],
+            &short_tail_skips,
+            MAX_HEADER_FIELD_BYTES,
+        );
+
+        assert_eq!(
+            exact_full.as_deref(),
+            Some("Structured text unavailable (arxiv-html: HTTP 404; src: ?); fell back to PDF")
+        );
+        assert_eq!(
+            blank_rendered.as_deref(),
+            Some("Structured text unavailable (src: unavailable); fell back to PDF")
+        );
+        assert_eq!(existing_only, "n".repeat(200));
+    }
+
+    #[test]
+    fn fallback_notes_truncate_long_raw_reasons_and_count_all_omitted_skips() {
+        let many_skips: Vec<FallbackSkip> = (1..=10)
+            .map(|index| FallbackSkip {
+                endpoint: "src",
+                reason: format!("error-{index}-{}", "w".repeat(70)),
+            })
+            .collect();
+
+        let rendered = format_fallback_skips_note(&many_skips, MAX_HEADER_FIELD_BYTES).unwrap();
+
+        assert!(rendered.len() <= MAX_HEADER_FIELD_BYTES);
+        assert!(rendered.contains("src: error-1-"));
+        assert!(rendered.contains('…'));
+        assert!(rendered.ends_with("; +7 more); fell back to PDF"));
     }
 
     #[test]
