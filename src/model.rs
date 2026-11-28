@@ -115,9 +115,9 @@ pub enum AdfontesError {
     },
 }
 
-/// Validated scholarly identifier or HTTP(S) URL parsed at the input boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParsedTarget {
+/// Validated scholarly work identifier resolvable through structured retrieval waterfalls.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ScholarlyId {
     /// Canonical `arXiv` e-print identifier (`2409.13740v1` or `math/0211159v1`).
     Arxiv(ArxivId),
     /// Digital Object Identifier (`10.xxxx/...`).
@@ -128,6 +128,72 @@ pub enum ParsedTarget {
     Pmid(Pmid),
     /// IETF Request for Comments number (`RFC 9110`).
     Rfc(RfcNumber),
+}
+
+impl ScholarlyId {
+    /// Parses a bare scholarly identifier or canonical scholarly URL into a [`ScholarlyId`].
+    ///
+    /// Delegates to [`ParsedTarget::parse`] so security blocks ([`AdfontesError::SafetyBlock`])
+    /// are preserved, and rejects non-scholarly HTTP(S) URLs as [`AdfontesError::InvalidTarget`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdfontesError::SafetyBlock`] for disallowed schemes or credentials, and
+    /// [`AdfontesError::InvalidTarget`] when `raw` is not a recognized scholarly identifier or URL.
+    pub fn parse(raw: &str) -> Result<Self, AdfontesError> {
+        match ParsedTarget::parse(raw)? {
+            ParsedTarget::Scholarly(id) => Ok(id),
+            ParsedTarget::Url(_) => Err(AdfontesError::InvalidTarget {
+                input: raw.to_owned(),
+                reason: "expected a scholarly identifier (arXiv, DOI, PMCID, PMID, or RFC)"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    /// Returns an opaque canonical equivalence key for cycle detection and alias deduplication.
+    ///
+    /// Folds `arXiv` versions via [`ArxivId::base_id`] and ASCII-lowercases DOI Basic Latin
+    /// characters per ISO 26324.
+    #[must_use]
+    pub fn canonical_key(&self) -> ScholarlyIdKey {
+        match self {
+            Self::Arxiv(id) => {
+                ScholarlyIdKey(ScholarlyIdKeyKind::Arxiv(id.base_id().to_ascii_lowercase()))
+            }
+            Self::Doi(doi) => {
+                ScholarlyIdKey(ScholarlyIdKeyKind::Doi(doi.as_str().to_ascii_lowercase()))
+            }
+            Self::PmcId(pmc) => ScholarlyIdKey(ScholarlyIdKeyKind::PmcId(pmc.as_str().to_owned())),
+            Self::Pmid(pmid) => ScholarlyIdKey(ScholarlyIdKeyKind::Pmid(pmid.as_str().to_owned())),
+            Self::Rfc(rfc) => ScholarlyIdKey(ScholarlyIdKeyKind::Rfc(*rfc)),
+        }
+    }
+}
+
+impl fmt::Display for ScholarlyId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Arxiv(id) => write!(formatter, "arXiv:{id}"),
+            Self::Doi(doi) => formatter.write_str(doi.as_str()),
+            Self::PmcId(pmc) => formatter.write_str(pmc.as_str()),
+            Self::Pmid(pmid) => write!(formatter, "PMID:{pmid}"),
+            Self::Rfc(rfc) => write!(formatter, "{rfc}"),
+        }
+    }
+}
+
+/// Opaque canonical equivalence key for deduplicating [`ScholarlyId`] aliases across a work.
+///
+/// Constructed exclusively via [`ScholarlyId::canonical_key`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScholarlyIdKey(ScholarlyIdKeyKind);
+
+/// Validated scholarly identifier or HTTP(S) URL parsed at the input boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedTarget {
+    /// Canonical scholarly work identifier (`arXiv`, `DOI`, `PMCID`, `PMID`, `RFC`).
+    Scholarly(ScholarlyId),
     /// Validated `http://` or `https://` web URL.
     Url(HttpUrl),
 }
@@ -137,7 +203,7 @@ impl ParsedTarget {
     ///
     /// Canonical scholarly URLs (`arxiv.org`, `ar5iv`, `doi.org`, DataCite `10.48550/arXiv.*`,
     /// Europe PMC / NCBI `PMC*`, PubMed, and IETF RFC Editor / Datatracker) are classified into
-    /// their scholarly variant so they benefit from full multi-format waterfalls.
+    /// their [`ScholarlyId`] variant so they benefit from full multi-format waterfalls.
     ///
     /// # Errors
     ///
@@ -161,36 +227,38 @@ impl ParsedTarget {
 
         if looks_like_url_with_scheme(trimmed) {
             let http_url = HttpUrl::parse(trimmed)?;
-            return Ok(classify_known_scholarly_url(&http_url).unwrap_or(Self::Url(http_url)));
+            return Ok(classify_known_scholarly_url(&http_url)
+                .map_or(Self::Url(http_url), Self::Scholarly));
         }
 
         if strip_ascii_prefix_ignore_case(trimmed, ARXIV_SCHEME_PREFIX).is_some() {
-            return ArxivId::parse(trimmed).map(Self::Arxiv);
+            return ArxivId::parse(trimmed).map(|id| Self::Scholarly(ScholarlyId::Arxiv(id)));
         }
         if strip_ascii_prefix_ignore_case(trimmed, DOI_SCHEME_PREFIX).is_some() {
-            return parse_doi_or_arxiv_datacite(trimmed);
+            return parse_doi_or_arxiv_datacite(trimmed).map(Self::Scholarly);
         }
         if strip_ascii_prefix_ignore_case(trimmed, PMCID_SCHEME_PREFIX).is_some() {
-            return PmcId::parse(trimmed).map(Self::PmcId);
+            return PmcId::parse(trimmed).map(|id| Self::Scholarly(ScholarlyId::PmcId(id)));
         }
         if strip_ascii_prefix_ignore_case(trimmed, PMID_SCHEME_PREFIX).is_some() {
-            return Pmid::parse(trimmed).map(Self::Pmid);
+            return Pmid::parse(trimmed).map(|id| Self::Scholarly(ScholarlyId::Pmid(id)));
         }
         if strip_ascii_prefix_ignore_case(trimmed, PMC_PREFIX).is_some() {
-            return PmcId::parse(trimmed).map(Self::PmcId);
+            return PmcId::parse(trimmed).map(|id| Self::Scholarly(ScholarlyId::PmcId(id)));
         }
         if strip_ascii_prefix_ignore_case(trimmed, RFC_PREFIX).is_some() {
-            return RfcNumber::parse(trimmed).map(Self::Rfc);
+            return RfcNumber::parse(trimmed).map(|id| Self::Scholarly(ScholarlyId::Rfc(id)));
         }
         if trimmed.starts_with(DOI_DIRECTORY_PREFIX) {
-            return parse_doi_or_arxiv_datacite(trimmed);
+            return parse_doi_or_arxiv_datacite(trimmed).map(Self::Scholarly);
         }
         if looks_like_non_scholarly_uri_scheme(trimmed) {
             let http_url = HttpUrl::parse(trimmed)?;
-            return Ok(classify_known_scholarly_url(&http_url).unwrap_or(Self::Url(http_url)));
+            return Ok(classify_known_scholarly_url(&http_url)
+                .map_or(Self::Url(http_url), Self::Scholarly));
         }
         if let Ok(arxiv) = ArxivId::parse(trimmed) {
-            return Ok(Self::Arxiv(arxiv));
+            return Ok(Self::Scholarly(ScholarlyId::Arxiv(arxiv)));
         }
 
         Err(AdfontesError::InvalidTarget {
@@ -271,6 +339,19 @@ impl ArxivId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Returns the versionless `arXiv` identifier (`2409.13740` or `math/0211159`).
+    #[must_use]
+    pub fn base_id(&self) -> &str {
+        match self.0.rsplit_once('v') {
+            Some((base, version))
+                if !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                base
+            }
+            _ => &self.0,
+        }
+    }
 }
 
 macro_rules! impl_from_str {
@@ -299,7 +380,16 @@ macro_rules! impl_display_as_str {
     };
 }
 
-impl_from_str!(ParsedTarget, ArxivId, Doi, PmcId, Pmid, RfcNumber, HttpUrl);
+impl_from_str!(
+    ParsedTarget,
+    ScholarlyId,
+    ArxivId,
+    Doi,
+    PmcId,
+    Pmid,
+    RfcNumber,
+    HttpUrl
+);
 impl_display_as_str!(ArxivId, Doi, PmcId, Pmid, HttpUrl);
 
 /// Validated Digital Object Identifier (`10.<registrant>/<suffix>`).
@@ -1056,9 +1146,9 @@ pub struct StagedResult {
     pub compact_index: String,
 }
 
-/// Reclassifies a known scholarly landing/PDF URL into its canonical [`ParsedTarget`] variant.
+/// Reclassifies a known scholarly landing/PDF URL into its canonical [`ScholarlyId`].
 #[must_use]
-pub fn classify_known_scholarly_url(url: &HttpUrl) -> Option<ParsedTarget> {
+pub fn classify_known_scholarly_url(url: &HttpUrl) -> Option<ScholarlyId> {
     let UrlHost::Domain(domain) = url.host() else {
         return None;
     };
@@ -1085,12 +1175,21 @@ pub fn truncate_chars(input: &str, max_chars: usize) -> String {
     out
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ScholarlyIdKeyKind {
+    Arxiv(String),
+    Doi(String),
+    PmcId(String),
+    Pmid(String),
+    Rfc(RfcNumber),
+}
+
 struct ArxivVersionSplit<'a> {
     digits: &'a str,
     version: Option<u32>,
 }
 
-fn classify_arxiv_url(host: &str, path: &str) -> Option<ParsedTarget> {
+fn classify_arxiv_url(host: &str, path: &str) -> Option<ScholarlyId> {
     if !matches!(
         host,
         "arxiv.org" | "www.arxiv.org" | "export.arxiv.org" | "ar5iv.labs.arxiv.org" | "ar5iv.org"
@@ -1102,14 +1201,14 @@ fn classify_arxiv_url(host: &str, path: &str) -> Option<ParsedTarget> {
             let trimmed = rest.trim_end_matches('/');
             let decoded = percent_decode_utf8(trimmed)?;
             if let Ok(arxiv) = ArxivId::parse(&decoded) {
-                return Some(ParsedTarget::Arxiv(arxiv));
+                return Some(ScholarlyId::Arxiv(arxiv));
             }
         }
     }
     None
 }
 
-fn classify_doi_url(host: &str, path: &str) -> Option<ParsedTarget> {
+fn classify_doi_url(host: &str, path: &str) -> Option<ScholarlyId> {
     if !matches!(host, "doi.org" | "www.doi.org" | "dx.doi.org") {
         return None;
     }
@@ -1117,21 +1216,21 @@ fn classify_doi_url(host: &str, path: &str) -> Option<ParsedTarget> {
     parse_doi_or_arxiv_datacite(raw_doi).ok()
 }
 
-fn classify_biomedical_url(host: &str, path: &str) -> Option<ParsedTarget> {
+fn classify_biomedical_url(host: &str, path: &str) -> Option<ScholarlyId> {
     if matches!(
         host,
         "pmc.ncbi.nlm.nih.gov" | "www.ncbi.nlm.nih.gov" | "ncbi.nlm.nih.gov"
     ) {
         for segment in path.split('/') {
             if let Ok(pmc) = PmcId::parse(segment) {
-                return Some(ParsedTarget::PmcId(pmc));
+                return Some(ScholarlyId::PmcId(pmc));
             }
         }
         if let Some(rest) = strip_ascii_prefix_ignore_case(path, "/pubmed/")
             && let Some(first) = rest.split('/').next()
             && let Ok(pmid) = Pmid::parse(first)
         {
-            return Some(ParsedTarget::Pmid(pmid));
+            return Some(ScholarlyId::Pmid(pmid));
         }
     }
 
@@ -1139,7 +1238,7 @@ fn classify_biomedical_url(host: &str, path: &str) -> Option<ParsedTarget> {
         && let Some(first) = path.trim_matches('/').split('/').next()
         && let Ok(pmid) = Pmid::parse(first)
     {
-        return Some(ParsedTarget::Pmid(pmid));
+        return Some(ScholarlyId::Pmid(pmid));
     }
 
     if matches!(host, "europepmc.org" | "www.europepmc.org") {
@@ -1149,27 +1248,27 @@ fn classify_biomedical_url(host: &str, path: &str) -> Option<ParsedTarget> {
         {
             let digits = strip_ascii_prefix_ignore_case(first, PMC_PREFIX).unwrap_or(first);
             if let Ok(pmc) = PmcId::parse(&format!("PMC{digits}")) {
-                return Some(ParsedTarget::PmcId(pmc));
+                return Some(ScholarlyId::PmcId(pmc));
             }
         }
         if let Some(rest) = strip_ascii_prefix_ignore_case(trimmed, "articles/")
             && let Some(first) = rest.split('/').next()
             && let Ok(pmc) = PmcId::parse(first)
         {
-            return Some(ParsedTarget::PmcId(pmc));
+            return Some(ScholarlyId::PmcId(pmc));
         }
         if let Some(rest) = strip_ascii_prefix_ignore_case(trimmed, "article/med/")
             && let Some(first) = rest.split('/').next()
             && let Ok(pmid) = Pmid::parse(first)
         {
-            return Some(ParsedTarget::Pmid(pmid));
+            return Some(ScholarlyId::Pmid(pmid));
         }
     }
 
     None
 }
 
-fn classify_rfc_url(host: &str, path: &str) -> Option<ParsedTarget> {
+fn classify_rfc_url(host: &str, path: &str) -> Option<ScholarlyId> {
     let trimmed = path.trim_end_matches('/');
     let candidate = if matches!(host, "www.rfc-editor.org" | "rfc-editor.org") {
         strip_ascii_prefix_ignore_case(trimmed, "/rfc/pdfrfc/")
@@ -1194,18 +1293,18 @@ fn classify_rfc_url(host: &str, path: &str) -> Option<ParsedTarget> {
         .or_else(|| strip_ascii_suffix_ignore_case(candidate, PDF_EXTENSION))
         .unwrap_or(candidate);
 
-    RfcNumber::parse(base).ok().map(ParsedTarget::Rfc)
+    RfcNumber::parse(base).ok().map(ScholarlyId::Rfc)
 }
 
-fn parse_doi_or_arxiv_datacite(raw: &str) -> Result<ParsedTarget, AdfontesError> {
+fn parse_doi_or_arxiv_datacite(raw: &str) -> Result<ScholarlyId, AdfontesError> {
     let doi = Doi::parse(raw)?;
     if let Some(arxiv_suffix) = strip_ascii_prefix_ignore_case(doi.as_str(), "10.48550/arxiv.") {
         let candidate = arxiv_suffix.trim_end_matches('/');
         if let Ok(arxiv) = ArxivId::parse(candidate) {
-            return Ok(ParsedTarget::Arxiv(arxiv));
+            return Ok(ScholarlyId::Arxiv(arxiv));
         }
     }
-    Ok(ParsedTarget::Doi(doi))
+    Ok(ScholarlyId::Doi(doi))
 }
 
 fn looks_like_url_with_scheme(input: &str) -> bool {
@@ -1416,8 +1515,72 @@ mod tests {
     fn parses_arxiv_targets_and_datacite_aliases(#[case] raw: &str, #[case] expected_full: &str) {
         let parsed = ParsedTarget::parse(raw).unwrap();
         let expected = ArxivId::parse(expected_full).unwrap();
-        assert_eq!(parsed, ParsedTarget::Arxiv(expected.clone()));
+        assert_eq!(
+            parsed,
+            ParsedTarget::Scholarly(ScholarlyId::Arxiv(expected.clone()))
+        );
         assert_eq!(expected.as_str(), expected_full);
+    }
+
+    #[rstest]
+    #[case("2409.13740", "2409.13740")]
+    #[case("2409.13740v2", "2409.13740")]
+    #[case("math/0211159v1", "math/0211159")]
+    #[case("math.GT/0211159v12", "math.GT/0211159")]
+    fn extracts_versionless_arxiv_base_id(#[case] raw: &str, #[case] expected_base: &str) {
+        let id = ArxivId::parse(raw).unwrap();
+        assert_eq!(id.base_id(), expected_base);
+    }
+
+    #[test]
+    fn scholarly_id_canonical_key_folds_arxiv_versions_and_case() {
+        let modern_v1 = ScholarlyId::parse("2409.13740v1").unwrap().canonical_key();
+        let modern_v2 = ScholarlyId::parse("2409.13740v2").unwrap().canonical_key();
+        let legacy_upper = ScholarlyId::parse("math.GT/0211159v1")
+            .unwrap()
+            .canonical_key();
+        let legacy_lower = ScholarlyId::parse("math.gt/0211159")
+            .unwrap()
+            .canonical_key();
+        let doi_upper = ScholarlyId::parse("10.1038/S41586-025-10072-4")
+            .unwrap()
+            .canonical_key();
+        let doi_lower = ScholarlyId::parse("10.1038/s41586-025-10072-4")
+            .unwrap()
+            .canonical_key();
+        let pmc = ScholarlyId::parse("PMC10016948").unwrap().canonical_key();
+
+        assert_eq!(modern_v1, modern_v2);
+        assert_eq!(legacy_upper, legacy_lower);
+        assert_eq!(doi_upper, doi_lower);
+        assert_ne!(doi_lower, pmc);
+    }
+
+    #[rstest]
+    #[case("arXiv:2409.13740v1")]
+    #[case("10.1111/rssc.12435")]
+    #[case("PMC10016948")]
+    #[case("PMID:38491022")]
+    #[case("RFC 9110")]
+    fn scholarly_id_display_round_trips_through_parse(#[case] canonical: &str) {
+        let parsed = ScholarlyId::parse(canonical).unwrap();
+        assert_eq!(parsed.to_string(), canonical);
+        assert_eq!(ScholarlyId::parse(&parsed.to_string()).unwrap(), parsed);
+    }
+
+    #[test]
+    fn scholarly_id_parse_rejects_plain_urls_and_preserves_safety_blocks() {
+        let plain_url_error = ScholarlyId::parse("https://example.org/paper.html").unwrap_err();
+        let scheme_error = ScholarlyId::parse("file:///etc/passwd").unwrap_err();
+        let userinfo_error =
+            ScholarlyId::parse("https://user:pass@arxiv.org/abs/2409.13740").unwrap_err();
+
+        assert!(matches!(
+            plain_url_error,
+            AdfontesError::InvalidTarget { .. }
+        ));
+        assert!(matches!(scheme_error, AdfontesError::SafetyBlock { .. }));
+        assert!(matches!(userinfo_error, AdfontesError::SafetyBlock { .. }));
     }
 
     #[rstest]
@@ -1450,7 +1613,7 @@ mod tests {
     )]
     fn parses_percent_encoded_and_sici_dois(#[case] raw: &str, #[case] expected: &str) {
         let parsed = ParsedTarget::parse(raw).unwrap();
-        let ParsedTarget::Doi(doi) = parsed else {
+        let ParsedTarget::Scholarly(ScholarlyId::Doi(doi)) = parsed else {
             panic!("expected Doi variant for {raw}");
         };
         assert_eq!(doi.as_str(), expected);
@@ -1480,7 +1643,7 @@ mod tests {
     #[case("https://europepmc.org/articles/PMC112233", "PMC112233")]
     fn parses_pmcid_variants(#[case] raw: &str, #[case] expected: &str) {
         let parsed = ParsedTarget::parse(raw).unwrap();
-        let ParsedTarget::PmcId(pmc) = parsed else {
+        let ParsedTarget::Scholarly(ScholarlyId::PmcId(pmc)) = parsed else {
             panic!("expected PmcId variant for {raw}");
         };
         assert_eq!(pmc.as_str(), expected);
@@ -1502,7 +1665,7 @@ mod tests {
     #[case("https://europepmc.org/article/med/38491022/abstract", "38491022")]
     fn parses_pmid_variants(#[case] raw: &str, #[case] expected: &str) {
         let parsed = ParsedTarget::parse(raw).unwrap();
-        let ParsedTarget::Pmid(pmid) = parsed else {
+        let ParsedTarget::Scholarly(ScholarlyId::Pmid(pmid)) = parsed else {
             panic!("expected Pmid variant for {raw}");
         };
         assert_eq!(pmid.as_str(), expected);
@@ -1525,7 +1688,7 @@ mod tests {
     #[case("https://datatracker.ietf.org/doc/html/rfc2119", 2119)]
     fn parses_rfc_variants(#[case] raw: &str, #[case] expected_number: u32) {
         let parsed = ParsedTarget::parse(raw).unwrap();
-        let ParsedTarget::Rfc(rfc) = parsed else {
+        let ParsedTarget::Scholarly(ScholarlyId::Rfc(rfc)) = parsed else {
             panic!("expected Rfc variant for {raw}");
         };
         assert_eq!(rfc.get(), expected_number);

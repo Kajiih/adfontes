@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use crate::extract::{clean_html_fragment, sanitize_inline_text};
-use crate::model::{HttpUrl, ParsedTarget, PmcId, RfcNumber, WorkMetadata};
+use crate::model::{HttpUrl, PmcId, RfcNumber, ScholarlyId, WorkMetadata};
 
 const MAX_METADATA_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INVERTED_ABSTRACT_WORDS: usize = 4_000;
@@ -68,7 +68,7 @@ impl OaCandidates {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct EuropePmcIds {
     pub(super) pmcid: Option<PmcId>,
-    pub(super) follow_up_target: Option<ParsedTarget>,
+    pub(super) follow_up_target: Option<ScholarlyId>,
 }
 
 /// Size-bounded, parsed provider JSON payload encapsulating [`serde_json::Value`] inside `providers`.
@@ -268,8 +268,7 @@ impl JsonDoc {
         let follow_up_target = record
             .key("doi")
             .str()
-            .and_then(|raw_doi| ParsedTarget::parse(raw_doi).ok())
-            .filter(|target| !matches!(target, ParsedTarget::Url(_)));
+            .and_then(|raw_doi| ScholarlyId::parse(raw_doi).ok());
         Some(EuropePmcIds {
             pmcid,
             follow_up_target,

@@ -22,7 +22,8 @@ use crate::extract::{
 };
 use crate::model::{
     AdfontesError, ArxivId, Doi, ExtractedDocument, ExtractedPayload, HttpUrl, ParsedTarget, PmcId,
-    Pmid, RfcNumber, TextFormat, UnavailableReason, WorkMetadata, classify_known_scholarly_url,
+    Pmid, RfcNumber, ScholarlyId, ScholarlyIdKey, TextFormat, UnavailableReason, WorkMetadata,
+    classify_known_scholarly_url,
 };
 use crate::pdf::is_pdf_magic;
 use crate::transport::{HttpClient, HttpResponse};
@@ -281,15 +282,19 @@ async fn resolve_target_inner(
     budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     depth: u8,
-    visited: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<ScholarlyIdKey>,
 ) -> Result<ExtractedDocument, AdfontesError> {
-    visited.insert(target_visit_key(target));
     match target {
-        ParsedTarget::Arxiv(id) => resolve_arxiv(id, budget, config).await,
-        ParsedTarget::Doi(doi) => resolve_doi(doi, budget, config, depth, visited).await,
-        ParsedTarget::PmcId(pmcid) => resolve_pmcid(pmcid, budget, config).await,
-        ParsedTarget::Pmid(pmid) => resolve_pmid(pmid, budget, config, depth, visited).await,
-        ParsedTarget::Rfc(rfc) => resolve_rfc(*rfc, budget, config).await,
+        ParsedTarget::Scholarly(id) => {
+            visited.insert(id.canonical_key());
+            match id {
+                ScholarlyId::Arxiv(arxiv) => resolve_arxiv(arxiv, budget, config).await,
+                ScholarlyId::Doi(doi) => resolve_doi(doi, budget, config, depth, visited).await,
+                ScholarlyId::PmcId(pmcid) => resolve_pmcid(pmcid, budget, config).await,
+                ScholarlyId::Pmid(pmid) => resolve_pmid(pmid, budget, config, depth, visited).await,
+                ScholarlyId::Rfc(rfc) => resolve_rfc(*rfc, budget, config).await,
+            }
+        }
         ParsedTarget::Url(url) => resolve_url(url, budget, config, depth, visited).await,
     }
 }
@@ -572,7 +577,7 @@ async fn resolve_pmid(
     budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     depth: u8,
-    visited: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<ScholarlyIdKey>,
 ) -> Result<ExtractedDocument, AdfontesError> {
     let base = config.endpoints.europe_pmc.trim_end_matches('/');
     let search_url = HttpUrl::parse(&format!(
@@ -607,7 +612,7 @@ async fn resolve_pmid(
     let mut saw_body_restricted = false;
 
     if let Some(pmcid) = ids.pmcid
-        && visited.insert(target_visit_key(&ParsedTarget::PmcId(pmcid.clone())))
+        && visited.insert(ScholarlyId::PmcId(pmcid.clone()).canonical_key())
     {
         match resolve_pmcid(&pmcid, budget, config).await {
             Ok(pmc_doc) if !matches!(pmc_doc.payload, ExtractedPayload::MetadataOnly { .. }) => {
@@ -624,11 +629,12 @@ async fn resolve_pmid(
 
     if depth < MAX_RECLASSIFICATION_DEPTH
         && !budget.is_exhausted()
-        && let Some(parsed_target) = ids.follow_up_target
-        && !visited.contains(&target_visit_key(&parsed_target))
+        && let Some(follow_up) = ids.follow_up_target
+        && !visited.contains(&follow_up.canonical_key())
     {
+        let follow_up_target = ParsedTarget::Scholarly(follow_up);
         match Box::pin(resolve_target_inner(
-            &parsed_target,
+            &follow_up_target,
             budget,
             config,
             depth + 1,
@@ -669,7 +675,7 @@ async fn resolve_doi(
     budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     depth: u8,
-    visited: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<ScholarlyIdKey>,
 ) -> Result<ExtractedDocument, AdfontesError> {
     let encoded_doi = doi.percent_encoded_path();
     let doi_canonical_url = HttpUrl::parse(&format!(
@@ -728,7 +734,7 @@ async fn resolve_doi(
 
     // 4. Structured full-text preference: discovered PMCID -> Europe PMC JATS XML.
     if let Some(pmcid) = oa_candidates.pmcid()
-        && visited.insert(target_visit_key(&ParsedTarget::PmcId(pmcid.clone())))
+        && visited.insert(ScholarlyId::PmcId(pmcid.clone()).canonical_key())
     {
         match resolve_pmcid(pmcid, budget, config).await {
             Ok(pmc_doc) if !matches!(pmc_doc.payload, ExtractedPayload::MetadataOnly { .. }) => {
@@ -784,7 +790,7 @@ async fn try_oa_candidates(
     budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     depth: u8,
-    visited: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<ScholarlyIdKey>,
     saw_body_restricted: &mut bool,
 ) -> Result<Option<ExtractedDocument>, AdfontesError> {
     // 1. Prefer OA landing links that point directly to arXiv or PMC structured repositories.
@@ -794,14 +800,15 @@ async fn try_oa_candidates(
             if attempted_targets >= MAX_OA_CANDIDATES || budget.is_exhausted() {
                 break;
             }
-            if let Some(target @ (ParsedTarget::Arxiv(_) | ParsedTarget::PmcId(_))) =
+            if let Some(id @ (ScholarlyId::Arxiv(_) | ScholarlyId::PmcId(_))) =
                 classify_known_scholarly_url(landing)
             {
-                let key = target_visit_key(&target);
+                let key = id.canonical_key();
                 if visited.contains(&key) {
                     continue;
                 }
                 attempted_targets += 1;
+                let target = ParsedTarget::Scholarly(id);
                 match Box::pin(resolve_target_inner(
                     &target,
                     budget,
@@ -849,7 +856,7 @@ async fn try_oa_landing_pages(
     budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     depth: u8,
-    visited: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<ScholarlyIdKey>,
     saw_body_restricted: &mut bool,
 ) -> Result<Option<ExtractedDocument>, AdfontesError> {
     for landing_url in landing_urls.iter().take(MAX_OA_CANDIDATES) {
@@ -859,10 +866,11 @@ async fn try_oa_landing_pages(
         match budget.get(landing_url, Some(ACCEPT_WEB_PREFERRED)).await {
             Ok(resp) => {
                 if depth < MAX_RECLASSIFICATION_DEPTH
-                    && let Some(target @ (ParsedTarget::Arxiv(_) | ParsedTarget::PmcId(_))) =
+                    && let Some(id @ (ScholarlyId::Arxiv(_) | ScholarlyId::PmcId(_))) =
                         classify_known_scholarly_url(&resp.final_url)
-                    && !visited.contains(&target_visit_key(&target))
+                    && !visited.contains(&id.canonical_key())
                 {
+                    let target = ParsedTarget::Scholarly(id);
                     match Box::pin(resolve_target_inner(
                         &target,
                         budget,
@@ -1184,12 +1192,12 @@ async fn resolve_url(
     budget: &ResolveBudget<'_>,
     config: &ResolverConfig,
     depth: u8,
-    visited: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<ScholarlyIdKey>,
 ) -> Result<ExtractedDocument, AdfontesError> {
     budget.client.validate_url_policy(url)?;
-    let response = if let Some(raw_github) = url.to_raw_github_url() {
-        visited.insert(format!("url:{}", raw_github.as_str()));
-        match budget.get(&raw_github, Some(ACCEPT_WEB_PREFERRED)).await {
+    let initial_raw_github = url.to_raw_github_url();
+    let response = if let Some(ref raw_github) = initial_raw_github {
+        match budget.get(raw_github, Some(ACCEPT_WEB_PREFERRED)).await {
             Ok(resp) if resp.status == HTTP_OK => resp,
             Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
             _ => budget.get(url, Some(ACCEPT_WEB_PREFERRED)).await?,
@@ -1208,11 +1216,11 @@ async fn resolve_url(
         {
             if hop != url
                 && let Some(reclassified) = classify_known_scholarly_url(hop)
-                && !matches!(reclassified, ParsedTarget::Url(_))
-                && !visited.contains(&target_visit_key(&reclassified))
+                && !visited.contains(&reclassified.canonical_key())
             {
+                let target = ParsedTarget::Scholarly(reclassified);
                 return Box::pin(resolve_target_inner(
-                    &reclassified,
+                    &target,
                     budget,
                     config,
                     depth + 1,
@@ -1227,7 +1235,7 @@ async fn resolve_url(
     let response = if depth < MAX_RECLASSIFICATION_DEPTH
         && response.final_url != *url
         && let Some(raw_github) = response.final_url.to_raw_github_url()
-        && visited.insert(format!("url:{}", raw_github.as_str()))
+        && initial_raw_github.as_ref() != Some(&raw_github)
     {
         match budget.get(&raw_github, Some(ACCEPT_WEB_PREFERRED)).await {
             Ok(raw_resp) if raw_resp.status == HTTP_OK => raw_resp,
@@ -1500,17 +1508,6 @@ fn is_generic_repository_venue(venue: &str) -> bool {
     GENERIC_REPOSITORY_VENUES
         .iter()
         .any(|generic| venue.eq_ignore_ascii_case(generic))
-}
-
-fn target_visit_key(target: &ParsedTarget) -> String {
-    match target {
-        ParsedTarget::Arxiv(id) => format!("arxiv:{}", id.as_str().to_ascii_lowercase()),
-        ParsedTarget::Doi(doi) => format!("doi:{}", doi.as_str().to_ascii_lowercase()),
-        ParsedTarget::PmcId(pmc) => format!("pmc:{}", pmc.as_str().to_ascii_uppercase()),
-        ParsedTarget::Pmid(pmid) => format!("pmid:{}", pmid.as_str()),
-        ParsedTarget::Rfc(rfc) => format!("rfc:{}", rfc.get()),
-        ParsedTarget::Url(url) => format!("url:{}", url.as_str()),
-    }
 }
 
 const fn is_body_restricted_doc(doc: &ExtractedDocument) -> bool {

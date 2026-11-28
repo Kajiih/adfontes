@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 use crate::extract::{extract_markdown_toc, sanitize_inline_text};
 use crate::model::{
     DIRECT_PDF_READ_MAX_PAGES, HttpUrl, PageSpan, ParsedTarget, PdfIndex, PdfPageSummary,
-    StagedOutcome, TextFormat, TocEntry, UnavailableReason, WorkMetadata, truncate_chars,
+    ScholarlyId, StagedOutcome, TextFormat, TocEntry, UnavailableReason, WorkMetadata,
+    truncate_chars,
 };
 
 /// Maximum UTF-8 byte length of the compact manifest printed to stdout or MCP responses.
@@ -38,39 +39,14 @@ pub fn build_document_slug(target: &ParsedTarget, metadata: &WorkMetadata) -> St
         .as_deref()
         .or_else(|| metadata.source_url.as_ref().map(HttpUrl::as_str))
         .unwrap_or(DEFAULT_STAGING_NAME);
-    let target_key = match target {
-        ParsedTarget::Arxiv(id) => format!("arxiv:{}", id.as_str()),
-        ParsedTarget::Doi(doi) => format!("doi:{}", doi.as_str()),
-        ParsedTarget::PmcId(pmc) => format!("pmc:{}", pmc.as_str()),
-        ParsedTarget::Pmid(pmid) => format!("pmid:{}", pmid.as_str()),
-        ParsedTarget::Rfc(rfc) => format!("rfc:{}", rfc.get()),
-        ParsedTarget::Url(url) => format!("url:{}", url.as_str()),
-    };
-    let hash_hex = short_sha256_hex(&format!("{target_key}|{seed}"));
-
-    let (prefix, core) = match target {
-        ParsedTarget::Arxiv(id) => (
-            "arxiv",
-            sanitize_slug_part(id.as_str(), MAX_SLUG_PREFIX_LEN),
-        ),
-        ParsedTarget::Doi(doi) => ("doi", sanitize_slug_part(doi.as_str(), MAX_SLUG_PREFIX_LEN)),
-        ParsedTarget::PmcId(pmc) => ("pmc", sanitize_slug_part(pmc.as_str(), MAX_SLUG_PREFIX_LEN)),
-        ParsedTarget::Pmid(pmid) => (
-            "pmid",
-            sanitize_slug_part(pmid.as_str(), MAX_SLUG_PREFIX_LEN),
-        ),
-        ParsedTarget::Rfc(rfc) => ("rfc", rfc.get().to_string()),
-        ParsedTarget::Url(url) => (
-            "web",
-            sanitize_slug_part(&url_slug_seed(url), MAX_SLUG_PREFIX_LEN),
-        ),
-    };
-    let trimmed_core = if core.is_empty() {
+    let parts = slug_parts(target);
+    let hash_hex = short_sha256_hex(&format!("{}|{seed}", parts.hash_key));
+    let trimmed_core = if parts.core.is_empty() {
         DEFAULT_SLUG_CORE
     } else {
-        core.as_str()
+        parts.core.as_str()
     };
-    format!("{prefix}_{trimmed_core}_{hash_hex}")
+    format!("{}_{trimmed_core}_{hash_hex}", parts.prefix)
 }
 
 /// Formats a bounded (`<= 3,600 B`) compact index pinning status, staged paths, and navigation
@@ -640,6 +616,47 @@ fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
         boundary -= 1;
     }
     input.get(..boundary).unwrap_or_default().to_owned()
+}
+
+struct SlugParts {
+    hash_key: String,
+    prefix: &'static str,
+    core: String,
+}
+
+fn slug_parts(target: &ParsedTarget) -> SlugParts {
+    match target {
+        ParsedTarget::Scholarly(ScholarlyId::Arxiv(id)) => SlugParts {
+            hash_key: format!("arxiv:{}", id.as_str()),
+            prefix: "arxiv",
+            core: sanitize_slug_part(id.as_str(), MAX_SLUG_PREFIX_LEN),
+        },
+        ParsedTarget::Scholarly(ScholarlyId::Doi(doi)) => SlugParts {
+            hash_key: format!("doi:{}", doi.as_str()),
+            prefix: "doi",
+            core: sanitize_slug_part(doi.as_str(), MAX_SLUG_PREFIX_LEN),
+        },
+        ParsedTarget::Scholarly(ScholarlyId::PmcId(pmc)) => SlugParts {
+            hash_key: format!("pmc:{}", pmc.as_str()),
+            prefix: "pmc",
+            core: sanitize_slug_part(pmc.as_str(), MAX_SLUG_PREFIX_LEN),
+        },
+        ParsedTarget::Scholarly(ScholarlyId::Pmid(pmid)) => SlugParts {
+            hash_key: format!("pmid:{}", pmid.as_str()),
+            prefix: "pmid",
+            core: sanitize_slug_part(pmid.as_str(), MAX_SLUG_PREFIX_LEN),
+        },
+        ParsedTarget::Scholarly(ScholarlyId::Rfc(rfc)) => SlugParts {
+            hash_key: format!("rfc:{}", rfc.get()),
+            prefix: "rfc",
+            core: rfc.get().to_string(),
+        },
+        ParsedTarget::Url(url) => SlugParts {
+            hash_key: format!("url:{}", url.as_str()),
+            prefix: "web",
+            core: sanitize_slug_part(&url_slug_seed(url), MAX_SLUG_PREFIX_LEN),
+        },
+    }
 }
 
 fn build_slice_stem(canonical_pdf_path: &Path) -> String {
