@@ -7,6 +7,7 @@
 
 architecture_component!(Resolve);
 
+mod content;
 mod providers;
 
 use std::collections::BTreeSet;
@@ -14,18 +15,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use self::content::{
+    LandingExtraction, MIME_PLAIN_TEXT, MIN_FULLTEXT_CHARS, dispatch_http_response,
+    extract_arxiv_html_response, extract_oa_landing_response, is_arxiv_abs_url, is_pdf_response,
+    is_plain_text_mime,
+};
 use self::providers::{JsonDoc, OaCandidates};
 use crate::extract::{
-    JatsExtraction, XmlDocumentExtraction, clean_rfc_text, extract_arxiv_source_archive,
-    extract_html_to_markdown, extract_jats_xml, extract_markdown_toc, extract_rfc_xml,
-    extract_text_title, extract_xml_document, normalize_markdown_spacing, parse_arxiv_atom_feed,
+    JatsExtraction, clean_rfc_text, extract_arxiv_source_archive, extract_jats_xml,
+    extract_rfc_xml, parse_arxiv_atom_feed,
 };
 use crate::model::{
     AdfontesError, ArxivId, Doi, ExtractedDocument, ExtractedPayload, HttpUrl, ParsedTarget, PmcId,
     Pmid, RfcNumber, ScholarlyId, ScholarlyIdKey, TextFormat, UnavailableReason, WorkMetadata,
     classify_known_scholarly_url,
 };
-use crate::pdf::is_pdf_magic;
 use crate::transport::{HttpClient, HttpResponse};
 
 const ACCEPT_HTML: &str = "text/html, application/xhtml+xml;q=0.9";
@@ -35,20 +39,11 @@ const ACCEPT_CSL_JSON: &str = "application/vnd.citationstyles.csl+json, applicat
 const ACCEPT_PDF: &str = "application/pdf, */*;q=0.1";
 const ACCEPT_WEB_PREFERRED: &str =
     "text/markdown, text/html;q=0.9, application/pdf;q=0.8, text/plain;q=0.7, */*;q=0.5";
-const MIME_PLAIN_TEXT: &str = "text/plain";
-const PDF_MAGIC_PREFIX: &[u8] = b"%PDF-";
 
 const HTTP_OK: u16 = 200;
 const MAX_RECLASSIFICATION_DEPTH: u8 = 3;
 const MAX_WATERFALL_HTTP_REQUESTS: usize = 24;
 const MAX_WATERFALL_DURATION: Duration = Duration::from_secs(90);
-const MIN_FULLTEXT_CHARS: usize = 160;
-const MIN_OA_LANDING_HTML_CHARS: usize = 2_500;
-const MIN_OA_LANDING_HEADINGLESS_CHARS: usize = 5_000;
-const MIN_OA_PAYWALL_OVERRIDE_CHARS: usize = 6_000;
-const MIN_OA_BODY_HEADINGS: usize = 2;
-const MIN_OA_PAYWALL_OVERRIDE_HEADINGS: usize = 3;
-const MAX_ARXIV_STUB_CHECK_LEN: usize = 2_500;
 const MAX_OA_CANDIDATES: usize = 6;
 const MAX_EMAIL_LOCAL_LEN: usize = 64;
 const MAX_EMAIL_TOTAL_LEN: usize = 254;
@@ -59,32 +54,6 @@ const RESERVED_EMAIL_TLDS: &[&str] = &["example", "invalid", "test", "localhost"
 const PLACEHOLDER_EMAIL_LOCALS: &[&str] = &["test", "user", "placeholder", "your_email", "email"];
 
 const GENERIC_REPOSITORY_VENUES: &[&str] = &["arXiv", "Europe PMC", "PubMed"];
-
-const PAYWALL_MARKERS: &[&str] = &[
-    "buy this article",
-    "purchase access",
-    "rent this article",
-    "institutional access",
-    "access through your institution",
-    "sign in to access",
-    "subscribe to read",
-    "get full access",
-    "purchase pdf",
-    "paywall",
-];
-
-const NON_BODY_SECTION_HEADINGS: &[&str] = &[
-    "abstract",
-    "references",
-    "bibliography",
-    "acknowledgments",
-    "acknowledgements",
-    "author information",
-    "supplementary information",
-    "metrics",
-    "rights and permissions",
-    "about this article",
-];
 
 /// Base service URLs used by scholarly retrieval waterfalls.
 ///
@@ -436,41 +405,26 @@ async fn try_arxiv_html_endpoint(
 ) -> Result<Option<ExtractedDocument>, AdfontesError> {
     let url = HttpUrl::parse(raw_url)?;
     match budget.get(&url, Some(ACCEPT_HTML)).await {
-        Ok(resp) if resp.status == HTTP_OK => {
-            if is_arxiv_abs_url(&resp.final_url) {
-                failures.push(format!("{label}: redirected to /abs/"));
-                return Ok(None);
+        Ok(resp) if resp.status == HTTP_OK => match extract_arxiv_html_response(resp) {
+            Ok(extracted) => {
+                if metadata.title.is_none() {
+                    metadata.title = extracted.title;
+                }
+                metadata.source_url = Some(extracted.source_url);
+                Ok(Some(ExtractedDocument {
+                    metadata: metadata.clone(),
+                    payload: ExtractedPayload::FullText {
+                        format: TextFormat::Html,
+                        markdown: extracted.markdown,
+                    },
+                    raw_bytes_fetched: extracted.raw_bytes_fetched,
+                }))
             }
-            let mime = resp.mime_type();
-            if !is_html_mime(&mime) {
-                failures.push(format!("{label}: unexpected MIME `{mime}`"));
-                return Ok(None);
+            Err(reason) => {
+                failures.push(format!("{label}: {reason}"));
+                Ok(None)
             }
-            let decoded = resp.decode_text();
-            let extracted = extract_html_to_markdown(&decoded);
-            if extracted.markdown.len() < MAX_ARXIV_STUB_CHECK_LEN
-                && looks_like_arxiv_no_html_stub(&extracted.markdown)
-            {
-                failures.push(format!("{label}: HTML unavailable notice"));
-                return Ok(None);
-            }
-            if extracted.markdown.len() < MIN_FULLTEXT_CHARS {
-                failures.push(format!("{label}: extracted body too short"));
-                return Ok(None);
-            }
-            if metadata.title.is_none() {
-                metadata.title = extracted.title;
-            }
-            metadata.source_url = Some(resp.final_url);
-            Ok(Some(ExtractedDocument {
-                metadata: metadata.clone(),
-                payload: ExtractedPayload::FullText {
-                    format: TextFormat::Html,
-                    markdown: extracted.markdown,
-                },
-                raw_bytes_fetched: resp.body.len(),
-            }))
-        }
+        },
         Ok(resp) => {
             failures.push(format!("{label}: HTTP {}", resp.status));
             Ok(None)
@@ -897,8 +851,37 @@ async fn try_oa_landing_pages(
                 if resp.status != HTTP_OK || is_arxiv_abs_url(&resp.final_url) {
                     continue;
                 }
-                if let Some(doc) = extract_oa_landing_response(resp, metadata) {
-                    return Ok(Some(doc));
+                match extract_oa_landing_response(resp) {
+                    Some(LandingExtraction::Pdf {
+                        bytes,
+                        source_url,
+                        raw_bytes_fetched,
+                    }) => {
+                        metadata.source_url = Some(source_url);
+                        return Ok(Some(ExtractedDocument {
+                            metadata: metadata.clone(),
+                            payload: ExtractedPayload::Pdf { bytes },
+                            raw_bytes_fetched,
+                        }));
+                    }
+                    Some(LandingExtraction::FullText {
+                        format,
+                        title,
+                        markdown,
+                        source_url,
+                        raw_bytes_fetched,
+                    }) => {
+                        if metadata.title.is_none() {
+                            metadata.title = title;
+                        }
+                        metadata.source_url = Some(source_url);
+                        return Ok(Some(ExtractedDocument {
+                            metadata: metadata.clone(),
+                            payload: ExtractedPayload::FullText { format, markdown },
+                            raw_bytes_fetched,
+                        }));
+                    }
+                    None => {}
                 }
             }
             Err(safety @ AdfontesError::SafetyBlock { .. }) => return Err(safety),
@@ -906,53 +889,6 @@ async fn try_oa_landing_pages(
         }
     }
     Ok(None)
-}
-
-fn extract_oa_landing_response(
-    resp: HttpResponse,
-    metadata: &mut WorkMetadata,
-) -> Option<ExtractedDocument> {
-    if is_pdf_response(&resp) {
-        let byte_len = resp.body.len();
-        metadata.source_url = Some(resp.final_url);
-        return Some(ExtractedDocument {
-            metadata: metadata.clone(),
-            payload: ExtractedPayload::Pdf { bytes: resp.body },
-            raw_bytes_fetched: byte_len,
-        });
-    }
-    let mime = resp.mime_type();
-    if is_markdown_mime(&mime) {
-        let markdown = normalize_markdown_spacing(&resp.decode_text());
-        if markdown.len() >= MIN_FULLTEXT_CHARS {
-            metadata.source_url = Some(resp.final_url);
-            return Some(ExtractedDocument {
-                metadata: metadata.clone(),
-                payload: ExtractedPayload::FullText {
-                    format: TextFormat::Markdown,
-                    markdown,
-                },
-                raw_bytes_fetched: resp.body.len(),
-            });
-        }
-    } else if is_html_mime(&mime) {
-        let extracted = extract_html_to_markdown(&resp.decode_text());
-        if is_substantive_oa_html(&extracted.markdown) {
-            if metadata.title.is_none() {
-                metadata.title = extracted.title;
-            }
-            metadata.source_url = Some(resp.final_url);
-            return Some(ExtractedDocument {
-                metadata: metadata.clone(),
-                payload: ExtractedPayload::FullText {
-                    format: TextFormat::Html,
-                    markdown: extracted.markdown,
-                },
-                raw_bytes_fetched: resp.body.len(),
-            });
-        }
-    }
-    None
 }
 
 async fn resolve_pmcid(
@@ -1256,162 +1192,6 @@ async fn resolve_url(
     dispatch_http_response(response)
 }
 
-fn dispatch_http_response(response: HttpResponse) -> Result<ExtractedDocument, AdfontesError> {
-    let raw_len = response.body.len();
-    let mime = response.mime_type();
-    let host_label = response.final_url.host_str().to_owned();
-    let mut metadata = WorkMetadata {
-        venue_or_source: (!host_label.is_empty()).then_some(host_label),
-        source_url: Some(response.final_url.clone()),
-        ..WorkMetadata::default()
-    };
-
-    if is_pdf_response(&response) {
-        return Ok(ExtractedDocument {
-            metadata,
-            payload: ExtractedPayload::Pdf {
-                bytes: response.body,
-            },
-            raw_bytes_fetched: raw_len,
-        });
-    }
-
-    if is_markdown_mime(&mime)
-        || (is_plain_text_mime(&mime) && looks_like_markdown_path(response.final_url.path()))
-    {
-        let text = response.decode_text();
-        let markdown = normalize_markdown_spacing(&text);
-        metadata.title = extract_text_title(&markdown);
-        return Ok(ExtractedDocument {
-            metadata,
-            payload: ExtractedPayload::FullText {
-                format: TextFormat::Markdown,
-                markdown,
-            },
-            raw_bytes_fetched: raw_len,
-        });
-    }
-
-    if is_html_mime(&mime) {
-        let extracted = extract_html_to_markdown(&response.decode_text());
-        metadata.title = extracted.title;
-        if extracted.markdown.trim().is_empty() {
-            return Ok(ExtractedDocument {
-                metadata,
-                payload: ExtractedPayload::MetadataOnly {
-                    reason: UnavailableReason::UpstreamUnavailable {
-                        detail: "HTML page yielded no readable body text".to_owned(),
-                    },
-                },
-                raw_bytes_fetched: raw_len,
-            });
-        }
-        return Ok(ExtractedDocument {
-            metadata,
-            payload: ExtractedPayload::FullText {
-                format: TextFormat::Html,
-                markdown: extracted.markdown,
-            },
-            raw_bytes_fetched: raw_len,
-        });
-    }
-
-    if is_plain_text_mime(&mime) {
-        let text = response.decode_text();
-        let normalized = normalize_markdown_spacing(&text);
-        metadata.title = extract_text_title(&normalized);
-        return Ok(ExtractedDocument {
-            metadata,
-            payload: ExtractedPayload::FullText {
-                format: TextFormat::PlainText,
-                markdown: normalized,
-            },
-            raw_bytes_fetched: raw_len,
-        });
-    }
-
-    if let Some(xml_doc) = try_dispatch_xml_response(&response, &mime, &mut metadata)? {
-        return Ok(xml_doc);
-    }
-
-    Ok(ExtractedDocument {
-        metadata,
-        payload: ExtractedPayload::MetadataOnly {
-            reason: UnavailableReason::UnsupportedContentType {
-                mime: if mime.is_empty() {
-                    "application/octet-stream".to_owned()
-                } else {
-                    mime
-                },
-            },
-        },
-        raw_bytes_fetched: raw_len,
-    })
-}
-
-fn try_dispatch_xml_response(
-    response: &HttpResponse,
-    mime: &str,
-    metadata: &mut WorkMetadata,
-) -> Result<Option<ExtractedDocument>, AdfontesError> {
-    if !is_xml_mime(mime) {
-        return Ok(None);
-    }
-    let raw_len = response.body.len();
-    let xml = response.decode_text();
-    match extract_xml_document(&xml) {
-        Ok(XmlDocumentExtraction::Jats(JatsExtraction::FullText {
-            title,
-            authors,
-            year,
-            abstract_text,
-            markdown,
-        })) => {
-            fill_metadata_if_missing(metadata, title, authors, year, abstract_text);
-            Ok(Some(ExtractedDocument {
-                metadata: metadata.clone(),
-                payload: ExtractedPayload::FullText {
-                    format: TextFormat::JatsXml,
-                    markdown,
-                },
-                raw_bytes_fetched: raw_len,
-            }))
-        }
-        Ok(XmlDocumentExtraction::Jats(JatsExtraction::BodyRestricted {
-            title,
-            authors,
-            year,
-            abstract_text,
-        })) => {
-            fill_metadata_if_missing(metadata, title, authors, year, abstract_text);
-            Ok(Some(ExtractedDocument {
-                metadata: metadata.clone(),
-                payload: ExtractedPayload::MetadataOnly {
-                    reason: UnavailableReason::BodyRestricted,
-                },
-                raw_bytes_fetched: raw_len,
-            }))
-        }
-        Ok(XmlDocumentExtraction::Rfc(extracted)) if !extracted.markdown.is_empty() => {
-            if metadata.title.is_none() {
-                metadata.title = extracted.title;
-            }
-            Ok(Some(ExtractedDocument {
-                metadata: metadata.clone(),
-                payload: ExtractedPayload::FullText {
-                    format: TextFormat::RfcXml,
-                    markdown: extracted.markdown,
-                },
-                raw_bytes_fetched: raw_len,
-            }))
-        }
-        Err(safety @ AdfontesError::SafetyBlock { .. }) => Err(safety),
-        Ok(XmlDocumentExtraction::Rfc(_) | XmlDocumentExtraction::UnsupportedRoot) | Err(_) => {
-            Ok(None)
-        }
-    }
-}
-
 async fn fetch_optional_json(
     url: &HttpUrl,
     accept: &str,
@@ -1517,125 +1297,6 @@ const fn is_body_restricted_doc(doc: &ExtractedDocument) -> bool {
             reason: UnavailableReason::BodyRestricted
         }
     )
-}
-
-fn is_pdf_response(resp: &HttpResponse) -> bool {
-    let mime = resp.mime_type();
-    if matches!(
-        mime.as_str(),
-        "application/pdf" | "application/x-pdf" | "application/acrobat"
-    ) {
-        return is_pdf_magic(&resp.body);
-    }
-    if is_html_mime(&mime)
-        || is_markdown_mime(&mime)
-        || is_plain_text_mime(&mime)
-        || is_xml_mime(&mime)
-        || matches!(
-            mime.as_str(),
-            ACCEPT_JSON | "application/vnd.citationstyles.csl+json"
-        )
-    {
-        return false;
-    }
-    starts_with_pdf_magic(&resp.body)
-}
-
-fn starts_with_pdf_magic(bytes: &[u8]) -> bool {
-    let trimmed = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .and_then(|start| bytes.get(start..))
-        .unwrap_or_default();
-    let Some(rest) = trimmed.strip_prefix(PDF_MAGIC_PREFIX) else {
-        return false;
-    };
-    // ISO 32000-1 §7.5.2 header line: `%PDF-<major>.<minor>` followed by EOL (rejecting TeX
-    // comments such as `%PDF-1.7 compatibility note`).
-    let Some((major, after_major)) = rest.split_first() else {
-        return false;
-    };
-    let Some((dot, after_dot)) = after_major.split_first() else {
-        return false;
-    };
-    let Some((minor, after_version)) = after_dot.split_first() else {
-        return false;
-    };
-    if !major.is_ascii_digit() || *dot != b'.' || !minor.is_ascii_digit() {
-        return false;
-    }
-    after_version
-        .iter()
-        .find(|&&byte| byte != b' ' && byte != b'\t')
-        .is_some_and(|&byte| matches!(byte, b'\r' | b'\n'))
-}
-
-fn is_substantive_oa_html(markdown: &str) -> bool {
-    let char_count = markdown.chars().count();
-    if char_count < MIN_OA_LANDING_HTML_CHARS {
-        return false;
-    }
-    let body_headings = extract_markdown_toc(markdown)
-        .iter()
-        .filter(|entry| {
-            let normalized = entry.heading.trim().to_ascii_lowercase();
-            !NON_BODY_SECTION_HEADINGS
-                .iter()
-                .any(|ignored| normalized == *ignored)
-        })
-        .count();
-    let lower = markdown.to_ascii_lowercase();
-    let has_paywall = PAYWALL_MARKERS.iter().any(|marker| lower.contains(marker));
-    if has_paywall {
-        body_headings >= MIN_OA_PAYWALL_OVERRIDE_HEADINGS
-            && char_count >= MIN_OA_PAYWALL_OVERRIDE_CHARS
-    } else {
-        body_headings >= MIN_OA_BODY_HEADINGS || char_count >= MIN_OA_LANDING_HEADINGLESS_CHARS
-    }
-}
-
-fn is_arxiv_abs_url(url: &HttpUrl) -> bool {
-    let path = url.path().to_ascii_lowercase();
-    path.starts_with("/abs/")
-}
-
-fn looks_like_arxiv_no_html_stub(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("html is not available for the source")
-        || lower.contains("no html version available")
-}
-
-fn is_html_mime(mime: &str) -> bool {
-    matches!(mime, "text/html" | "application/xhtml+xml")
-}
-
-fn is_markdown_mime(mime: &str) -> bool {
-    matches!(mime, "text/markdown" | "text/x-markdown")
-}
-
-fn is_plain_text_mime(mime: &str) -> bool {
-    matches!(
-        mime,
-        MIME_PLAIN_TEXT | "text/x-rst" | "text/restructuredtext"
-    )
-}
-
-fn is_xml_mime(mime: &str) -> bool {
-    matches!(
-        mime,
-        "application/xml" | "text/xml" | "application/jats+xml" | "application/rfc+xml"
-    )
-}
-
-fn looks_like_markdown_path(path: &str) -> bool {
-    let segment = path.rsplit('/').next().unwrap_or("");
-    let has_markdown_extension = segment.rsplit_once('.').is_some_and(|(stem, extension)| {
-        !stem.is_empty()
-            && (extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown"))
-    });
-    has_markdown_extension
-        || segment.eq_ignore_ascii_case("llms.txt")
-        || segment.eq_ignore_ascii_case("llms-full.txt")
 }
 
 fn is_usable_contact_email(raw: &str) -> bool {

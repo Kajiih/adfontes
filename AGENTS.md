@@ -23,7 +23,7 @@ Run the narrowest verification checks covering your changes, and run the full ga
 - `Transport` owns SSRF-pinned asynchronous HTTP(S) requests with cached keep-alive/TLS connection pools and `SsrfDnsResolver`, proxy/CIDR matching, MIME parsing, and charset decoding (`reqwest`, `rustls` with `ring`, `rustls-platform-verifier`, `ipnet`, `mime`, `encoding_rs`).
 - `Pdf` owns pure-Rust PDF indexing and lossless vector page slicing (`lopdf`).
 - `Extract` owns math-preserving HTML5, XML, RFC, TeX, and CommonMark TOC extractors (`cssparser`, `cssparser-color`, `scraper`, `roxmltree`, `pulldown-cmark`).
-- `Resolve` (`src/resolve.rs` and `src/resolve/providers.rs`) is strictly filesystem-free (no `std::fs` writes or staging) and drives asynchronous scholarly retrieval waterfalls.
+- `Resolve` (`src/resolve.rs`, `src/resolve/content.rs`, and `src/resolve/providers.rs`) is strictly filesystem-free (no `std::fs` writes or staging) and drives asynchronous scholarly retrieval waterfalls.
 - `Stage` (`src/stage.rs`, `src/stage/manifest.rs`, `src/stage/sandbox.rs`) is strictly network-free (no `Transport` or `Resolve` imports) and owns `sha2`, `tempfile`, `rustix`, and `dunce`.
 - `Mcp` (`Mcp => [Stage, Model]`) is strictly synchronous and network-free, owns `serde`, and exposes newline-delimited JSON-RPC `2.0` stdio tools (`fetch`, `slice_pdf`) over an injected synchronous fetcher callback.
 - `Cli` owns `clap`, startup environment binding (`CliEnv::from_env()`), and the single-threaded `tokio` runtime bridging `fetch` and `mcp` to async `Resolve`/`Transport`.
