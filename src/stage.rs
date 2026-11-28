@@ -232,13 +232,16 @@ fn stage_optional_pdf_text(
     prepared_text: PreparedPdfText,
     dest_path: &Path,
 ) -> Result<PdfTextSummary, AdfontesError> {
-    prepared_text.persist_with(
-        |text_content| {
-            write_file_atomic(dest_path, text_content.as_bytes())?;
-            Ok(dest_path.to_path_buf())
-        },
-        || remove_file_if_present(dest_path),
-    )
+    match prepared_text {
+        PreparedPdfText::None(summary) => {
+            remove_file_if_present(dest_path)?;
+            Ok(summary)
+        }
+        PreparedPdfText::Extracted(extracted) => {
+            write_file_atomic(dest_path, extracted.markdown().as_bytes())?;
+            Ok(extracted.into_summary(dest_path.to_path_buf()))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -10,10 +10,10 @@ use sha2::{Digest, Sha256};
 
 use crate::extract::{extract_markdown_toc, sanitize_inline_text};
 use crate::model::{
-    AdfontesError, DIRECT_PDF_READ_MAX_PAGES, FallbackSkip, HttpUrl, MIN_READABLE_PDF_PAGE_CHARS,
-    PageSpan, ParsedTarget, PdfIndex, PdfPageLineRange, PdfPageSummary, PdfPageText,
-    PdfTextCoverage, PdfTextSummary, ScholarlyId, StagedOutcome, StagedPdfText, TextFormat,
-    TocEntry, UnavailableReason, WorkMetadata, truncate_chars, truncate_utf8_bytes,
+    DIRECT_PDF_READ_MAX_PAGES, FallbackSkip, HttpUrl, MIN_READABLE_PDF_PAGE_CHARS, PageSpan,
+    ParsedTarget, PdfIndex, PdfPageLineRange, PdfPageSummary, PdfPageText, PdfTextCoverage,
+    PdfTextSummary, ScholarlyId, StagedOutcome, StagedPdfText, TextFormat, TocEntry,
+    UnavailableReason, WorkMetadata, truncate_chars, truncate_utf8_bytes,
 };
 use crate::pdf::ExtractedPdfPage;
 
@@ -159,51 +159,40 @@ pub(super) enum PdfTextScope {
     },
 }
 
-pub(super) struct PreparedPdfText {
-    indexed_pages: u32,
-    empty_pages: u32,
-    unindexed_pages: u32,
-    layer: PreparedPdfTextLayer,
+pub(super) enum PreparedPdfText {
+    None(PdfTextSummary),
+    Extracted(PreparedExtractedPdfText),
 }
 
-impl PreparedPdfText {
-    pub(super) fn persist_with(
-        self,
-        write_text: impl FnOnce(&str) -> Result<PathBuf, AdfontesError>,
-        remove_stale: impl FnOnce() -> Result<(), AdfontesError>,
-    ) -> Result<PdfTextSummary, AdfontesError> {
-        match self.layer {
-            PreparedPdfTextLayer::None => {
-                remove_stale()?;
-                Ok(PdfTextSummary::without_text(
-                    self.indexed_pages,
-                    self.unindexed_pages,
-                ))
-            }
-            PreparedPdfTextLayer::Extracted {
-                non_empty_pages,
-                readable_pages,
-                content,
-                line_count,
-                byte_count,
-                page_line_ranges,
-            } => {
-                let path = write_text(&content)?;
-                drop(content);
-                Ok(PdfTextSummary::with_text(
-                    non_empty_pages,
-                    readable_pages,
-                    self.empty_pages,
-                    self.unindexed_pages,
-                    StagedPdfText {
-                        path,
-                        line_count,
-                        byte_count,
-                        page_line_ranges,
-                    },
-                ))
-            }
-        }
+pub(super) struct PreparedExtractedPdfText {
+    non_empty_pages: NonZeroU32,
+    readable_pages: u32,
+    empty_pages: u32,
+    unindexed_pages: u32,
+    content: String,
+    line_count: usize,
+    byte_count: usize,
+    page_line_ranges: BTreeMap<NonZeroU32, PdfPageLineRange>,
+}
+
+impl PreparedExtractedPdfText {
+    pub(super) fn markdown(&self) -> &str {
+        &self.content
+    }
+
+    pub(super) fn into_summary(self, path: PathBuf) -> PdfTextSummary {
+        PdfTextSummary::with_text(
+            self.non_empty_pages,
+            self.readable_pages,
+            self.empty_pages,
+            self.unindexed_pages,
+            StagedPdfText {
+                path,
+                line_count: self.line_count,
+                byte_count: self.byte_count,
+                page_line_ranges: self.page_line_ranges,
+            },
+        )
     }
 }
 
@@ -231,12 +220,7 @@ pub(super) fn prepare_pdf_text_document(
     let empty_pages = indexed_pages.saturating_sub(non_empty_count);
 
     let Some(non_empty_pages) = NonZeroU32::new(non_empty_count) else {
-        return PreparedPdfText {
-            indexed_pages,
-            empty_pages,
-            unindexed_pages,
-            layer: PreparedPdfTextLayer::None,
-        };
+        return PreparedPdfText::None(PdfTextSummary::without_text(indexed_pages, unindexed_pages));
     };
 
     let heading = format_pdf_text_heading(title, scope);
@@ -287,19 +271,16 @@ pub(super) fn prepare_pdf_text_document(
     let content = builder.content;
     let line_count = builder.line_count;
     let byte_count = content.len();
-    PreparedPdfText {
-        indexed_pages,
+    PreparedPdfText::Extracted(PreparedExtractedPdfText {
+        non_empty_pages,
+        readable_pages,
         empty_pages,
         unindexed_pages,
-        layer: PreparedPdfTextLayer::Extracted {
-            non_empty_pages,
-            readable_pages,
-            content,
-            line_count,
-            byte_count,
-            page_line_ranges,
-        },
-    }
+        content,
+        line_count,
+        byte_count,
+        page_line_ranges,
+    })
 }
 
 pub(super) struct SliceFilenames {
@@ -1068,18 +1049,6 @@ fn truncate_utf8_bytes_with_ellipsis(input: &str, max_bytes: usize) -> String {
     prefix
 }
 
-enum PreparedPdfTextLayer {
-    None,
-    Extracted {
-        non_empty_pages: NonZeroU32,
-        readable_pages: u32,
-        content: String,
-        line_count: usize,
-        byte_count: usize,
-        page_line_ranges: BTreeMap<NonZeroU32, PdfPageLineRange>,
-    },
-}
-
 struct LineBuilder {
     content: String,
     line_count: usize,
@@ -1566,22 +1535,16 @@ mod tests {
             ExtractedPdfPage::new(NonZeroU32::new(2).unwrap(), String::new()),
             ExtractedPdfPage::new(NonZeroU32::new(3).unwrap(), page3_text.to_owned()),
         ];
-        let prepared = prepare_pdf_text_document(
+        let PreparedPdfText::Extracted(extracted) = prepare_pdf_text_document(
             Some("My Paper\nInjected Line"),
             PdfTextScope::FullDocument { total_pages: 5 },
             &pages,
-        );
-        let mut captured = String::new();
-        let summary = prepared
-            .persist_with(
-                |text| {
-                    captured.push_str(text);
-                    Ok(PathBuf::from("/tmp/paper.extracted.md"))
-                },
-                || Ok(()),
-            )
-            .unwrap();
+        ) else {
+            panic!("expected extracted text");
+        };
+        let captured = extracted.markdown().to_owned();
         let lines: Vec<&str> = captured.lines().collect();
+        let summary = extracted.into_summary(PathBuf::from("/tmp/paper.extracted.md"));
         let staged = summary.staged_text().unwrap();
         let p1_range = staged.page_line_ranges[&NonZeroU32::new(1).unwrap()];
         let p3_range = staged.page_line_ranges[&NonZeroU32::new(3).unwrap()];
@@ -1606,22 +1569,16 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
             page_text.to_owned(),
         )];
-        let prepared = prepare_pdf_text_document(
+        let PreparedPdfText::Extracted(extracted) = prepare_pdf_text_document(
             Some("My Paper\nInjected Line"),
             PdfTextScope::FullDocument { total_pages: 5 },
             &pages,
-        );
-        let mut captured = String::new();
-        let summary = prepared
-            .persist_with(
-                |text| {
-                    captured.push_str(text);
-                    Ok(PathBuf::from("/tmp/paper.extracted.md"))
-                },
-                || Ok(()),
-            )
-            .unwrap();
+        ) else {
+            panic!("expected extracted text");
+        };
+        let captured = extracted.markdown().to_owned();
         let lines: Vec<&str> = captured.lines().collect();
+        let summary = extracted.into_summary(PathBuf::from("/tmp/paper.extracted.md"));
         let staged = summary.staged_text().unwrap();
 
         assert_eq!(
@@ -1639,21 +1596,13 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
             String::new(),
         )];
-        let prepared = prepare_pdf_text_document(
+        let PreparedPdfText::None(summary) = prepare_pdf_text_document(
             Some("Scanned Monograph"),
             PdfTextScope::FullDocument { total_pages: 1 },
             &pages,
-        );
-        let mut wrote_file = false;
-        let summary = prepared
-            .persist_with(
-                |_| {
-                    wrote_file = true;
-                    Ok(PathBuf::from("/tmp/never.extracted.md"))
-                },
-                || Ok(()),
-            )
-            .unwrap();
+        ) else {
+            panic!("expected empty text layer");
+        };
         let outcome = StagedOutcome::Pdf {
             staged_pdf_path: PathBuf::from("/tmp/scanned.pdf"),
             page_index_path: None,
@@ -1675,54 +1624,9 @@ mod tests {
         };
         let manifest = format_compact_index(&WorkMetadata::default(), &outcome);
 
-        assert!(!wrote_file);
         assert!(!manifest.contains("EXTRACTED_TEXT_PATH:"));
         assert!(manifest.contains("TEXT_LAYER: NONE"));
         assert!(manifest.contains("text-only readers cannot read this scanned PDF"));
-    }
-
-    #[test]
-    fn persist_with_none_invokes_stale_cleanup_while_extracted_skips_cleanup() {
-        let empty_pages = vec![ExtractedPdfPage::new(
-            NonZeroU32::new(1).unwrap(),
-            String::new(),
-        )];
-        let readable_pages = vec![ExtractedPdfPage::new(
-            NonZeroU32::new(1).unwrap(),
-            "Readable scholarly prose across methodology.".to_owned(),
-        )];
-        let mut cleaned_for_none = false;
-        let mut cleaned_for_extracted = false;
-
-        let _ = prepare_pdf_text_document(
-            None,
-            PdfTextScope::FullDocument { total_pages: 1 },
-            &empty_pages,
-        )
-        .persist_with(
-            |_| Ok(PathBuf::from("/tmp/unused.extracted.md")),
-            || {
-                cleaned_for_none = true;
-                Ok(())
-            },
-        )
-        .unwrap();
-        let _ = prepare_pdf_text_document(
-            None,
-            PdfTextScope::FullDocument { total_pages: 1 },
-            &readable_pages,
-        )
-        .persist_with(
-            |_| Ok(PathBuf::from("/tmp/used.extracted.md")),
-            || {
-                cleaned_for_extracted = true;
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert!(cleaned_for_none);
-        assert!(!cleaned_for_extracted);
     }
 
     #[test]
@@ -1858,24 +1762,18 @@ mod tests {
             ExtractedPdfPage::new(NonZeroU32::new(310).unwrap(), page_310.to_owned()),
             ExtractedPdfPage::new(NonZeroU32::new(311).unwrap(), page_311.to_owned()),
         ];
-        let prepared = prepare_pdf_text_document(
+        let PreparedPdfText::Extracted(extracted) = prepare_pdf_text_document(
             None,
             PdfTextScope::Slice {
                 span,
                 source_total_pages: 600,
             },
             &pages,
-        );
-        let mut content = String::new();
-        let text_summary = prepared
-            .persist_with(
-                |text| {
-                    content.push_str(text);
-                    Ok(PathBuf::from("/tmp/book_p310-311.extracted.md"))
-                },
-                || Ok(()),
-            )
-            .unwrap();
+        ) else {
+            panic!("expected extracted slice text");
+        };
+        let content = extracted.markdown().to_owned();
+        let text_summary = extracted.into_summary(PathBuf::from("/tmp/book_p310-311.extracted.md"));
         let summary = format_slice_summary(
             Path::new("/tmp/book.pdf"),
             Path::new("/tmp/book_p310-311.pdf"),
