@@ -1057,17 +1057,29 @@ pub struct TocEntry {
     pub end_line: NonZeroUsize,
 }
 
+/// Extracted text summary state for a single PDF page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PdfPageText {
+    /// Page was inspected for text extraction (may still have `char_count == 0` when scanned).
+    Indexed {
+        /// Non-whitespace extracted character count on this page.
+        char_count: usize,
+        /// Detected section/figure/table heading lines on this page.
+        headings: Vec<String>,
+        /// Short first-line text preview for page orientation.
+        preview: String,
+    },
+    /// Page exceeded indexing caps (page limit or cumulative text budget); inspect via `slice_pdf`.
+    Unindexed,
+}
+
 /// Lightweight per-page text hint summary for a staged PDF.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdfPageSummary {
     /// 1-indexed page number.
     pub page_number: NonZeroU32,
-    /// Extracted character count on this page.
-    pub char_count: usize,
-    /// Detected section/figure/table heading lines on this page.
-    pub headings: Vec<String>,
-    /// Short first-line text preview for page orientation.
-    pub preview: String,
+    /// Text extraction state and orientation hints for this page.
+    pub text: PdfPageText,
 }
 
 /// Structural index over a staged PDF document.
@@ -1202,6 +1214,19 @@ pub fn truncate_chars(input: &str, max_chars: usize) -> String {
         out.push(character);
     }
     out
+}
+
+/// Truncates a UTF-8 string slice to at most `max_bytes` bytes on a valid char boundary.
+#[must_use]
+pub fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> &str {
+    if input.len() <= max_bytes {
+        return input;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !input.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    input.get(..boundary).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

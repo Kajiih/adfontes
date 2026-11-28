@@ -17,7 +17,10 @@ use lopdf::{
     decode_text_string,
 };
 
-use crate::model::{AdfontesError, PageSpan, PdfIndex, PdfPageSummary, truncate_chars};
+use crate::model::{
+    AdfontesError, PageSpan, PdfIndex, PdfPageSummary, PdfPageText, truncate_chars,
+    truncate_utf8_bytes,
+};
 
 const PDF_FORMAT_LABEL: &str = "PDF";
 const KEY_FIRST: &[u8] = b"First";
@@ -27,6 +30,8 @@ const MAX_PDF_LOAD_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PDF_PAGE_DECOMPRESSED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PDF_CMAP_BYTES: usize = 1024 * 1024;
+const MAX_PDF_PAGE_TEXT_BYTES: usize = 512 * 1024;
+const MAX_PDF_DOCUMENT_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INDEXED_PDF_PAGES: usize = 250;
 const MAX_PARENT_TREE_DEPTH: usize = 64;
 const MAX_OUTLINE_ITEMS: usize = 200;
@@ -98,38 +103,7 @@ pub fn is_pdf_magic(bytes: &[u8]) -> bool {
 /// Returns [`AdfontesError::SafetyBlock`] if a PDF decompression bomb exceeds memory budgets, or
 /// [`AdfontesError::Extraction`] if `bytes` is not a readable PDF or requires a user password.
 pub fn index_pdf_bytes(bytes: &[u8]) -> Result<PdfIndex, AdfontesError> {
-    let mut doc = load_decrypted_pdf(bytes)?;
-    let page_ids = doc.get_pages();
-    let page_count = u32::try_from(page_ids.len()).unwrap_or(u32::MAX);
-    let outline_titles = extract_outline_titles(&doc);
-
-    let mut remaining_decompressed = MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES;
-    let mut cmap_sizes: BTreeMap<ObjectId, usize> = BTreeMap::new();
-    let mut pages = Vec::with_capacity(page_ids.len());
-
-    for (index, (&page_number, &page_id)) in page_ids.iter().enumerate() {
-        let page_text = if index >= MAX_INDEXED_PDF_PAGES {
-            String::new()
-        } else {
-            extract_bounded_page_text(
-                &mut doc,
-                page_number,
-                page_id,
-                &mut remaining_decompressed,
-                &mut cmap_sizes,
-            )?
-        };
-        let Some(page_nz) = NonZeroU32::new(page_number) else {
-            continue;
-        };
-        pages.push(summarize_page_text(page_nz, &page_text));
-    }
-
-    Ok(PdfIndex {
-        page_count,
-        outline_titles,
-        pages,
-    })
+    index_pdf_bytes_with_budget(bytes, MAX_INDEXED_PDF_PAGES, MAX_PDF_DOCUMENT_TEXT_BYTES)
 }
 
 /// Losslessly slices an inclusive [`PageSpan`] (`1..=8` pages) into a self-contained PDF.
@@ -206,6 +180,47 @@ pub fn slice_pdf_bytes(raw_bytes: &[u8], span: PageSpan) -> Result<SlicedPdf, Ad
         total_pages,
         effective_span,
         bytes: out_bytes,
+    })
+}
+
+fn index_pdf_bytes_with_budget(
+    bytes: &[u8],
+    max_indexed_pages: usize,
+    max_document_text_bytes: usize,
+) -> Result<PdfIndex, AdfontesError> {
+    let mut doc = load_decrypted_pdf(bytes)?;
+    let page_ids = doc.get_pages();
+    let page_count = u32::try_from(page_ids.len()).unwrap_or(u32::MAX);
+    let outline_titles = extract_outline_titles(&doc);
+
+    let mut extraction_budget = PdfExtractionBudget::new();
+    let mut remaining_text_bytes = max_document_text_bytes;
+    let mut pages = Vec::with_capacity(page_ids.len());
+
+    for (index, (&page_number, &page_id)) in page_ids.iter().enumerate() {
+        let Some(page_nz) = NonZeroU32::new(page_number) else {
+            continue;
+        };
+        if index >= max_indexed_pages || remaining_text_bytes == 0 {
+            pages.push(unindexed_page_summary(page_nz));
+            continue;
+        }
+        materialize_inherited_page_attributes(&mut doc, page_id);
+        let raw_text = extraction_budget.extract_page_text(&doc, page_number, page_id)?;
+        let normalized = normalize_pdf_page_text(&raw_text, MAX_PDF_PAGE_TEXT_BYTES);
+        if normalized.len() > remaining_text_bytes {
+            remaining_text_bytes = 0;
+            pages.push(unindexed_page_summary(page_nz));
+            continue;
+        }
+        remaining_text_bytes = remaining_text_bytes.saturating_sub(normalized.len());
+        pages.push(summarize_page_text(page_nz, &normalized));
+    }
+
+    Ok(PdfIndex {
+        page_count,
+        outline_titles,
+        pages,
     })
 }
 
@@ -301,63 +316,81 @@ impl Drop for PdfLoadBudgetGuard {
     }
 }
 
-fn extract_bounded_page_text(
-    doc: &mut Document,
-    page_number: u32,
-    page_id: ObjectId,
-    remaining_decompressed: &mut usize,
-    cmap_sizes: &mut BTreeMap<ObjectId, usize>,
-) -> Result<String, AdfontesError> {
-    if *remaining_decompressed == 0 {
-        return Err(AdfontesError::SafetyBlock {
-            reason: format!(
-                "PDF indexing exceeded cumulative {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte decompression ceiling"
-            ),
-        });
+struct PdfExtractionBudget {
+    remaining_decompressed: usize,
+    cmap_sizes: BTreeMap<ObjectId, usize>,
+}
+
+impl PdfExtractionBudget {
+    const fn new() -> Self {
+        Self {
+            remaining_decompressed: MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES,
+            cmap_sizes: BTreeMap::new(),
+        }
     }
 
-    materialize_inherited_page_attributes(doc, page_id);
-    charge_page_font_cmaps(
-        doc,
-        page_number,
-        page_id,
-        remaining_decompressed,
-        cmap_sizes,
-    )?;
+    fn extract_page_text(
+        &mut self,
+        doc: &Document,
+        page_number: u32,
+        page_id: ObjectId,
+    ) -> Result<String, AdfontesError> {
+        if self.remaining_decompressed == 0 {
+            return Err(AdfontesError::SafetyBlock {
+                reason: format!(
+                    "PDF text extraction exceeded cumulative {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte decompression ceiling"
+                ),
+            });
+        }
 
-    let content_limit = (*remaining_decompressed).min(MAX_PDF_PAGE_DECOMPRESSED_BYTES);
-    let content_bytes = match doc.get_page_content_with_limit(page_id, content_limit) {
-        Ok(bytes) => bytes,
-        Err(LopdfError::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+        charge_page_font_cmaps(
+            doc,
+            page_number,
+            page_id,
+            &mut self.remaining_decompressed,
+            &mut self.cmap_sizes,
+        )?;
+
+        let content_limit = self
+            .remaining_decompressed
+            .min(MAX_PDF_PAGE_DECOMPRESSED_BYTES);
+        let content_bytes = match doc.get_page_content_with_limit(page_id, content_limit) {
+            Ok(bytes) => bytes,
+            Err(LopdfError::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+                return Err(AdfontesError::SafetyBlock {
+                    reason: format!(
+                        "PDF page {page_number} decompressed content exceeded cumulative {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte ceiling"
+                    ),
+                });
+            }
+            Err(_) => return Ok(String::new()),
+        };
+
+        if content_bytes.len() > self.remaining_decompressed {
             return Err(AdfontesError::SafetyBlock {
                 reason: format!(
                     "PDF page {page_number} decompressed content exceeded cumulative {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte ceiling"
                 ),
             });
         }
-        Err(_) => return Ok(String::new()),
-    };
+        let page_budget = self
+            .remaining_decompressed
+            .min(MAX_PDF_PAGE_DECOMPRESSED_BYTES);
+        self.remaining_decompressed = self
+            .remaining_decompressed
+            .saturating_sub(content_bytes.len());
 
-    if content_bytes.len() > *remaining_decompressed {
-        return Err(AdfontesError::SafetyBlock {
-            reason: format!(
-                "PDF page {page_number} decompressed content exceeded cumulative {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte ceiling"
-            ),
-        });
-    }
-    let page_budget = (*remaining_decompressed).min(MAX_PDF_PAGE_DECOMPRESSED_BYTES);
-    *remaining_decompressed = remaining_decompressed.saturating_sub(content_bytes.len());
-
-    match doc.extract_text_with_limit(&[page_number], page_budget) {
-        Ok(text) => Ok(text),
-        Err(LopdfError::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
-            Err(AdfontesError::SafetyBlock {
-                reason: format!(
-                    "PDF page {page_number} text extraction exceeded {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte ceiling"
-                ),
-            })
+        match doc.extract_text_with_limit(&[page_number], page_budget) {
+            Ok(text) => Ok(text),
+            Err(LopdfError::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+                Err(AdfontesError::SafetyBlock {
+                    reason: format!(
+                        "PDF page {page_number} text extraction exceeded {MAX_PDF_INDEX_TOTAL_DECOMPRESSED_BYTES}-byte ceiling"
+                    ),
+                })
+            }
+            Err(_) => Ok(String::new()),
         }
-        Err(_) => Ok(String::new()),
     }
 }
 
@@ -536,6 +569,70 @@ fn resolve_dictionary<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dict
     }
 }
 
+const fn unindexed_page_summary(page_number: NonZeroU32) -> PdfPageSummary {
+    PdfPageSummary {
+        page_number,
+        text: PdfPageText::Unindexed,
+    }
+}
+
+fn normalize_pdf_page_text(raw: &str, max_bytes: usize) -> String {
+    if max_bytes == 0 || raw.is_empty() {
+        return String::new();
+    }
+    let mut expanded = String::with_capacity(raw.len().min(max_bytes));
+    let mut chars = raw.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    let _ = chars.next();
+                }
+                expanded.push('\n');
+            }
+            '\x0c' => expanded.push('\n'),
+            '\u{00AD}' => {}
+            '\u{FB00}' => expanded.push_str("ff"),
+            '\u{FB01}' => expanded.push_str("fi"),
+            '\u{FB02}' => expanded.push_str("fl"),
+            '\u{FB03}' => expanded.push_str("ffi"),
+            '\u{FB04}' => expanded.push_str("ffl"),
+            '\u{FB05}' | '\u{FB06}' => expanded.push_str("st"),
+            '\n' | '\t' => expanded.push(character),
+            other if other.is_control() => {}
+            other => expanded.push(other),
+        }
+    }
+
+    let mut normalized = String::with_capacity(expanded.len().min(max_bytes));
+    let mut consecutive_blanks: usize = 0;
+    for line in expanded.split('\n') {
+        if normalized.len() >= max_bytes {
+            break;
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            if normalized.is_empty() {
+                continue;
+            }
+            consecutive_blanks += 1;
+            if consecutive_blanks <= 1 {
+                normalized.push('\n');
+            }
+            continue;
+        }
+        consecutive_blanks = 0;
+        if !normalized.is_empty() {
+            normalized.push('\n');
+        }
+        let remaining = max_bytes.saturating_sub(normalized.len());
+        normalized.push_str(truncate_utf8_bytes(trimmed, remaining));
+    }
+
+    let bounded = truncate_utf8_bytes(&normalized, max_bytes);
+    bounded.trim_end().to_owned()
+}
+
 fn summarize_page_text(page_number: NonZeroU32, text: &str) -> PdfPageSummary {
     let mut headings = Vec::new();
     let mut preview = String::new();
@@ -555,10 +652,19 @@ fn summarize_page_text(page_number: NonZeroU32, text: &str) -> PdfPageSummary {
 
     PdfPageSummary {
         page_number,
-        char_count: text.chars().count(),
-        headings,
-        preview,
+        text: PdfPageText::Indexed {
+            char_count: count_non_whitespace_chars(text),
+            headings,
+            preview,
+        },
     }
+}
+
+fn count_non_whitespace_chars(input: &str) -> usize {
+    input
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count()
 }
 
 fn looks_like_pdf_heading(line: &str) -> bool {
@@ -745,9 +851,12 @@ mod tests {
             "3 Results summary",
         ]);
         let index = index_pdf_bytes(&pdf_bytes).unwrap();
+        let PdfPageText::Indexed { ref preview, .. } = index.pages[1].text else {
+            panic!("expected indexed page 2");
+        };
         assert_eq!(index.page_count, 3);
         assert_eq!(index.outline_titles, vec!["1 Introduction", "1.1 Résumé"]);
-        assert!(index.pages[1].preview.contains("2 Methods"));
+        assert!(preview.contains("2 Methods"));
     }
 
     #[test]
@@ -1049,5 +1158,63 @@ mod tests {
             index_pdf_bytes(&bytes).unwrap_err(),
             AdfontesError::SafetyBlock { .. }
         ));
+    }
+
+    #[test]
+    fn normalizes_pdf_ligatures_controls_blank_lines_and_utf8_truncation() {
+        let raw = [
+            "",
+            "  Ef\u{FB01}cient \u{FB02}ow\u{00AD}chart\x00  ",
+            "",
+            "",
+            "\x0cNext\u{FB03}eld  ",
+            "",
+        ]
+        .join("\r\n");
+        let normalized = normalize_pdf_page_text(&raw, 1024);
+        let multibyte = normalize_pdf_page_text("αβγδε\n   ", 5);
+        let expected = ["  Efficient flowchart", "", "Nextffield"].join("\n");
+
+        assert_eq!(normalized, expected);
+        assert_eq!(multibyte, "αβ");
+    }
+
+    #[test]
+    fn document_text_budget_marks_overflow_and_trailing_pages_unindexed_without_partial_truncation()
+    {
+        // Page 0 uses 20 B of a 25 B budget (leaving 5 B). Page 1 (42 B) overflows; Page 2 ("End",
+        // 3 B <= 5 B) MUST still be marked unindexed so no non-contiguous hole is created.
+        let pdf_bytes = build_inherited_multipage_pdf(&[
+            "Alpha page body text",
+            "Beta page exceeds remaining budget cleanly",
+            "End",
+        ]);
+        let indexed = index_pdf_bytes_with_budget(&pdf_bytes, MAX_INDEXED_PDF_PAGES, 25).unwrap();
+        let page_capped = index_pdf_bytes_with_budget(&pdf_bytes, 1, 1024).unwrap();
+
+        assert!(matches!(
+            indexed.pages[0].text,
+            PdfPageText::Indexed { char_count: 17, .. }
+        ));
+        assert_eq!(indexed.pages[1].text, PdfPageText::Unindexed);
+        assert_eq!(indexed.pages[2].text, PdfPageText::Unindexed);
+        assert_eq!(page_capped.pages[1].text, PdfPageText::Unindexed);
+    }
+
+    #[test]
+    fn whitespace_only_page_reports_zero_non_whitespace_chars_while_indexed() {
+        let pdf_bytes = build_inherited_multipage_pdf(&["     ", "Readable content here"]);
+        let indexed = index_pdf_bytes(&pdf_bytes).unwrap();
+        let unicode_ws = normalize_pdf_page_text("\u{00A0}\u{2003} \n\u{00A0}", 1024);
+
+        assert!(matches!(
+            indexed.pages[0].text,
+            PdfPageText::Indexed { char_count: 0, .. }
+        ));
+        assert!(matches!(
+            indexed.pages[1].text,
+            PdfPageText::Indexed { char_count: 19, .. }
+        ));
+        assert_eq!(unicode_ws, "");
     }
 }

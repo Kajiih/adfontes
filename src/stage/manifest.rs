@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 use crate::extract::{extract_markdown_toc, sanitize_inline_text};
 use crate::model::{
     DIRECT_PDF_READ_MAX_PAGES, FallbackSkip, HttpUrl, PageSpan, ParsedTarget, PdfIndex,
-    PdfPageSummary, ScholarlyId, StagedOutcome, TextFormat, TocEntry, UnavailableReason,
-    WorkMetadata, truncate_chars,
+    PdfPageSummary, PdfPageText, ScholarlyId, StagedOutcome, TextFormat, TocEntry,
+    UnavailableReason, WorkMetadata, truncate_chars, truncate_utf8_bytes,
 };
 
 /// Maximum UTF-8 byte length of the compact manifest printed to stdout or MCP responses.
@@ -84,10 +84,8 @@ pub fn format_compact_index(metadata: &WorkMetadata, outcome: &StagedOutcome) ->
                 .map_or_else(String::new, |abstract_text| {
                     let sanitized = sanitize_inline_text(abstract_text);
                     let budget = remaining_bytes.saturating_sub("ABSTRACT: \n".len());
-                    let excerpt = truncate_utf8_bytes(
-                        &truncate_chars(&sanitized, MAX_ABSTRACT_EXCERPT_CHARS),
-                        budget,
-                    );
+                    let truncated_chars = truncate_chars(&sanitized, MAX_ABSTRACT_EXCERPT_CHARS);
+                    let excerpt = truncate_utf8_bytes(&truncated_chars, budget);
                     if excerpt.is_empty() {
                         String::new()
                     } else {
@@ -100,7 +98,7 @@ pub fn format_compact_index(metadata: &WorkMetadata, outcome: &StagedOutcome) ->
     let mut combined = header;
     combined.push_str(&body_section);
     if combined.len() > MAX_COMPACT_INDEX_BYTES {
-        truncate_utf8_bytes(&combined, MAX_COMPACT_INDEX_BYTES)
+        truncate_utf8_bytes(&combined, MAX_COMPACT_INDEX_BYTES).to_owned()
     } else {
         combined
     }
@@ -194,22 +192,51 @@ pub(super) fn format_pdf_page_index_document(metadata: &WorkMetadata, index: &Pd
 
     out.push_str("## Pages\n\n");
     for page in &index.pages {
-        let summary_text = if page.headings.is_empty() {
-            sanitize_inline_text(&page.preview)
-        } else {
-            page.headings
-                .iter()
-                .map(|heading| sanitize_inline_text(heading))
-                .filter(|heading| !heading.is_empty())
-                .collect::<Vec<_>>()
-                .join(" | ")
-        };
-        let _ = writeln!(
-            out,
-            "- **Page {}** ({} chars): {summary_text}",
-            page.page_number.get(),
-            page.char_count,
-        );
+        match &page.text {
+            PdfPageText::Unindexed => {
+                let _ = writeln!(
+                    out,
+                    "- **Page {}** (not indexed; call slice_pdf)",
+                    page.page_number.get()
+                );
+            }
+            PdfPageText::Indexed { char_count: 0, .. } => {
+                let _ = writeln!(
+                    out,
+                    "- **Page {}** (0 chars, scanned/visual)",
+                    page.page_number.get()
+                );
+            }
+            PdfPageText::Indexed {
+                char_count,
+                headings,
+                preview,
+            } => {
+                let summary_text = if headings.is_empty() {
+                    sanitize_inline_text(preview)
+                } else {
+                    headings
+                        .iter()
+                        .map(|heading| sanitize_inline_text(heading))
+                        .filter(|heading| !heading.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                };
+                if summary_text.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "- **Page {}** ({char_count} chars)",
+                        page.page_number.get()
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "- **Page {}** ({char_count} chars): {summary_text}",
+                        page.page_number.get(),
+                    );
+                }
+            }
+        }
     }
     out
 }
@@ -549,19 +576,36 @@ fn format_pdf_outline_lines(index: &PdfIndex) -> Vec<String> {
 }
 
 fn format_pdf_page_line(page: &PdfPageSummary) -> String {
-    let raw_hint = page
-        .headings
-        .first()
-        .map(String::as_str)
-        .filter(|val| !val.trim().is_empty())
-        .unwrap_or(page.preview.as_str());
-    let clean_hint = sanitize_inline_text(raw_hint);
-    format!(
-        "- p.{}: {} ({} chars)",
-        page.page_number.get(),
-        truncate_chars(&clean_hint, MAX_PDF_HINT_CHARS),
-        page.char_count
-    )
+    match &page.text {
+        PdfPageText::Unindexed => format!(
+            "- p.{}: (not indexed; call slice_pdf)",
+            page.page_number.get()
+        ),
+        PdfPageText::Indexed { char_count: 0, .. } => {
+            format!("- p.{}: (0 chars, scanned/visual)", page.page_number.get())
+        }
+        PdfPageText::Indexed {
+            char_count,
+            headings,
+            preview,
+        } => {
+            let raw_hint = headings
+                .first()
+                .map(String::as_str)
+                .filter(|val| !val.trim().is_empty())
+                .unwrap_or(preview.as_str());
+            let clean_hint = sanitize_inline_text(raw_hint);
+            if clean_hint.is_empty() {
+                format!("- p.{}: ({char_count} chars)", page.page_number.get())
+            } else {
+                format!(
+                    "- p.{}: {} ({char_count} chars)",
+                    page.page_number.get(),
+                    truncate_chars(&clean_hint, MAX_PDF_HINT_CHARS),
+                )
+            }
+        }
+    }
 }
 
 fn format_bounded_list_section(
@@ -685,22 +729,11 @@ fn truncate_utf8_bytes_with_ellipsis(input: &str, max_bytes: usize) -> String {
     }
     let ellipsis = "…";
     if max_bytes <= ellipsis.len() {
-        return truncate_utf8_bytes(input, max_bytes);
+        return truncate_utf8_bytes(input, max_bytes).to_owned();
     }
-    let mut prefix = truncate_utf8_bytes(input, max_bytes - ellipsis.len());
+    let mut prefix = truncate_utf8_bytes(input, max_bytes - ellipsis.len()).to_owned();
     prefix.push_str(ellipsis);
     prefix
-}
-
-fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
-    if input.len() <= max_bytes {
-        return input.to_owned();
-    }
-    let mut boundary = max_bytes;
-    while boundary > 0 && !input.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    input.get(..boundary).unwrap_or_default().to_owned()
 }
 
 struct SlugParts {
@@ -896,11 +929,13 @@ mod tests {
         let long_pages: Vec<PdfPageSummary> = (1..=120)
             .map(|page_number| PdfPageSummary {
                 page_number: NonZeroU32::new(page_number).unwrap(),
-                char_count: 2000,
-                headings: vec![format!(
-                    "Section {page_number} Detailed Derivation Analysis"
-                )],
-                preview: format!("Preview text for page {page_number}"),
+                text: PdfPageText::Indexed {
+                    char_count: 2000,
+                    headings: vec![format!(
+                        "Section {page_number} Detailed Derivation Analysis"
+                    )],
+                    preview: format!("Preview text for page {page_number}"),
+                },
             })
             .collect();
         let long_outcome = StagedOutcome::Pdf {
@@ -1077,6 +1112,44 @@ mod tests {
         assert!(rendered.contains("src: error-1-"));
         assert!(rendered.contains('…'));
         assert!(rendered.ends_with("; +7 more); fell back to PDF"));
+    }
+
+    #[test]
+    fn formats_scanned_and_unindexed_pdf_pages_cleanly_without_empty_hints() {
+        let index = PdfIndex {
+            page_count: 3,
+            outline_titles: Vec::new(),
+            pages: vec![
+                PdfPageSummary {
+                    page_number: NonZeroU32::new(1).unwrap(),
+                    text: PdfPageText::Indexed {
+                        char_count: 0,
+                        headings: Vec::new(),
+                        preview: String::new(),
+                    },
+                },
+                PdfPageSummary {
+                    page_number: NonZeroU32::new(2).unwrap(),
+                    text: PdfPageText::Unindexed,
+                },
+                PdfPageSummary {
+                    page_number: NonZeroU32::new(3).unwrap(),
+                    text: PdfPageText::Indexed {
+                        char_count: 180,
+                        headings: vec!["1 Intro".to_owned()],
+                        preview: "1 Intro".to_owned(),
+                    },
+                },
+            ],
+        };
+        let page_doc = format_pdf_page_index_document(&WorkMetadata::default(), &index);
+        let p1 = format_pdf_page_line(&index.pages[0]);
+        let p2 = format_pdf_page_line(&index.pages[1]);
+
+        assert_eq!(p1, "- p.1: (0 chars, scanned/visual)");
+        assert_eq!(p2, "- p.2: (not indexed; call slice_pdf)");
+        assert!(page_doc.contains("- **Page 1** (0 chars, scanned/visual)\n"));
+        assert!(page_doc.contains("- **Page 2** (not indexed; call slice_pdf)\n"));
     }
 
     #[test]
