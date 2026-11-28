@@ -284,6 +284,7 @@ impl WorkResolution {
     ) {
         self.trace.record_structured_skip(endpoint, reason);
     }
+
     pub(super) fn finish_full_text(mut self, resolved: ResolvedText) -> ExtractedDocument {
         self.metadata.source_url = Some(resolved.source_url);
         if resolved.origin.canonical_key() != self.caller_key {
@@ -717,6 +718,7 @@ mod tests {
         ));
         assert!(after.is_none());
     }
+
     #[test]
     fn depth_exceeded_structured_landing_remains_in_pool_while_visited_is_skipped() {
         let caller = ScholarlyId::parse("10.1000/depth-check").unwrap();

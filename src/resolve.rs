@@ -277,23 +277,9 @@ async fn resolve_url(
 
     // Reclassify intermediate and final post-redirect scholarly URLs BEFORE rejecting non-200
     // statuses (e.g., grounding redirect -> doi.org -> 403 publisher, or -> arxiv.org/html 404).
-    let mut reclassified_ids = Vec::new();
-    for hop in response
-        .redirect_chain
-        .iter()
-        .chain(std::iter::once(&response.final_url))
-    {
-        if hop != url
-            && let Some(reclassified) = classify_known_scholarly_url(hop)
-            && !reclassified_ids.iter().any(|existing: &ScholarlyId| {
-                existing.canonical_key() == reclassified.canonical_key()
-            })
-        {
-            reclassified_ids.push(reclassified);
-        }
-    }
-    if let Some((primary, rest)) = reclassified_ids.split_first() {
-        return resolve_work(primary, rest, budget, config).await;
+    let reclassified = reclassify_redirect_hops(url, &response);
+    if let Some((primary, seed_aliases)) = reclassified.split_first() {
+        return resolve_work(primary, seed_aliases, budget, config).await;
     }
 
     // Rewrite post-redirect GitHub `/blob/` URLs to `raw.githubusercontent.com` before falling back.
@@ -318,6 +304,25 @@ async fn resolve_url(
     }
 
     dispatch_http_response(response)
+}
+
+fn reclassify_redirect_hops(initial_url: &HttpUrl, response: &HttpResponse) -> Vec<ScholarlyId> {
+    let mut reclassified_ids: Vec<ScholarlyId> = Vec::new();
+    for hop in response
+        .redirect_chain
+        .iter()
+        .chain(std::iter::once(&response.final_url))
+    {
+        if hop != initial_url
+            && let Some(reclassified) = classify_known_scholarly_url(hop)
+            && !reclassified_ids
+                .iter()
+                .any(|existing| existing.canonical_key() == reclassified.canonical_key())
+        {
+            reclassified_ids.push(reclassified);
+        }
+    }
+    reclassified_ids
 }
 
 async fn resolve_work(
@@ -2796,5 +2801,56 @@ mod tests {
             concise_error_detail(&extraction),
             "archive contained no .tex files"
         );
+    }
+
+    #[test]
+    fn reclassify_redirect_hops_extracts_deduplicated_primary_and_seed_aliases() {
+        let initial_url =
+            HttpUrl::parse("https://vertexaisearch.cloud.google.com/grounding-api-redirect/token")
+                .unwrap();
+        let redirected = HttpResponse {
+            status: 403,
+            content_type: Some("text/html".to_owned()),
+            headers: std::collections::BTreeMap::new(),
+            body: Vec::new(),
+            final_url: HttpUrl::parse("https://publisher.example.org/forbidden").unwrap(),
+            redirect_chain: vec![
+                HttpUrl::parse("https://doi.org/10.1000/abc").unwrap(),
+                HttpUrl::parse("https://arxiv.org/abs/2409.13740v1").unwrap(),
+                HttpUrl::parse("https://doi.org/10.1000/ABC").unwrap(),
+            ],
+        };
+        let same_url = HttpResponse {
+            status: 403,
+            content_type: Some("text/html".to_owned()),
+            headers: std::collections::BTreeMap::new(),
+            body: Vec::new(),
+            final_url: initial_url.clone(),
+            redirect_chain: Vec::new(),
+        };
+        let self_scholarly_url = HttpUrl::parse("https://doi.org/10.1000/self-work").unwrap();
+        let self_scholarly_response = HttpResponse {
+            status: 403,
+            content_type: Some("text/html".to_owned()),
+            headers: std::collections::BTreeMap::new(),
+            body: Vec::new(),
+            final_url: self_scholarly_url.clone(),
+            redirect_chain: vec![self_scholarly_url.clone()],
+        };
+
+        let labels: Vec<String> = reclassify_redirect_hops(&initial_url, &redirected)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let same_non_scholarly = reclassify_redirect_hops(&initial_url, &same_url);
+        let same_scholarly =
+            reclassify_redirect_hops(&self_scholarly_url, &self_scholarly_response);
+
+        assert_eq!(
+            labels,
+            vec!["10.1000/abc".to_owned(), "arXiv:2409.13740v1".to_owned()]
+        );
+        assert_eq!(same_non_scholarly, Vec::<ScholarlyId>::new());
+        assert_eq!(same_scholarly, Vec::<ScholarlyId>::new());
     }
 }
