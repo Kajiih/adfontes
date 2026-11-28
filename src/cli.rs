@@ -164,7 +164,7 @@ struct CliArgs {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    /// Retrieve full text or PDF via keyless open-access waterfalls and stage locally.
+    /// Retrieve full text or PDF (with companion extracted text) via keyless open-access waterfalls and stage locally.
     Fetch {
         /// arXiv ID/URL, DOI, PMCID, PMID, IETF RFC, or http(s):// URL.
         target: String,
@@ -175,7 +175,7 @@ enum CliCommand {
         #[arg(long = "no-pdf-index")]
         no_pdf_index: bool,
     },
-    /// Extract a lossless 1..=8-page vector PDF slice from a confined staged PDF.
+    /// Extract a lossless 1..=8-page vector PDF slice and companion extracted text from a confined staged PDF.
     SlicePdf {
         /// Path to a confined staged PDF file.
         pdf_path: PathBuf,

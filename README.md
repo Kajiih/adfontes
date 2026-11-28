@@ -2,7 +2,7 @@
 
 Full-text academic and technical literature reader CLI and stdio Model Context Protocol (**MCP**) server for coding agents.
 
-Given a paper identifier (`arXiv`, `DOI`, `PMCID`, `PMID`), specification (`IETF RFC`), or URL, `adfontes` fetches open-access full text, stages it locally, and prints a compact provenance header with a line- or page-indexed Table of Contents. Paywalled works return bibliographic metadata and an abstract without fabricating full text.
+Given a paper identifier (`arXiv`, `DOI`, `PMCID`, `PMID`), specification (`IETF RFC`), or URL, `adfontes` fetches open-access full text, stages it locally (including companion extracted Markdown text for PDFs with a text layer), and prints a compact provenance header with a line- or page-indexed Table of Contents. Paywalled works return bibliographic metadata and an abstract without fabricating full text.
 
 ---
 
@@ -38,7 +38,7 @@ adfontes fetch https://example.org/article         # web page, Markdown, GitHub 
 adfontes fetch 2409.13740 -o /tmp/lit              # custom staging directory
 ```
 
-Extract a lossless `1`–`8`-page vector slice from a staged PDF:
+Extract a lossless `1`–`8`-page vector slice and companion extracted Markdown text from a staged PDF:
 
 ```bash
 adfontes slice-pdf /tmp/adfontes/paper.pdf -p 8-10

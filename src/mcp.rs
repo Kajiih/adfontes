@@ -639,7 +639,7 @@ fn build_tools_list_result() -> Value {
         FIELD_TOOLS: [
             tool_definition(
                 TOOL_FETCH,
-                "Retrieve full-text academic papers, specifications, or articles via keyless open-access waterfalls, stage normalized Markdown or PDF locally, and return a compact (<= 3,600 B) provenance header and line/page Table of Contents for read_file.",
+                "Retrieve full-text academic papers, specifications, or articles via keyless open-access waterfalls, stage normalized Markdown or PDF (with companion extracted text when a text layer is present) locally, and return a compact (<= 3,600 B) provenance header and line/page Table of Contents for read_file.",
                 &[ARG_TARGET],
                 &json!({
                     ARG_TARGET: string_property(
@@ -658,7 +658,7 @@ fn build_tools_list_result() -> Value {
             ),
             tool_definition(
                 TOOL_SLICE_PDF,
-                "Extract a lossless 1..=8-page vector PDF slice from a staged PDF file so read_file can visually inspect target equations, plots, or tables without attaching the entire PDF.",
+                "Extract a lossless 1..=8-page vector PDF slice (plus companion extracted Markdown text when a text layer is present) from a staged PDF file so text-only and multimodal agents can inspect target pages, equations, plots, or tables without attaching the entire PDF.",
                 &[ARG_PDF_PATH, ARG_START_PAGE],
                 &json!({
                     ARG_PDF_PATH: string_property(
@@ -1453,7 +1453,6 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].get("id"), Some(&json!(1)));
     }
-
     #[test]
     fn fetch_pdf_surfaces_companion_extracted_text_and_layer_status() {
         let sandbox = TestSandbox::new();

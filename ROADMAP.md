@@ -4,14 +4,13 @@ Tracked follow-up directions and enhancements to evaluate after `v0.2.0`. Items 
 
 ## 1. First-Class Text Path for PDFs
 
-- **Staged extracted text alongside PDFs**: Persist the per-page text already extracted during PDF indexing (currently up to `250` pages) into a companion Markdown file (`<slug>.extracted.md` with `## Page N` anchors and line-range mapping in `<slug>.pages.md`), surfacing its path in the compact manifest alongside `STAGED_PDF`.
-- **On-demand page-range text extraction**: Emit companion extracted text when slicing PDFs (or expose a text-extraction mode on `slice_pdf`) so text-only readers can inspect arbitrary page spans — including pages beyond the initial `250`-page indexing cap on book-length PDFs — while multimodal readers retain lossless vector PDF slices for equations, figures, tables, and scanned pages.
-- **Reader-aware navigation directives**: Update manifest `NAVIGATION:` lines and the agent skill (Section 3) to present both the visual PDF path and the extracted text path explicitly, flagging low-character/scanned pages that require visual inspection.
+- **Shipped (manifest & slicer paths):** Staged companion Markdown (`<slug>.extracted.md` with `## Page N` anchors and `<slug>.pages.md` `L<start>-L<end>` anchors alongside `STAGED_PDF`), on-demand companion `.extracted.md` extraction in `slice_pdf` / `slice-pdf` anchored to original source pages, and reader-aware `TEXT_LAYER:` / `NAVIGATION:` manifest directives flagging scanned, sparse, and unindexed pages.
+- **Agent skill guidance (remaining)**: Document the text-first + visual-fallback PDF workflow inside the collocated agent skill once Section 3 ships.
 
 ## 2. Large-PDF Support & Structured Size Limits
 
 - **Aligned, configurable download ceilings**: Raise the default HTTP size ceiling for PDFs to match the `100 MiB` local PDF limit (while keeping tighter defaults for HTML/XML/JSON) and expose bounded environment overrides (`ADFONTES_MAX_RESPONSE_BYTES`, `ADFONTES_TIMEOUT_SECS`) for book-length sources.
-- **Outline page numbers & graceful long-book indexing**: Resolve PDF `/Outlines` destinations (`/Dest` and `/A`) to 1-indexed page numbers so agents can jump directly to chapters in multi-hundred-page books, and stop full-book text indexing cleanly once the `250`-page or cumulative `32 MiB` indexing-text budget is reached (without aborting staging), while keeping per-stream decompression-bomb checks fail-closed.
+- **Outline page numbers (remaining; whole-page indexing cutoff shipped)**: Resolve PDF `/Outlines` destinations (`/Dest` and `/A`) to 1-indexed page numbers so agents can jump directly to chapters in multi-hundred-page books (`index_pdf_bytes` already cuts off text indexing cleanly on whole-page boundaries once the `250`-page or `8 MiB` normalized-text budget is reached without aborting staging, while keeping per-stream decompression and `CMap` checks fail-closed).
 - **Structured oversized-payload outcome**: Return a compact manifest (`STATUS: METADATA_ONLY` with an explicit size-limit reason, or `STATUS: TOO_LARGE`) reporting actual size, active limit, and next steps instead of a bare tool error when a direct target exceeds the configured download ceiling.
 
 ## 3. Agent Skill Collocation
