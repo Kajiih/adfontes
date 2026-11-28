@@ -1,17 +1,21 @@
 //! Pure, zero-I/O staging slug generation, `<slug>.pages.md`, metadata note rendering,
 //! and bounded (`<= 3,600 B`) navigation manifest formatting.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::num::{NonZeroU32, NonZeroUsize};
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
 use crate::extract::{extract_markdown_toc, sanitize_inline_text};
 use crate::model::{
-    DIRECT_PDF_READ_MAX_PAGES, FallbackSkip, HttpUrl, PageSpan, ParsedTarget, PdfIndex,
-    PdfPageSummary, PdfPageText, ScholarlyId, StagedOutcome, TextFormat, TocEntry,
-    UnavailableReason, WorkMetadata, truncate_chars, truncate_utf8_bytes,
+    AdfontesError, DIRECT_PDF_READ_MAX_PAGES, FallbackSkip, HttpUrl, MIN_READABLE_PDF_PAGE_CHARS,
+    PageSpan, ParsedTarget, PdfIndex, PdfPageLineRange, PdfPageSummary, PdfPageText,
+    PdfTextCoverage, PdfTextSummary, ScholarlyId, StagedOutcome, StagedPdfText, TextFormat,
+    TocEntry, UnavailableReason, WorkMetadata, truncate_chars, truncate_utf8_bytes,
 };
+use crate::pdf::ExtractedPdfPage;
 
 /// Maximum UTF-8 byte length of the compact manifest printed to stdout or MCP responses.
 pub const MAX_COMPACT_INDEX_BYTES: usize = 3_600;
@@ -31,6 +35,7 @@ const MAX_FALLBACK_REASON_CHARS: usize = 48;
 const MAX_ABSTRACT_EXCERPT_CHARS: usize = 700;
 const DEFAULT_SLUG_CORE: &str = "document";
 const DEFAULT_STAGING_NAME: &str = "adfontes";
+const EXTRACTED_TEXT_SUFFIX: &str = ".extracted.md";
 
 /// Builds a deterministic, version-aware filename slug (`<family>_<id>_<hash8>`) for staging.
 #[must_use]
@@ -63,7 +68,11 @@ pub fn format_compact_index(metadata: &WorkMetadata, outcome: &StagedOutcome) ->
             |index| format_toc_entry(&toc[index]),
             remaining_bytes,
         ),
-        StagedOutcome::Pdf { pdf_index, .. } => {
+        StagedOutcome::Pdf {
+            pdf_index,
+            text_summary,
+            ..
+        } => {
             let outline_lines = format_pdf_outline_lines(pdf_index);
             let total_items = outline_lines.len() + pdf_index.pages.len();
             format_bounded_list_section(
@@ -71,7 +80,10 @@ pub fn format_compact_index(metadata: &WorkMetadata, outcome: &StagedOutcome) ->
                 total_items,
                 |index| {
                     outline_lines.get(index).cloned().unwrap_or_else(|| {
-                        format_pdf_page_line(&pdf_index.pages[index - outline_lines.len()])
+                        format_pdf_page_line(
+                            &pdf_index.pages[index - outline_lines.len()],
+                            text_summary,
+                        )
                     })
                 },
                 remaining_bytes,
@@ -132,6 +144,158 @@ pub(super) fn prepare_full_text(format: TextFormat, mut markdown: String) -> Pre
     }
 }
 
+pub(super) fn build_extracted_text_filename(slug: &str) -> String {
+    format!("{slug}{EXTRACTED_TEXT_SUFFIX}")
+}
+
+pub(super) struct PreparedPdfText {
+    indexed_pages: u32,
+    empty_pages: u32,
+    unindexed_pages: u32,
+    layer: PreparedPdfTextLayer,
+}
+
+impl PreparedPdfText {
+    pub(super) fn persist_with(
+        self,
+        write_text: impl FnOnce(&str) -> Result<PathBuf, AdfontesError>,
+        remove_stale: impl FnOnce() -> Result<(), AdfontesError>,
+    ) -> Result<PdfTextSummary, AdfontesError> {
+        match self.layer {
+            PreparedPdfTextLayer::None => {
+                remove_stale()?;
+                Ok(PdfTextSummary::without_text(
+                    self.indexed_pages,
+                    self.unindexed_pages,
+                ))
+            }
+            PreparedPdfTextLayer::Extracted {
+                non_empty_pages,
+                readable_pages,
+                content,
+                line_count,
+                byte_count,
+                page_line_ranges,
+            } => {
+                let path = write_text(&content)?;
+                drop(content);
+                Ok(PdfTextSummary::with_text(
+                    non_empty_pages,
+                    readable_pages,
+                    self.empty_pages,
+                    self.unindexed_pages,
+                    StagedPdfText {
+                        path,
+                        line_count,
+                        byte_count,
+                        page_line_ranges,
+                    },
+                ))
+            }
+        }
+    }
+}
+
+pub(super) fn prepare_pdf_text_document(
+    title: Option<&str>,
+    total_pages: u32,
+    page_texts: &[ExtractedPdfPage],
+) -> PreparedPdfText {
+    let indexed_pages = u32::try_from(page_texts.len()).unwrap_or(u32::MAX);
+    let unindexed_pages = total_pages.saturating_sub(indexed_pages);
+    let mut non_empty_count: u32 = 0;
+    let mut readable_pages: u32 = 0;
+    for page in page_texts {
+        if page.char_count() > 0 {
+            non_empty_count = non_empty_count.saturating_add(1);
+        }
+        if page.char_count() >= MIN_READABLE_PDF_PAGE_CHARS {
+            readable_pages = readable_pages.saturating_add(1);
+        }
+    }
+    let empty_pages = indexed_pages.saturating_sub(non_empty_count);
+
+    let Some(non_empty_pages) = NonZeroU32::new(non_empty_count) else {
+        return PreparedPdfText {
+            indexed_pages,
+            empty_pages,
+            unindexed_pages,
+            layer: PreparedPdfTextLayer::None,
+        };
+    };
+
+    let clean_title = title
+        .map(sanitize_inline_text)
+        .filter(|val| !val.is_empty());
+    let scope_label = if total_pages == 1 {
+        "1 page".to_owned()
+    } else {
+        format!("{total_pages} pages")
+    };
+    let heading = clean_title.as_ref().map_or_else(
+        || format!("# Extracted PDF Text ({scope_label})"),
+        |value| format!("# {value} — Extracted PDF Text ({scope_label})"),
+    );
+    let mut builder = LineBuilder::new();
+    builder.push_line(&heading);
+
+    let mut page_line_ranges = BTreeMap::new();
+    for page in page_texts {
+        if page.char_count() == 0 {
+            continue;
+        }
+        builder.push_line("");
+        let start_line = builder.next_line_nz();
+        builder.push_line(&format!("## Page {}", page.page_number().get()));
+        builder.push_line("");
+        for text_line in page.text().lines() {
+            builder.push_line(text_line);
+        }
+        let end_line = builder.last_line_nz();
+        page_line_ranges.insert(
+            page.page_number(),
+            PdfPageLineRange {
+                start_line,
+                end_line,
+            },
+        );
+    }
+
+    if indexed_pages < total_pages {
+        let tail_start = indexed_pages.saturating_add(1);
+        builder.push_line("");
+        builder.push_line("---");
+        builder.push_line("");
+        let tail_note = if tail_start == total_pages {
+            format!(
+                "_[Page {tail_start} was not pre-extracted; call slice_pdf on STAGED_PDF to extract text and visual slices for that page.]_"
+            )
+        } else {
+            format!(
+                "_[Pages {tail_start}-{total_pages} were not pre-extracted; call slice_pdf on STAGED_PDF to extract text and visual slices for those pages.]_"
+            )
+        };
+        builder.push_line(&tail_note);
+    }
+
+    let content = builder.content;
+    let line_count = builder.line_count;
+    let byte_count = content.len();
+    PreparedPdfText {
+        indexed_pages,
+        empty_pages,
+        unindexed_pages,
+        layer: PreparedPdfTextLayer::Extracted {
+            non_empty_pages,
+            readable_pages,
+            content,
+            line_count,
+            byte_count,
+            page_line_ranges,
+        },
+    }
+}
+
 pub(super) fn build_slice_filename(canonical_pdf_path: &Path, span: PageSpan) -> String {
     let stem = build_slice_stem(canonical_pdf_path);
     if span.start() == span.end() {
@@ -169,7 +333,11 @@ pub(super) fn format_slice_summary(
     summary
 }
 
-pub(super) fn format_pdf_page_index_document(metadata: &WorkMetadata, index: &PdfIndex) -> String {
+pub(super) fn format_pdf_page_index_document(
+    metadata: &WorkMetadata,
+    index: &PdfIndex,
+    text_summary: &PdfTextSummary,
+) -> String {
     let mut out = String::new();
     let title = metadata
         .title
@@ -192,25 +360,13 @@ pub(super) fn format_pdf_page_index_document(metadata: &WorkMetadata, index: &Pd
 
     out.push_str("## Pages\n\n");
     for page in &index.pages {
+        let status = format_pdf_page_status(page, text_summary);
         match &page.text {
-            PdfPageText::Unindexed => {
-                let _ = writeln!(
-                    out,
-                    "- **Page {}** (not indexed; call slice_pdf)",
-                    page.page_number.get()
-                );
-            }
-            PdfPageText::Indexed { char_count: 0, .. } => {
-                let _ = writeln!(
-                    out,
-                    "- **Page {}** (0 chars, scanned/visual)",
-                    page.page_number.get()
-                );
+            PdfPageText::Unindexed | PdfPageText::Indexed { char_count: 0, .. } => {
+                let _ = writeln!(out, "- **Page {}** ({status})", page.page_number.get());
             }
             PdfPageText::Indexed {
-                char_count,
-                headings,
-                preview,
+                headings, preview, ..
             } => {
                 let summary_text = if headings.is_empty() {
                     sanitize_inline_text(preview)
@@ -223,15 +379,11 @@ pub(super) fn format_pdf_page_index_document(metadata: &WorkMetadata, index: &Pd
                         .join(" | ")
                 };
                 if summary_text.is_empty() {
-                    let _ = writeln!(
-                        out,
-                        "- **Page {}** ({char_count} chars)",
-                        page.page_number.get()
-                    );
+                    let _ = writeln!(out, "- **Page {}** ({status})", page.page_number.get());
                 } else {
                     let _ = writeln!(
                         out,
-                        "- **Page {}** ({char_count} chars): {summary_text}",
+                        "- **Page {}** ({status}): {summary_text}",
                         page.page_number.get(),
                     );
                 }
@@ -493,6 +645,7 @@ fn append_outcome_header(out: &mut String, outcome: &StagedOutcome) {
             page_index_path,
             byte_count,
             pdf_index,
+            text_summary,
             ..
         } => {
             let _ = writeln!(out, "CONTENT_KIND: PDF");
@@ -501,11 +654,11 @@ fn append_outcome_header(out: &mut String, outcome: &StagedOutcome) {
                 "STAGED_PDF: {}",
                 sanitize_inline_text(&staged_pdf_path.display().to_string())
             );
-            if let Some(index_path) = page_index_path {
+            if let Some(staged_text) = text_summary.staged_text() {
                 let _ = writeln!(
                     out,
-                    "PAGE_INDEX_PATH: {}",
-                    sanitize_inline_text(&index_path.display().to_string())
+                    "EXTRACTED_TEXT_PATH: {}",
+                    sanitize_inline_text(&staged_text.path.display().to_string())
                 );
             }
             let _ = writeln!(
@@ -513,17 +666,13 @@ fn append_outcome_header(out: &mut String, outcome: &StagedOutcome) {
                 "METRICS: {} pages, {byte_count} bytes",
                 pdf_index.page_count
             );
-            if pdf_index.page_count <= DIRECT_PDF_READ_MAX_PAGES {
+            let _ = writeln!(out, "{}", format_text_layer_line(text_summary));
+            let _ = writeln!(out, "NAVIGATION: {}", format_pdf_navigation(text_summary));
+            if let Some(index_path) = page_index_path {
                 let _ = writeln!(
                     out,
-                    "NAVIGATION: PDF has {} pages (<= {DIRECT_PDF_READ_MAX_PAGES}): call read_file directly on STAGED_PDF for a single PDF, or use PAGE_INDEX_PATH + slice_pdf (1-5 pages) when surveying multiple PDFs.",
-                    pdf_index.page_count
-                );
-            } else {
-                let _ = writeln!(
-                    out,
-                    "NAVIGATION: PDF has {} pages (> {DIRECT_PDF_READ_MAX_PAGES}): read PAGE_INDEX_PATH first, then call slice_pdf (1-5 target pages) and read_file on the slice.",
-                    pdf_index.page_count
+                    "PAGE_INDEX_PATH: {}",
+                    sanitize_inline_text(&index_path.display().to_string())
                 );
             }
         }
@@ -547,6 +696,92 @@ fn append_outcome_header(out: &mut String, outcome: &StagedOutcome) {
                 "NAVIGATION: No open-access full text is available; report unavailability honestly instead of deriving unverified claims from the abstract."
             );
         }
+    }
+}
+
+fn format_text_layer_line(summary: &PdfTextSummary) -> String {
+    let label = summary.coverage().as_label();
+    let unindexed = summary.unindexed_pages();
+    summary.staged_text().map_or_else(
+        || {
+            if unindexed > 0 {
+                format!(
+                    "TEXT_LAYER: {label} (0/{} pages extracted; {} indexed, {unindexed} unindexed)",
+                    summary.scope_pages(),
+                    summary.indexed_pages(),
+                )
+            } else {
+                format!(
+                    "TEXT_LAYER: {label} (0/{} pages extracted; scanned/visual)",
+                    summary.scope_pages()
+                )
+            }
+        },
+        |staged| {
+            let mut details = format!(
+                "{}/{} pages extracted",
+                summary.non_empty_pages(),
+                summary.scope_pages()
+            );
+            if summary.readable_pages() < summary.non_empty_pages() {
+                let _ = write!(details, ", {} readable", summary.readable_pages());
+            }
+            if unindexed > 0 {
+                let _ = write!(details, ", {unindexed} unindexed");
+            }
+            format!(
+                "TEXT_LAYER: {label} ({details}; {} lines, {} bytes)",
+                staged.line_count, staged.byte_count
+            )
+        },
+    )
+}
+
+fn format_pdf_navigation(text_summary: &PdfTextSummary) -> String {
+    let page_count = text_summary.scope_pages();
+    let has_unindexed = text_summary.unindexed_pages() > 0;
+    match text_summary.coverage() {
+        PdfTextCoverage::Full => {
+            if page_count <= DIRECT_PDF_READ_MAX_PAGES {
+                format!(
+                    "Read EXTRACTED_TEXT_PATH with read_file (StartLine/EndLine) for prose/text; for equations/figures/tables, read STAGED_PDF directly (<= {DIRECT_PDF_READ_MAX_PAGES} pages)."
+                )
+            } else {
+                format!(
+                    "Read EXTRACTED_TEXT_PATH with read_file (StartLine/EndLine) for prose/text; for equations/figures/tables, call slice_pdf on STAGED_PDF (> {DIRECT_PDF_READ_MAX_PAGES} pages) first."
+                )
+            }
+        }
+        PdfTextCoverage::Partial => {
+            match (has_unindexed, page_count <= DIRECT_PDF_READ_MAX_PAGES) {
+                (true, true) => format!(
+                    "Read EXTRACTED_TEXT_PATH with read_file (StartLine/EndLine) for extracted pages; call slice_pdf on STAGED_PDF for unindexed pages, or read STAGED_PDF directly (<= {DIRECT_PDF_READ_MAX_PAGES} pages) for figures/equations."
+                ),
+                (false, true) => format!(
+                    "Read EXTRACTED_TEXT_PATH with read_file (StartLine/EndLine) for extracted pages; for visual/sparse pages or equations, read STAGED_PDF directly (<= {DIRECT_PDF_READ_MAX_PAGES} pages)."
+                ),
+                (true, false) => format!(
+                    "Read EXTRACTED_TEXT_PATH with read_file (StartLine/EndLine) for extracted pages; call slice_pdf on STAGED_PDF (> {DIRECT_PDF_READ_MAX_PAGES} pages) for unindexed pages, figures, or equations."
+                ),
+                (false, false) => format!(
+                    "Read EXTRACTED_TEXT_PATH with read_file (StartLine/EndLine) for extracted pages; call slice_pdf on STAGED_PDF (> {DIRECT_PDF_READ_MAX_PAGES} pages) for visual/sparse pages, figures, or equations."
+                ),
+            }
+        }
+        PdfTextCoverage::None => match (has_unindexed, page_count <= DIRECT_PDF_READ_MAX_PAGES) {
+            (true, true) => format!(
+                "No text extracted from inspected pages, but unindexed pages remain; call slice_pdf on STAGED_PDF for unindexed pages, or read STAGED_PDF directly (<= {DIRECT_PDF_READ_MAX_PAGES} pages) with a multimodal reader."
+            ),
+            (true, false) => format!(
+                "No text extracted from inspected pages, but unindexed pages remain; call slice_pdf on STAGED_PDF (> {DIRECT_PDF_READ_MAX_PAGES} pages) to extract text or inspect target pages visually."
+            ),
+            (false, true) => format!(
+                "No usable text layer (text-only readers cannot read this scanned PDF); multimodal readers may read STAGED_PDF directly (<= {DIRECT_PDF_READ_MAX_PAGES} pages)."
+            ),
+            (false, false) => format!(
+                "No usable text layer (text-only readers cannot read this scanned PDF); multimodal readers should call slice_pdf on STAGED_PDF (> {DIRECT_PDF_READ_MAX_PAGES} pages) before read_file."
+            ),
+        },
     }
 }
 
@@ -575,19 +810,14 @@ fn format_pdf_outline_lines(index: &PdfIndex) -> Vec<String> {
     lines
 }
 
-fn format_pdf_page_line(page: &PdfPageSummary) -> String {
+fn format_pdf_page_line(page: &PdfPageSummary, text_summary: &PdfTextSummary) -> String {
+    let status = format_pdf_page_status(page, text_summary);
     match &page.text {
-        PdfPageText::Unindexed => format!(
-            "- p.{}: (not indexed; call slice_pdf)",
-            page.page_number.get()
-        ),
-        PdfPageText::Indexed { char_count: 0, .. } => {
-            format!("- p.{}: (0 chars, scanned/visual)", page.page_number.get())
+        PdfPageText::Unindexed | PdfPageText::Indexed { char_count: 0, .. } => {
+            format!("- p.{}: ({status})", page.page_number.get())
         }
         PdfPageText::Indexed {
-            char_count,
-            headings,
-            preview,
+            headings, preview, ..
         } => {
             let raw_hint = headings
                 .first()
@@ -596,15 +826,35 @@ fn format_pdf_page_line(page: &PdfPageSummary) -> String {
                 .unwrap_or(preview.as_str());
             let clean_hint = sanitize_inline_text(raw_hint);
             if clean_hint.is_empty() {
-                format!("- p.{}: ({char_count} chars)", page.page_number.get())
+                format!("- p.{}: ({status})", page.page_number.get())
             } else {
                 format!(
-                    "- p.{}: {} ({char_count} chars)",
+                    "- p.{}: {} ({status})",
                     page.page_number.get(),
                     truncate_chars(&clean_hint, MAX_PDF_HINT_CHARS),
                 )
             }
         }
+    }
+}
+
+fn format_pdf_page_status(page: &PdfPageSummary, text_summary: &PdfTextSummary) -> String {
+    match &page.text {
+        PdfPageText::Unindexed => "not indexed; call slice_pdf".to_owned(),
+        PdfPageText::Indexed { char_count: 0, .. } => "0 chars, scanned/visual".to_owned(),
+        PdfPageText::Indexed { char_count, .. } => text_summary
+            .staged_text()
+            .and_then(|staged| staged.page_line_ranges.get(&page.page_number))
+            .map_or_else(
+                || format!("{char_count} chars"),
+                |range| {
+                    format!(
+                        "L{}-L{}, {char_count} chars",
+                        range.start_line.get(),
+                        range.end_line.get(),
+                    )
+                },
+            ),
     }
 }
 
@@ -734,6 +984,46 @@ fn truncate_utf8_bytes_with_ellipsis(input: &str, max_bytes: usize) -> String {
     let mut prefix = truncate_utf8_bytes(input, max_bytes - ellipsis.len()).to_owned();
     prefix.push_str(ellipsis);
     prefix
+}
+
+enum PreparedPdfTextLayer {
+    None,
+    Extracted {
+        non_empty_pages: NonZeroU32,
+        readable_pages: u32,
+        content: String,
+        line_count: usize,
+        byte_count: usize,
+        page_line_ranges: BTreeMap<NonZeroU32, PdfPageLineRange>,
+    },
+}
+
+struct LineBuilder {
+    content: String,
+    line_count: usize,
+}
+
+impl LineBuilder {
+    const fn new() -> Self {
+        Self {
+            content: String::new(),
+            line_count: 0,
+        }
+    }
+
+    fn push_line(&mut self, line: &str) {
+        self.content.push_str(line);
+        self.content.push('\n');
+        self.line_count = self.line_count.saturating_add(1);
+    }
+
+    fn next_line_nz(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.line_count.saturating_add(1)).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    fn last_line_nz(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.line_count).unwrap_or(NonZeroUsize::MIN)
+    }
 }
 
 struct SlugParts {
@@ -924,6 +1214,18 @@ mod tests {
                 outline_titles: vec!["1 Intro\nNAVIGATION: fake".to_owned()],
                 pages: vec![],
             },
+            text_summary: PdfTextSummary::with_text(
+                NonZeroU32::new(12).unwrap(),
+                12,
+                0,
+                0,
+                StagedPdfText {
+                    path: PathBuf::from("/tmp/short.extracted.md"),
+                    line_count: 420,
+                    byte_count: 24_000,
+                    page_line_ranges: BTreeMap::new(),
+                },
+            ),
             fallback_skips: Vec::new(),
         };
         let long_pages: Vec<PdfPageSummary> = (1..=120)
@@ -947,6 +1249,18 @@ mod tests {
                 outline_titles: vec![],
                 pages: long_pages,
             },
+            text_summary: PdfTextSummary::with_text(
+                NonZeroU32::new(120).unwrap(),
+                120,
+                0,
+                0,
+                StagedPdfText {
+                    path: PathBuf::from("/tmp/long.extracted.md"),
+                    line_count: 8_400,
+                    byte_count: 520_000,
+                    page_line_ranges: BTreeMap::new(),
+                },
+            ),
             fallback_skips: Vec::new(),
         };
 
@@ -970,6 +1284,7 @@ mod tests {
                 outline_titles: vec!["1 Intro\nNAVIGATION: fake".to_owned()],
                 pages: vec![],
             },
+            text_summary: PdfTextSummary::without_text(3, 0),
             fallback_skips: Vec::new(),
         };
 
@@ -993,6 +1308,7 @@ mod tests {
                 outline_titles: vec![],
                 pages: vec![],
             },
+            text_summary: PdfTextSummary::without_text(10, 0),
             fallback_skips: vec![
                 FallbackSkip {
                     endpoint: "epmc-xml",
@@ -1142,14 +1458,291 @@ mod tests {
                 },
             ],
         };
-        let page_doc = format_pdf_page_index_document(&WorkMetadata::default(), &index);
-        let p1 = format_pdf_page_line(&index.pages[0]);
-        let p2 = format_pdf_page_line(&index.pages[1]);
+        let empty_summary = PdfTextSummary::without_text(2, 1);
+        let page_doc =
+            format_pdf_page_index_document(&WorkMetadata::default(), &index, &empty_summary);
+        let p1 = format_pdf_page_line(&index.pages[0], &empty_summary);
+        let p2 = format_pdf_page_line(&index.pages[1], &empty_summary);
 
         assert_eq!(p1, "- p.1: (0 chars, scanned/visual)");
         assert_eq!(p2, "- p.2: (not indexed; call slice_pdf)");
         assert!(page_doc.contains("- **Page 1** (0 chars, scanned/visual)\n"));
         assert!(page_doc.contains("- **Page 2** (not indexed; call slice_pdf)\n"));
+    }
+
+    #[test]
+    fn prepare_pdf_text_document_tracks_exact_line_ranges_ignoring_spoofed_headings() {
+        let page1_text = indoc! {"
+            Abstract line one.
+            ## Page 99 spoofed heading
+            Abstract line three.
+        "}
+        .trim_end();
+        let page3_text = "Conclusion paragraph with full derivations and theorem statements.";
+        let pages = vec![
+            ExtractedPdfPage::new(NonZeroU32::new(1).unwrap(), page1_text.to_owned()),
+            ExtractedPdfPage::new(NonZeroU32::new(2).unwrap(), String::new()),
+            ExtractedPdfPage::new(NonZeroU32::new(3).unwrap(), page3_text.to_owned()),
+        ];
+        let prepared = prepare_pdf_text_document(Some("My Paper\nInjected Line"), 5, &pages);
+        let mut captured = String::new();
+        let summary = prepared
+            .persist_with(
+                |text| {
+                    captured.push_str(text);
+                    Ok(PathBuf::from("/tmp/paper.extracted.md"))
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        let lines: Vec<&str> = captured.lines().collect();
+        let staged = summary.staged_text().unwrap();
+        let p1_range = staged.page_line_ranges[&NonZeroU32::new(1).unwrap()];
+        let p3_range = staged.page_line_ranges[&NonZeroU32::new(3).unwrap()];
+
+        assert_eq!(lines[p1_range.start_line.get() - 1], "## Page 1");
+        assert_eq!(lines[p1_range.end_line.get() - 1], "Abstract line three.");
+        assert_eq!(lines[p3_range.end_line.get() - 1], page3_text);
+        assert_eq!(
+            staged
+                .page_line_ranges
+                .keys()
+                .map(|page| page.get())
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn prepare_pdf_text_document_sanitizes_title_emits_tail_footer_and_exact_metrics() {
+        let page_text = "Theorem 1 establishes asymptotic efficiency across cohorts.";
+        let pages = vec![ExtractedPdfPage::new(
+            NonZeroU32::new(1).unwrap(),
+            page_text.to_owned(),
+        )];
+        let prepared = prepare_pdf_text_document(Some("My Paper\nInjected Line"), 5, &pages);
+        let mut captured = String::new();
+        let summary = prepared
+            .persist_with(
+                |text| {
+                    captured.push_str(text);
+                    Ok(PathBuf::from("/tmp/paper.extracted.md"))
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        let lines: Vec<&str> = captured.lines().collect();
+        let staged = summary.staged_text().unwrap();
+
+        assert_eq!(
+            lines[0],
+            "# My Paper Injected Line — Extracted PDF Text (5 pages)"
+        );
+        assert!(captured.contains("_[Pages 2-5 were not pre-extracted;"));
+        assert_eq!(staged.line_count, lines.len());
+        assert_eq!(staged.byte_count, captured.len());
+    }
+
+    #[test]
+    fn scanned_pdf_omits_extracted_text_and_reports_text_layer_none() {
+        let pages = vec![ExtractedPdfPage::new(
+            NonZeroU32::new(1).unwrap(),
+            String::new(),
+        )];
+        let prepared = prepare_pdf_text_document(Some("Scanned Monograph"), 1, &pages);
+        let mut wrote_file = false;
+        let summary = prepared
+            .persist_with(
+                |_| {
+                    wrote_file = true;
+                    Ok(PathBuf::from("/tmp/never.extracted.md"))
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        let outcome = StagedOutcome::Pdf {
+            staged_pdf_path: PathBuf::from("/tmp/scanned.pdf"),
+            page_index_path: None,
+            byte_count: 2048,
+            pdf_index: PdfIndex {
+                page_count: 1,
+                outline_titles: Vec::new(),
+                pages: vec![PdfPageSummary {
+                    page_number: NonZeroU32::new(1).unwrap(),
+                    text: PdfPageText::Indexed {
+                        char_count: 0,
+                        headings: Vec::new(),
+                        preview: String::new(),
+                    },
+                }],
+            },
+            text_summary: summary,
+            fallback_skips: Vec::new(),
+        };
+        let manifest = format_compact_index(&WorkMetadata::default(), &outcome);
+
+        assert!(!wrote_file);
+        assert!(!manifest.contains("EXTRACTED_TEXT_PATH:"));
+        assert!(manifest.contains("TEXT_LAYER: NONE"));
+        assert!(manifest.contains("text-only readers cannot read this scanned PDF"));
+    }
+
+    #[test]
+    fn persist_with_none_invokes_stale_cleanup_while_extracted_skips_cleanup() {
+        let empty_pages = vec![ExtractedPdfPage::new(
+            NonZeroU32::new(1).unwrap(),
+            String::new(),
+        )];
+        let readable_pages = vec![ExtractedPdfPage::new(
+            NonZeroU32::new(1).unwrap(),
+            "Readable scholarly prose across methodology.".to_owned(),
+        )];
+        let mut cleaned_for_none = false;
+        let mut cleaned_for_extracted = false;
+
+        let _ = prepare_pdf_text_document(None, 1, &empty_pages)
+            .persist_with(
+                |_| Ok(PathBuf::from("/tmp/unused.extracted.md")),
+                || {
+                    cleaned_for_none = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let _ = prepare_pdf_text_document(None, 1, &readable_pages)
+            .persist_with(
+                |_| Ok(PathBuf::from("/tmp/used.extracted.md")),
+                || {
+                    cleaned_for_extracted = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(cleaned_for_none);
+        assert!(!cleaned_for_extracted);
+    }
+
+    #[test]
+    fn reports_unindexed_and_sparse_text_layers_honestly_in_manifest() {
+        let unindexed_none = PdfTextSummary::without_text(250, 50);
+        let short_unindexed_partial = PdfTextSummary::with_text(
+            NonZeroU32::new(16).unwrap(),
+            16,
+            0,
+            2,
+            StagedPdfText {
+                path: PathBuf::from("/tmp/dense.extracted.md"),
+                line_count: 400,
+                byte_count: 100_000,
+                page_line_ranges: BTreeMap::new(),
+            },
+        );
+        let sparse_partial = PdfTextSummary::with_text(
+            NonZeroU32::new(2).unwrap(),
+            0,
+            0,
+            0,
+            StagedPdfText {
+                path: PathBuf::from("/tmp/sparse.extracted.md"),
+                line_count: 8,
+                byte_count: 90,
+                page_line_ranges: BTreeMap::new(),
+            },
+        );
+
+        let none_layer = format_text_layer_line(&unindexed_none);
+        let none_nav = format_pdf_navigation(&unindexed_none);
+        let short_nav = format_pdf_navigation(&short_unindexed_partial);
+        let sparse_layer = format_text_layer_line(&sparse_partial);
+
+        assert!(none_layer.contains("250 indexed, 50 unindexed"));
+        assert!(none_nav.contains("call slice_pdf on STAGED_PDF"));
+        assert!(short_nav.contains("call slice_pdf on STAGED_PDF for unindexed pages"));
+        assert!(sparse_layer.contains("2/2 pages extracted, 0 readable"));
+    }
+
+    #[test]
+    fn pdf_compact_index_pins_text_headers_within_3600_byte_cap_under_max_metadata() {
+        let metadata = WorkMetadata {
+            title: Some("Very Long Scholarly Monograph Title ".repeat(12)),
+            authors: (1..=10)
+                .map(|idx| format!("Author Number {idx} With Long Institutional Name"))
+                .collect(),
+            year: Some(2026),
+            venue_or_source: Some("Journal of Statistical Computation and Simulation".to_owned()),
+            canonical_id: Some("doi:10.1000/very.long.canonical.identifier.2026.99999".to_owned()),
+            source_url: HttpUrl::parse(
+                "https://repository.example.org/bitstreams/very-long-path-segment/monograph-2026.pdf",
+            )
+            .ok(),
+            notes: vec!["PDF via direct publisher mirror with archival provenance".to_owned()],
+            ..WorkMetadata::default()
+        };
+        let pages: Vec<PdfPageSummary> = (1..=120)
+            .map(|page_number| PdfPageSummary {
+                page_number: NonZeroU32::new(page_number).unwrap(),
+                text: PdfPageText::Indexed {
+                    char_count: 1_850,
+                    headings: vec![format!(
+                        "Chapter {page_number}: Asymptotic Efficiency Bounds"
+                    )],
+                    preview: format!("Preview text for page {page_number}"),
+                },
+            })
+            .collect();
+        let page_line_ranges: BTreeMap<NonZeroU32, PdfPageLineRange> = (1..=120)
+            .map(|page_number| {
+                let start = usize::try_from(page_number).unwrap() * 40;
+                (
+                    NonZeroU32::new(page_number).unwrap(),
+                    PdfPageLineRange {
+                        start_line: NonZeroUsize::new(start).unwrap(),
+                        end_line: NonZeroUsize::new(start + 35).unwrap(),
+                    },
+                )
+            })
+            .collect();
+        let long_dir = "/tmp/adfontes-staging-root/nested-directory-for-long-paths";
+        let outcome = StagedOutcome::Pdf {
+            staged_pdf_path: PathBuf::from(format!(
+                "{long_dir}/doi_10.1000_monograph_abcdef01.pdf"
+            )),
+            page_index_path: Some(PathBuf::from(format!(
+                "{long_dir}/doi_10.1000_monograph_abcdef01.pages.md"
+            ))),
+            byte_count: 12_345_678,
+            pdf_index: PdfIndex {
+                page_count: 120,
+                outline_titles: vec!["Part I: Foundations".to_owned()],
+                pages,
+            },
+            text_summary: PdfTextSummary::with_text(
+                NonZeroU32::new(120).unwrap(),
+                120,
+                0,
+                0,
+                StagedPdfText {
+                    path: PathBuf::from(format!(
+                        "{long_dir}/doi_10.1000_monograph_abcdef01.extracted.md"
+                    )),
+                    line_count: 4_800,
+                    byte_count: 340_000,
+                    page_line_ranges,
+                },
+            ),
+            fallback_skips: vec![FallbackSkip {
+                endpoint: "epmc-xml",
+                reason: "HTTP 404".to_owned(),
+            }],
+        };
+
+        let compact = format_compact_index(&metadata, &outcome);
+
+        assert!(compact.len() <= MAX_COMPACT_INDEX_BYTES);
+        assert!(compact.contains("EXTRACTED_TEXT_PATH:"));
+        assert!(compact.contains("TEXT_LAYER: READABLE (120/120 pages extracted;"));
+        assert!(compact.contains("L40-L75, 1850 chars)"));
     }
 
     #[test]

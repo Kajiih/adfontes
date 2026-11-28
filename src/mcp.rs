@@ -1453,4 +1453,56 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].get("id"), Some(&json!(1)));
     }
+
+    #[test]
+    fn fetch_pdf_surfaces_companion_extracted_text_and_layer_status() {
+        let sandbox = TestSandbox::new();
+        let (policy, seed_pdf_location) = setup_staged_sample_pdf(
+            sandbox.path(),
+            &[
+                "Page 1 abstract with enough scholarly text to satisfy the readable text-layer threshold.",
+                "Page 2 derivation with enough mathematical prose to satisfy the readable text-layer threshold.",
+            ],
+        );
+        let pdf_bytes = std::fs::read(seed_pdf_location).unwrap();
+        let fetch_out = sandbox.path().join("fetched");
+        let fetch_call = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "fetch",
+                "arguments": {
+                    "target": "https://example.org/preprint.pdf",
+                    "output_dir": fetch_out.display().to_string()
+                }
+            }
+        });
+        let input = formatdoc! {"
+            {INIT_2025_06_18}
+            {fetch_call}
+        "};
+
+        let responses = run_mcp_session_with(&input, &policy, |_target, _should_stop| {
+            Ok(ExtractedDocument {
+                metadata: WorkMetadata {
+                    title: Some("Preprint PDF".to_owned()),
+                    ..WorkMetadata::default()
+                },
+                payload: ExtractedPayload::Pdf {
+                    bytes: pdf_bytes.clone(),
+                    fallback_skips: Vec::new(),
+                },
+                raw_bytes_fetched: pdf_bytes.len(),
+            })
+        });
+        let fetch_text = responses[1]
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+
+        assert_eq!(responses[1].pointer("/result/isError"), Some(&json!(false)));
+        assert!(fetch_text.contains("EXTRACTED_TEXT_PATH:"));
+        assert!(fetch_text.contains("TEXT_LAYER: READABLE"));
+    }
 }

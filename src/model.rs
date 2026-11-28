@@ -6,6 +6,7 @@
 architecture_component!(Model);
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -21,6 +22,9 @@ pub const MAX_PDF_SLICE_PAGES: u32 = 8;
 
 /// Maximum PDF page count recommended for direct whole-file multimodal `read_file` inspection.
 pub const DIRECT_PDF_READ_MAX_PAGES: u32 = 20;
+
+/// Minimum non-whitespace character count for an extracted PDF page to be considered readable text.
+pub const MIN_READABLE_PDF_PAGE_CHARS: usize = 50;
 
 const ARXIV_SCHEME_PREFIX: &str = "arxiv:";
 const DOI_SCHEME_PREFIX: &str = "doi:";
@@ -1082,6 +1086,170 @@ pub struct PdfPageSummary {
     pub text: PdfPageText,
 }
 
+/// Inclusive 1-indexed line range for one PDF page inside a staged `.extracted.md` file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdfPageLineRange {
+    /// 1-indexed first line of the page section (`## Page N`).
+    pub start_line: NonZeroUsize,
+    /// 1-indexed inclusive last content line of the page section.
+    pub end_line: NonZeroUsize,
+}
+
+/// Document- or slice-level classification of an extracted PDF text layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfTextCoverage {
+    /// Zero pages yielded extractable text (scanned or image-only PDF).
+    None,
+    /// Every page in scope was indexed and met [`MIN_READABLE_PDF_PAGE_CHARS`].
+    Full,
+    /// Some text was extracted, but at least one page is sparse, blank/scanned, or unindexed.
+    Partial,
+}
+
+impl PdfTextCoverage {
+    /// Returns the compact uppercase wire label emitted in `TEXT_LAYER:`.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Full => "READABLE",
+            Self::Partial => "PARTIAL",
+        }
+    }
+}
+
+/// Companion line-indexed Markdown file staged alongside a PDF or PDF slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedPdfText {
+    /// Absolute path to the staged `.extracted.md` file.
+    pub path: PathBuf,
+    /// Total 1-indexed line count in [`Self::path`].
+    pub line_count: usize,
+    /// UTF-8 byte length of [`Self::path`] on disk.
+    pub byte_count: usize,
+    /// Per-page 1-indexed line ranges inside [`Self::path`].
+    pub page_line_ranges: BTreeMap<NonZeroU32, PdfPageLineRange>,
+}
+
+/// Readability and companion-file summary for text extracted from a staged PDF or slice.
+///
+/// Enforces `readable_pages <= non_empty_pages <= indexed_pages <= scope_pages` and couples
+/// `non_empty_pages > 0` strictly with a staged `.extracted.md` file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfTextSummary {
+    scope_pages: u32,
+    indexed_pages: u32,
+    layer: PdfTextLayer,
+}
+
+impl PdfTextSummary {
+    /// Constructs a summary for a PDF or slice where zero inspected pages yielded extractable text.
+    #[must_use]
+    pub const fn without_text(indexed_pages: u32, unindexed_pages: u32) -> Self {
+        Self {
+            scope_pages: indexed_pages.saturating_add(unindexed_pages),
+            indexed_pages,
+            layer: PdfTextLayer::None,
+        }
+    }
+
+    /// Constructs a summary for a PDF or slice with a staged `.extracted.md` companion file.
+    ///
+    /// Callers must ensure `readable_pages <= non_empty_pages` (enforced via `debug_assert!`).
+    #[must_use]
+    pub const fn with_text(
+        non_empty_pages: NonZeroU32,
+        readable_pages: u32,
+        empty_pages: u32,
+        unindexed_pages: u32,
+        staged: StagedPdfText,
+    ) -> Self {
+        let non_empty = non_empty_pages.get();
+        debug_assert!(readable_pages <= non_empty);
+        let indexed_pages = non_empty.saturating_add(empty_pages);
+        Self {
+            scope_pages: indexed_pages.saturating_add(unindexed_pages),
+            indexed_pages,
+            layer: PdfTextLayer::Extracted {
+                non_empty_pages,
+                readable_pages,
+                staged,
+            },
+        }
+    }
+
+    /// Returns total pages in scope (full document page count or slice span length).
+    #[must_use]
+    pub const fn scope_pages(&self) -> u32 {
+        self.scope_pages
+    }
+
+    /// Returns number of pages in scope inspected for text extraction (`<= scope_pages`).
+    #[must_use]
+    pub const fn indexed_pages(&self) -> u32 {
+        self.indexed_pages
+    }
+
+    /// Returns number of pages in scope not inspected due to indexing caps.
+    #[must_use]
+    pub const fn unindexed_pages(&self) -> u32 {
+        self.scope_pages.saturating_sub(self.indexed_pages)
+    }
+
+    /// Returns number of inspected pages with non-empty extracted text (`<= indexed_pages`).
+    #[must_use]
+    pub const fn non_empty_pages(&self) -> u32 {
+        match self.layer {
+            PdfTextLayer::None => 0,
+            PdfTextLayer::Extracted {
+                non_empty_pages, ..
+            } => non_empty_pages.get(),
+        }
+    }
+
+    /// Returns number of inspected pages meeting [`MIN_READABLE_PDF_PAGE_CHARS`].
+    #[must_use]
+    pub const fn readable_pages(&self) -> u32 {
+        match self.layer {
+            PdfTextLayer::None => 0,
+            PdfTextLayer::Extracted { readable_pages, .. } => readable_pages,
+        }
+    }
+
+    /// Returns staged `.extracted.md` companion metadata when at least one page had text.
+    #[must_use]
+    pub const fn staged_text(&self) -> Option<&StagedPdfText> {
+        match self.layer {
+            PdfTextLayer::None => None,
+            PdfTextLayer::Extracted { ref staged, .. } => Some(staged),
+        }
+    }
+
+    /// Classifies text-layer coverage across [`Self::scope_pages`].
+    #[must_use]
+    pub const fn coverage(&self) -> PdfTextCoverage {
+        if self.non_empty_pages() == 0 || self.scope_pages == 0 {
+            PdfTextCoverage::None
+        } else if self.indexed_pages == self.scope_pages
+            && self.readable_pages() == self.scope_pages
+        {
+            PdfTextCoverage::Full
+        } else {
+            PdfTextCoverage::Partial
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PdfTextLayer {
+    None,
+    Extracted {
+        non_empty_pages: NonZeroU32,
+        readable_pages: u32,
+        staged: StagedPdfText,
+    },
+}
+
 /// Structural index over a staged PDF document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdfIndex {
@@ -1153,7 +1321,7 @@ pub enum StagedOutcome {
         /// Extracted section Table of Contents.
         toc: Vec<TocEntry>,
     },
-    /// Validated PDF staged alongside an optional `<slug>.pages.md` page map.
+    /// Validated PDF staged alongside companion extracted text and an optional `<slug>.pages.md` page map.
     Pdf {
         /// Absolute path to the staged `.pdf` file.
         staged_pdf_path: PathBuf,
@@ -1163,6 +1331,8 @@ pub enum StagedOutcome {
         byte_count: usize,
         /// Extracted page counts and per-page heading hints.
         pdf_index: PdfIndex,
+        /// Readability coverage and companion `.extracted.md` metadata.
+        text_summary: PdfTextSummary,
         /// Structured full-text endpoints skipped before falling back to PDF.
         fallback_skips: Vec<FallbackSkip>,
     },
@@ -1995,5 +2165,39 @@ mod tests {
         #[case] expected: &str,
     ) {
         assert_eq!(truncate_chars(input, max_chars), expected);
+    }
+
+    #[rstest]
+    #[case(0, 0, 0, 0, PdfTextCoverage::None)]
+    #[case(0, 0, 10, 0, PdfTextCoverage::None)]
+    #[case(1, 0, 0, 0, PdfTextCoverage::Partial)]
+    #[case(1, 1, 1, 0, PdfTextCoverage::Partial)]
+    #[case(250, 250, 0, 50, PdfTextCoverage::Partial)]
+    #[case(12, 12, 0, 0, PdfTextCoverage::Full)]
+    fn pdf_text_summary_classifies_coverage_consistently(
+        #[case] non_empty_pages: u32,
+        #[case] readable_pages: u32,
+        #[case] empty_pages: u32,
+        #[case] unindexed_pages: u32,
+        #[case] expected: PdfTextCoverage,
+    ) {
+        let summary = NonZeroU32::new(non_empty_pages).map_or_else(
+            || PdfTextSummary::without_text(empty_pages, unindexed_pages),
+            |non_empty| {
+                PdfTextSummary::with_text(
+                    non_empty,
+                    readable_pages,
+                    empty_pages,
+                    unindexed_pages,
+                    StagedPdfText {
+                        path: PathBuf::from("/tmp/sample.extracted.md"),
+                        line_count: 10,
+                        byte_count: 200,
+                        page_line_ranges: BTreeMap::new(),
+                    },
+                )
+            },
+        );
+        assert_eq!(summary.coverage(), expected);
     }
 }

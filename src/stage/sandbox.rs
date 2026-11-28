@@ -303,6 +303,32 @@ pub(super) fn write_file_atomic(destination: &Path, bytes: &[u8]) -> Result<(), 
     Ok(())
 }
 
+pub(super) fn remove_file_if_present(path: &Path) -> Result<(), AdfontesError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(AdfontesError::Io {
+                context: format!("inspecting stale staged file `{}`", path.display()),
+                source,
+            });
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(AdfontesError::SafetyBlock {
+            reason: format!("refusing to remove non-regular path `{}`", path.display()),
+        });
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(AdfontesError::Io {
+            context: format!("removing stale staged file `{}`", path.display()),
+            source,
+        }),
+    }
+}
+
 struct ConfinedDirPlan {
     root: AllowedRoot,
     relative_tail: Vec<OsString>,
@@ -1983,6 +2009,24 @@ mod tests {
     #[case("paper.pdf", false)]
     fn rejects_unsafe_verbatim_segment_syntax(#[case] raw: &str, #[case] expected: bool) {
         assert_eq!(has_unsafe_segment_syntax(OsStr::new(raw)), expected);
+    }
+
+    #[test]
+    fn remove_file_if_present_deletes_regular_files_ignores_missing_and_blocks_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.extracted.md");
+        let regular = dir.path().join("stale.extracted.md");
+        let subdir = dir.path().join("subdir");
+        fs::write(&regular, b"old text").unwrap();
+        fs::create_dir(&subdir).unwrap();
+
+        assert!(remove_file_if_present(&missing).is_ok());
+        assert!(remove_file_if_present(&regular).is_ok());
+        assert!(!regular.exists());
+        assert!(matches!(
+            remove_file_if_present(&subdir).unwrap_err(),
+            AdfontesError::SafetyBlock { .. }
+        ));
     }
 
     #[cfg(windows)]

@@ -72,6 +72,54 @@ thread_local! {
     static PDF_LOAD_SAFETY_TRIPPED: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Normalized extracted text for a single PDF page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedPdfPage {
+    page_number: NonZeroU32,
+    char_count: usize,
+    text: String,
+}
+
+impl ExtractedPdfPage {
+    /// Creates an extracted page record whose [`Self::char_count`] is derived once from `text`.
+    #[must_use]
+    pub(crate) fn new(page_number: NonZeroU32, text: String) -> Self {
+        let char_count = count_non_whitespace_chars(&text);
+        Self {
+            page_number,
+            char_count,
+            text,
+        }
+    }
+
+    /// Returns the original 1-indexed page number in the source PDF.
+    #[must_use]
+    pub const fn page_number(&self) -> NonZeroU32 {
+        self.page_number
+    }
+
+    /// Returns the non-whitespace character count of [`Self::text`].
+    #[must_use]
+    pub const fn char_count(&self) -> usize {
+        self.char_count
+    }
+
+    /// Returns the normalized UTF-8 page text (empty when the page has no text layer).
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+/// Combined structural index and transient per-page text emitted by [`index_pdf_bytes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedPdf {
+    /// Lightweight page count, outline titles, and per-page summaries.
+    pub index: PdfIndex,
+    /// Normalized extracted text for each indexed page in ascending page-number order.
+    pub page_texts: Vec<ExtractedPdfPage>,
+}
+
 /// Lossless vector PDF slice emitted by [`slice_pdf_bytes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlicedPdf {
@@ -93,16 +141,17 @@ pub fn is_pdf_magic(bytes: &[u8]) -> bool {
         .any(|window| window == PDF_MAGIC)
 }
 
-/// Indexes a PDF's page count, nested outline bookmarks, and bounded per-page text hints.
+/// Indexes a PDF's page count, nested outline bookmarks, bounded per-page summaries, and
+/// normalized extracted page text.
 ///
-/// Uses pure-Rust `lopdf` under strict decompression and font-CMap byte budgets without spawning
-/// external binaries.
+/// Uses pure-Rust `lopdf` under strict decompression, font-CMap, and cumulative UTF-8 text byte
+/// budgets without spawning external binaries.
 ///
 /// # Errors
 ///
 /// Returns [`AdfontesError::SafetyBlock`] if a PDF decompression bomb exceeds memory budgets, or
 /// [`AdfontesError::Extraction`] if `bytes` is not a readable PDF or requires a user password.
-pub fn index_pdf_bytes(bytes: &[u8]) -> Result<PdfIndex, AdfontesError> {
+pub fn index_pdf_bytes(bytes: &[u8]) -> Result<IndexedPdf, AdfontesError> {
     index_pdf_bytes_with_budget(bytes, MAX_INDEXED_PDF_PAGES, MAX_PDF_DOCUMENT_TEXT_BYTES)
 }
 
@@ -187,7 +236,7 @@ fn index_pdf_bytes_with_budget(
     bytes: &[u8],
     max_indexed_pages: usize,
     max_document_text_bytes: usize,
-) -> Result<PdfIndex, AdfontesError> {
+) -> Result<IndexedPdf, AdfontesError> {
     let mut doc = load_decrypted_pdf(bytes)?;
     let page_ids = doc.get_pages();
     let page_count = u32::try_from(page_ids.len()).unwrap_or(u32::MAX);
@@ -196,6 +245,7 @@ fn index_pdf_bytes_with_budget(
     let mut extraction_budget = PdfExtractionBudget::new();
     let mut remaining_text_bytes = max_document_text_bytes;
     let mut pages = Vec::with_capacity(page_ids.len());
+    let mut page_texts = Vec::with_capacity(page_ids.len().min(max_indexed_pages));
 
     for (index, (&page_number, &page_id)) in page_ids.iter().enumerate() {
         let Some(page_nz) = NonZeroU32::new(page_number) else {
@@ -214,13 +264,22 @@ fn index_pdf_bytes_with_budget(
             continue;
         }
         remaining_text_bytes = remaining_text_bytes.saturating_sub(normalized.len());
-        pages.push(summarize_page_text(page_nz, &normalized));
+        let page = ExtractedPdfPage::new(page_nz, normalized);
+        pages.push(summarize_page_text(
+            page.page_number(),
+            page.text(),
+            page.char_count(),
+        ));
+        page_texts.push(page);
     }
 
-    Ok(PdfIndex {
-        page_count,
-        outline_titles,
-        pages,
+    Ok(IndexedPdf {
+        index: PdfIndex {
+            page_count,
+            outline_titles,
+            pages,
+        },
+        page_texts,
     })
 }
 
@@ -633,7 +692,7 @@ fn normalize_pdf_page_text(raw: &str, max_bytes: usize) -> String {
     bounded.trim_end().to_owned()
 }
 
-fn summarize_page_text(page_number: NonZeroU32, text: &str) -> PdfPageSummary {
+fn summarize_page_text(page_number: NonZeroU32, text: &str, char_count: usize) -> PdfPageSummary {
     let mut headings = Vec::new();
     let mut preview = String::new();
 
@@ -653,7 +712,7 @@ fn summarize_page_text(page_number: NonZeroU32, text: &str) -> PdfPageSummary {
     PdfPageSummary {
         page_number,
         text: PdfPageText::Indexed {
-            char_count: count_non_whitespace_chars(text),
+            char_count,
             headings,
             preview,
         },
@@ -850,13 +909,21 @@ mod tests {
             "2 Methods and derivations",
             "3 Results summary",
         ]);
-        let index = index_pdf_bytes(&pdf_bytes).unwrap();
-        let PdfPageText::Indexed { ref preview, .. } = index.pages[1].text else {
+        let indexed = index_pdf_bytes(&pdf_bytes).unwrap();
+        let PdfPageText::Indexed { ref preview, .. } = indexed.index.pages[1].text else {
             panic!("expected indexed page 2");
         };
-        assert_eq!(index.page_count, 3);
-        assert_eq!(index.outline_titles, vec!["1 Introduction", "1.1 Résumé"]);
+        assert_eq!(indexed.index.page_count, 3);
+        assert_eq!(
+            indexed.index.outline_titles,
+            vec!["1 Introduction", "1.1 Résumé"]
+        );
         assert!(preview.contains("2 Methods"));
+        assert!(
+            indexed.page_texts[1]
+                .text()
+                .contains("2 Methods and derivations")
+        );
     }
 
     #[test]
@@ -1192,13 +1259,10 @@ mod tests {
         let indexed = index_pdf_bytes_with_budget(&pdf_bytes, MAX_INDEXED_PDF_PAGES, 25).unwrap();
         let page_capped = index_pdf_bytes_with_budget(&pdf_bytes, 1, 1024).unwrap();
 
-        assert!(matches!(
-            indexed.pages[0].text,
-            PdfPageText::Indexed { char_count: 17, .. }
-        ));
-        assert_eq!(indexed.pages[1].text, PdfPageText::Unindexed);
-        assert_eq!(indexed.pages[2].text, PdfPageText::Unindexed);
-        assert_eq!(page_capped.pages[1].text, PdfPageText::Unindexed);
+        assert_eq!(indexed.page_texts.len(), 1);
+        assert_eq!(indexed.index.pages[1].text, PdfPageText::Unindexed);
+        assert_eq!(indexed.index.pages[2].text, PdfPageText::Unindexed);
+        assert_eq!(page_capped.index.pages[1].text, PdfPageText::Unindexed);
     }
 
     #[test]
@@ -1208,13 +1272,14 @@ mod tests {
         let unicode_ws = normalize_pdf_page_text("\u{00A0}\u{2003} \n\u{00A0}", 1024);
 
         assert!(matches!(
-            indexed.pages[0].text,
+            indexed.index.pages[0].text,
             PdfPageText::Indexed { char_count: 0, .. }
         ));
         assert!(matches!(
-            indexed.pages[1].text,
+            indexed.index.pages[1].text,
             PdfPageText::Indexed { char_count: 19, .. }
         ));
+        assert_eq!(indexed.page_texts[0].text(), "");
         assert_eq!(unicode_ws, "");
     }
 }
