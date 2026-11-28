@@ -605,12 +605,12 @@ mod tests {
             || false,
         );
 
+        let stdout_text = String::from_utf8(slice_stdout).unwrap();
+
         assert_eq!(slice_code, EXIT_OK);
-        assert!(
-            String::from_utf8(slice_stdout)
-                .unwrap()
-                .contains("PAGES: 2-3 (of 3)")
-        );
+        assert!(stdout_text.contains("PAGES: 2-3 (of 3)"));
+        assert!(stdout_text.contains("SLICE_TEXT:"));
+        assert!(stdout_text.contains("TEXT_LAYER: PARTIAL (2/2 pages extracted, 0 readable;"));
     }
 
     #[test]

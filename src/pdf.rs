@@ -129,6 +129,8 @@ pub struct SlicedPdf {
     pub effective_span: PageSpan,
     /// Validated standalone PDF bytes for the retained pages.
     pub bytes: Vec<u8>,
+    /// Normalized extracted text for each retained page in ascending original page-number order.
+    pub page_texts: Vec<ExtractedPdfPage>,
 }
 
 /// Returns `true` if `bytes` contains the `%PDF-` signature within its first 1,024 bytes.
@@ -155,28 +157,39 @@ pub fn index_pdf_bytes(bytes: &[u8]) -> Result<IndexedPdf, AdfontesError> {
     index_pdf_bytes_with_budget(bytes, MAX_INDEXED_PDF_PAGES, MAX_PDF_DOCUMENT_TEXT_BYTES)
 }
 
-/// Losslessly slices an inclusive [`PageSpan`] (`1..=8` pages) into a self-contained PDF.
+/// Losslessly slices an inclusive [`PageSpan`] (`1..=8` pages) into a self-contained PDF and
+/// extracts bounded per-page normalized text for companion `.extracted.md` staging.
 ///
 /// Materializes inherited `/Pages` attributes (`Resources`, `MediaBox`, `CropBox`, `Rotate`) onto
-/// each retained `/Page`, wires them into a fresh flat `/Pages` root (avoiding
-/// `lopdf::Document::delete_pages` `/Parent`-cycle hangs and empty intermediate `/Pages` nodes),
-/// strips cross-page `Catalog`/page/trailer state, prunes unreachable objects, and serializes.
+/// each retained `/Page`, extracts bounded per-page text before rewriting the `/Pages` tree, wires
+/// retained pages into a fresh flat `/Pages` root (avoiding `lopdf::Document::delete_pages`
+/// `/Parent`-cycle hangs and empty intermediate `/Pages` nodes), strips cross-page `Catalog`/page/
+/// trailer state, prunes unreachable objects, and serializes.
 ///
 /// # Errors
 ///
 /// Returns [`AdfontesError::InvalidTarget`] if `span` starts past the PDF's page count,
-/// [`AdfontesError::SafetyBlock`] on decompression bombs, or [`AdfontesError::Extraction`] if the PDF
-/// is malformed or user-password-encrypted.
+/// [`AdfontesError::SafetyBlock`] if loading or any retained page trips decompression or `CMap`
+/// limits (enforcing the same fail-closed security boundary as [`index_pdf_bytes`]), or
+/// [`AdfontesError::Extraction`] if the PDF is malformed or user-password-encrypted.
 pub fn slice_pdf_bytes(raw_bytes: &[u8], span: PageSpan) -> Result<SlicedPdf, AdfontesError> {
     let mut doc = load_decrypted_pdf(raw_bytes)?;
     let page_ids = doc.get_pages();
     let total_pages = u32::try_from(page_ids.len()).unwrap_or(u32::MAX);
     let effective_span = span.clamp_to_total(total_pages)?;
 
+    let mut extraction_budget = PdfExtractionBudget::new();
     let mut retained_ids = Vec::new();
+    let mut page_texts = Vec::new();
     for (&page_number, &page_id) in &page_ids {
         if page_number >= effective_span.start() && page_number <= effective_span.end() {
+            let Some(page_nz) = NonZeroU32::new(page_number) else {
+                continue;
+            };
             materialize_inherited_page_attributes(&mut doc, page_id);
+            let raw_text = extraction_budget.extract_page_text(&doc, page_number, page_id)?;
+            let normalized = normalize_pdf_page_text(&raw_text, MAX_PDF_PAGE_TEXT_BYTES);
+            page_texts.push(ExtractedPdfPage::new(page_nz, normalized));
             strip_cross_page_page_keys(&mut doc, page_id);
             retained_ids.push(page_id);
         }
@@ -229,6 +242,7 @@ pub fn slice_pdf_bytes(raw_bytes: &[u8], span: PageSpan) -> Result<SlicedPdf, Ad
         total_pages,
         effective_span,
         bytes: out_bytes,
+        page_texts,
     })
 }
 
@@ -783,6 +797,13 @@ pub fn build_test_pdf(page_texts: &[&str]) -> Vec<u8> {
     tests::build_inherited_multipage_pdf(page_texts)
 }
 
+/// Builds a synthetic PDF containing a compressed `ToUnicode` `CMap` bomb for cross-module tests.
+#[cfg(test)]
+#[must_use]
+pub fn build_test_cmap_bomb_pdf() -> Vec<u8> {
+    tests::build_cmap_bomb_pdf()
+}
+
 #[cfg(test)]
 mod tests {
     use lopdf::content::{Content, Operation};
@@ -1125,8 +1146,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn blocks_compressed_font_to_unicode_cmap_bomb() {
+    pub(super) fn build_cmap_bomb_pdf() -> Vec<u8> {
         let mut doc = Document::with_version("1.5");
         let pages_root = doc.new_object_id();
         let huge_cmap = vec![b' '; MAX_PDF_CMAP_BYTES + 4096];
@@ -1168,9 +1188,19 @@ mod tests {
 
         let mut bytes = Vec::new();
         doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn blocks_compressed_font_to_unicode_cmap_bomb() {
+        let bytes = build_cmap_bomb_pdf();
 
         assert!(matches!(
             index_pdf_bytes(&bytes).unwrap_err(),
+            AdfontesError::SafetyBlock { .. }
+        ));
+        assert!(matches!(
+            slice_pdf_bytes(&bytes, PageSpan::new(1, 1).unwrap()).unwrap_err(),
             AdfontesError::SafetyBlock { .. }
         ));
     }
@@ -1281,5 +1311,25 @@ mod tests {
         ));
         assert_eq!(indexed.page_texts[0].text(), "");
         assert_eq!(unicode_ws, "");
+    }
+
+    #[test]
+    fn slice_pdf_bytes_extracts_retained_pages_with_original_source_page_numbers() {
+        let pdf_bytes = build_inherited_multipage_pdf(&[
+            "1 Introduction",
+            "2 Inherited Font Derivation",
+            "3 Asymptotic Analysis",
+            "4 Conclusion",
+        ]);
+        let sliced = slice_pdf_bytes(&pdf_bytes, PageSpan::new(2, 3).unwrap()).unwrap();
+
+        assert_eq!(sliced.page_texts.len(), 2);
+        assert_eq!(sliced.page_texts[0].page_number().get(), 2);
+        assert!(
+            sliced.page_texts[0]
+                .text()
+                .contains("Inherited Font Derivation")
+        );
+        assert_eq!(sliced.page_texts[1].page_number().get(), 3);
     }
 }

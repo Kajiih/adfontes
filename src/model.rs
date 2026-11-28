@@ -931,6 +931,12 @@ impl PageSpan {
     pub const fn end(self) -> u32 {
         self.end.get()
     }
+
+    /// Returns the number of pages covered by this inclusive span (`1..=MAX_PDF_SLICE_PAGES`).
+    #[must_use]
+    pub const fn page_count(self) -> u32 {
+        self.end.get() - self.start.get() + 1
+    }
 }
 
 impl fmt::Display for PageSpan {

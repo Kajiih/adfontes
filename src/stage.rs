@@ -9,7 +9,7 @@ mod sandbox;
 use std::path::{Path, PathBuf};
 
 use self::manifest::{
-    PreparedPdfText, build_extracted_text_filename, build_slice_filename,
+    PdfTextScope, PreparedPdfText, build_extracted_text_filename, build_slice_filenames,
     format_metadata_only_note, format_pdf_page_index_document, format_slice_summary,
     prepare_full_text, prepare_pdf_text_document,
 };
@@ -37,6 +37,8 @@ pub struct StagedPdfSlice {
     pub effective_span: PageSpan,
     /// Byte size of the written PDF slice.
     pub byte_count: usize,
+    /// Readability and companion-file summary for extracted slice text.
+    pub text_summary: PdfTextSummary,
     /// Compact plain-text summary suitable for CLI stdout or MCP tool responses.
     pub summary: String,
 }
@@ -87,7 +89,9 @@ pub fn stage_document(
             let indexed = index_pdf_bytes(&bytes)?;
             let prepared_text = prepare_pdf_text_document(
                 doc.metadata.title.as_deref(),
-                indexed.index.page_count,
+                PdfTextScope::FullDocument {
+                    total_pages: indexed.index.page_count,
+                },
                 &indexed.page_texts,
             );
             drop(indexed.page_texts);
@@ -138,15 +142,21 @@ pub fn stage_document(
     })
 }
 
-/// Validates, slices, and atomically writes (`0600`) a `1..=8`-page vector PDF slice from a local
-/// confined staged PDF file.
+/// Validates, slices, and writes (`0600`) a `1..=8`-page vector PDF slice and any companion
+/// `.extracted.md` text file from a local confined staged PDF file.
+///
+/// Validates, slices, and extracts retained page text in memory before creating directories or
+/// writing per-file `0600` outputs, and removes any stale `*_p*.extracted.md` when re-slicing a
+/// scanned span over an earlier readable slice.
 ///
 /// # Errors
 ///
 /// Returns [`AdfontesError::SafetyBlock`] if slicing is disabled by `ADFONTES_DISABLE_PDF_SLICE`, if
 /// `pdf_path` escapes allowed staging roots, traverses a symlink, is a FIFO/non-regular file, or
-/// exceeds `100 MiB`, or if `output_dir` fails confinement; returns [`AdfontesError::InvalidTarget`]
-/// or [`AdfontesError::Extraction`] on invalid page bounds or PDF errors.
+/// exceeds `100 MiB`, if any retained page trips decompression or `CMap` limits during slicing or
+/// text extraction, or if `output_dir` fails confinement; returns [`AdfontesError::InvalidTarget`]
+/// or [`AdfontesError::Extraction`] on invalid page bounds or PDF errors, or [`AdfontesError::Io`]
+/// on write or stale-file cleanup failures.
 pub fn slice_staged_pdf(
     pdf_path: &Path,
     span: PageSpan,
@@ -165,6 +175,16 @@ pub fn slice_staged_pdf(
     let confined_pdf = read_bounded_confined_pdf(pdf_path, policy)?;
     let canonical_pdf_path = confined_pdf.canonical_path;
     let sliced = slice_pdf_bytes(&confined_pdf.bytes, span)?;
+    drop(confined_pdf.bytes);
+    let prepared_text = prepare_pdf_text_document(
+        None,
+        PdfTextScope::Slice {
+            span: sliced.effective_span,
+            source_total_pages: sliced.total_pages,
+        },
+        &sliced.page_texts,
+    );
+    drop(sliced.page_texts);
 
     let target_dir = if let Some(explicit) = output_dir {
         resolve_confined_staging_dir(Some(explicit), policy)?
@@ -180,17 +200,21 @@ pub fn slice_staged_pdf(
         resolve_confined_staging_dir(Some(parent), policy)?
     };
 
-    let slice_name = build_slice_filename(&canonical_pdf_path, sliced.effective_span);
-    let slice_pdf_path = target_dir.join(slice_name);
-    write_file_atomic(&slice_pdf_path, &sliced.bytes)?;
-
+    let filenames = build_slice_filenames(&canonical_pdf_path, sliced.effective_span);
+    let slice_pdf_path = target_dir.join(&filenames.pdf);
     let byte_count = sliced.bytes.len();
+    write_file_atomic(&slice_pdf_path, &sliced.bytes)?;
+    drop(sliced.bytes);
+
+    let text_summary =
+        stage_optional_pdf_text(prepared_text, &target_dir.join(&filenames.extracted_text))?;
     let summary = format_slice_summary(
         &canonical_pdf_path,
         &slice_pdf_path,
         sliced.effective_span,
         sliced.total_pages,
         byte_count,
+        &text_summary,
     );
 
     Ok(StagedPdfSlice {
@@ -199,6 +223,7 @@ pub fn slice_staged_pdf(
         total_pages: sliced.total_pages,
         effective_span: sliced.effective_span,
         byte_count,
+        text_summary,
         summary,
     })
 }
@@ -224,7 +249,7 @@ mod tests {
 
     use super::*;
     use crate::model::{TextFormat, WorkMetadata};
-    use crate::pdf::build_test_pdf;
+    use crate::pdf::{build_test_cmap_bomb_pdf, build_test_pdf};
 
     fn assert_owner_only_file(path: &Path) {
         #[cfg(unix)]
@@ -343,6 +368,10 @@ mod tests {
             slice_staged_pdf(&pdf_b, PageSpan::new(1, 2).unwrap(), None, &policy).unwrap();
 
         assert_ne!(slice_a.slice_pdf_path, slice_b.slice_pdf_path);
+        assert_ne!(
+            slice_a.text_summary.staged_text().unwrap().path,
+            slice_b.text_summary.staged_text().unwrap().path
+        );
         assert!(slice_a.slice_pdf_path.is_file());
         assert!(slice_b.slice_pdf_path.is_file());
     }
@@ -558,5 +587,206 @@ mod tests {
         assert_eq!(second_summary.staged_text(), None);
         assert!(!stale_path.exists());
         assert!(second.compact_index.contains("TEXT_LAYER: NONE"));
+    }
+
+    #[test]
+    fn slice_staged_pdf_writes_companion_extracted_text_with_original_page_numbers_and_0600_mode() {
+        let sandbox = TestSandbox::new();
+        let out_dir = sandbox.path().join("slice-text");
+        let policy = sandbox.policy();
+        let pdf_bytes = build_test_pdf(&[
+            "Page 1 intro text that is outside the requested page span for this slice.",
+            "Page 2 hierarchical model derivation with sufficient prose length for readable status.",
+            "Page 3 posterior predictive diagnostics with full empirical coverage tables.",
+            "Page 4 concluding remarks outside the slice.",
+        ]);
+        let target = ParsedTarget::parse("2409.13740v1").unwrap();
+        let staged = stage_document(
+            &target,
+            ExtractedDocument {
+                metadata: WorkMetadata::default(),
+                payload: ExtractedPayload::Pdf {
+                    bytes: pdf_bytes.clone(),
+                    fallback_skips: Vec::new(),
+                },
+                raw_bytes_fetched: pdf_bytes.len(),
+            },
+            Some(&out_dir),
+            false,
+            &policy,
+        )
+        .unwrap();
+        let StagedOutcome::Pdf {
+            staged_pdf_path, ..
+        } = staged.outcome
+        else {
+            panic!("expected staged PDF");
+        };
+
+        let slice = slice_staged_pdf(
+            &staged_pdf_path,
+            PageSpan::new(2, 3).unwrap(),
+            None,
+            &policy,
+        )
+        .unwrap();
+        let staged_text = slice.text_summary.staged_text().unwrap();
+        let page_numbers: Vec<u32> = staged_text
+            .page_line_ranges
+            .keys()
+            .map(|page| page.get())
+            .collect();
+
+        assert!(slice.summary.contains("SLICE_TEXT:"));
+        assert!(
+            slice
+                .summary
+                .contains("SLICE_PAGES: p.2 (L3-L5), p.3 (L7-L9)")
+        );
+        assert_eq!(page_numbers, vec![2, 3]);
+        assert_owner_only_file(&staged_text.path);
+    }
+
+    #[test]
+    fn slice_staged_pdf_omits_extracted_text_for_scanned_slice() {
+        let sandbox = TestSandbox::new();
+        let out_dir = sandbox.path().join("slice-scan");
+        let policy = sandbox.policy();
+        let pdf_bytes = build_test_pdf(&["   ", ""]);
+        let target = ParsedTarget::parse("https://example.org/scan-slice.pdf").unwrap();
+        let staged = stage_document(
+            &target,
+            ExtractedDocument {
+                metadata: WorkMetadata::default(),
+                payload: ExtractedPayload::Pdf {
+                    bytes: pdf_bytes.clone(),
+                    fallback_skips: Vec::new(),
+                },
+                raw_bytes_fetched: pdf_bytes.len(),
+            },
+            Some(&out_dir),
+            false,
+            &policy,
+        )
+        .unwrap();
+        let StagedOutcome::Pdf {
+            staged_pdf_path, ..
+        } = staged.outcome
+        else {
+            panic!("expected staged PDF");
+        };
+
+        let slice = slice_staged_pdf(
+            &staged_pdf_path,
+            PageSpan::new(1, 2).unwrap(),
+            None,
+            &policy,
+        )
+        .unwrap();
+        let has_extracted_file = fs::read_dir(&out_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".extracted.md")
+        });
+
+        assert_eq!(slice.text_summary.staged_text(), None);
+        assert!(!has_extracted_file);
+        assert!(!slice.summary.contains("SLICE_TEXT:"));
+        assert!(slice.summary.contains("TEXT_LAYER: NONE"));
+    }
+
+    #[test]
+    fn slice_staged_pdf_rejects_cmap_bomb_before_writing_any_slice_files() {
+        let sandbox = TestSandbox::new();
+        let source_dir = sandbox.path().join("bomb-src");
+        let slice_out = sandbox.path().join("bomb-out");
+        let policy = sandbox.policy();
+        fs::create_dir_all(&source_dir).unwrap();
+        let bomb_path = source_dir.join("bomb.pdf");
+        fs::write(&bomb_path, build_test_cmap_bomb_pdf()).unwrap();
+
+        let error = slice_staged_pdf(
+            &bomb_path,
+            PageSpan::new(1, 1).unwrap(),
+            Some(&slice_out),
+            &policy,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, AdfontesError::SafetyBlock { .. }));
+        assert!(!slice_out.exists());
+    }
+
+    #[test]
+    fn reslicing_scanned_pdf_removes_stale_extracted_text_file() {
+        let sandbox = TestSandbox::new();
+        let out_dir = sandbox.path().join("reslice");
+        let policy = sandbox.policy();
+        let target = ParsedTarget::parse("2409.13740v1").unwrap();
+        let readable_pdf = build_test_pdf(&[
+            "Page 1 intro prose outside the slice span.",
+            "Page 2 readable theorem statement with sufficient length for Markdown staging.",
+        ]);
+        let scanned_pdf = build_test_pdf(&[" ", "  "]);
+
+        let first = stage_document(
+            &target,
+            ExtractedDocument {
+                metadata: WorkMetadata::default(),
+                payload: ExtractedPayload::Pdf {
+                    bytes: readable_pdf.clone(),
+                    fallback_skips: Vec::new(),
+                },
+                raw_bytes_fetched: readable_pdf.len(),
+            },
+            Some(&out_dir),
+            false,
+            &policy,
+        )
+        .unwrap();
+        let StagedOutcome::Pdf {
+            staged_pdf_path, ..
+        } = first.outcome
+        else {
+            panic!("expected first staged PDF");
+        };
+        let first_slice = slice_staged_pdf(
+            &staged_pdf_path,
+            PageSpan::new(1, 2).unwrap(),
+            None,
+            &policy,
+        )
+        .unwrap();
+        let stale_slice_text = first_slice.text_summary.staged_text().unwrap().path.clone();
+
+        let _ = stage_document(
+            &target,
+            ExtractedDocument {
+                metadata: WorkMetadata::default(),
+                payload: ExtractedPayload::Pdf {
+                    bytes: scanned_pdf.clone(),
+                    fallback_skips: Vec::new(),
+                },
+                raw_bytes_fetched: scanned_pdf.len(),
+            },
+            Some(&out_dir),
+            false,
+            &policy,
+        )
+        .unwrap();
+        let second_slice = slice_staged_pdf(
+            &staged_pdf_path,
+            PageSpan::new(1, 2).unwrap(),
+            None,
+            &policy,
+        )
+        .unwrap();
+
+        assert_eq!(second_slice.text_summary.staged_text(), None);
+        assert!(!stale_slice_text.exists());
+        assert!(!second_slice.summary.contains("SLICE_TEXT:"));
+        assert!(second_slice.summary.contains("TEXT_LAYER: NONE"));
     }
 }

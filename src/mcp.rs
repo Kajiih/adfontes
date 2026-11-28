@@ -1505,4 +1505,42 @@ mod tests {
         assert!(fetch_text.contains("EXTRACTED_TEXT_PATH:"));
         assert!(fetch_text.contains("TEXT_LAYER: READABLE"));
     }
+
+    #[test]
+    fn slice_pdf_surfaces_companion_extracted_text_and_layer_status() {
+        let sandbox = TestSandbox::new();
+        let (policy, seed_pdf_location) = setup_staged_sample_pdf(
+            sandbox.path(),
+            &[
+                "Page 1 abstract with enough scholarly text to satisfy the readable text-layer threshold.",
+                "Page 2 derivation with enough mathematical prose to satisfy the readable text-layer threshold.",
+            ],
+        );
+        let slice_call = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "slice_pdf",
+                "arguments": {
+                    "pdf_path": seed_pdf_location,
+                    "start_page": 2
+                }
+            }
+        });
+        let input = formatdoc! {"
+            {INIT_2025_06_18}
+            {slice_call}
+        "};
+
+        let responses = run_mcp_session_with(&input, &policy, unexpected_fetcher);
+        let slice_text = responses[1]
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+
+        assert_eq!(responses[1].pointer("/result/isError"), Some(&json!(false)));
+        assert!(slice_text.contains("SLICE_TEXT:"));
+        assert!(slice_text.contains("TEXT_LAYER: READABLE"));
+    }
 }

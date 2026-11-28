@@ -148,6 +148,17 @@ pub(super) fn build_extracted_text_filename(slug: &str) -> String {
     format!("{slug}{EXTRACTED_TEXT_SUFFIX}")
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PdfTextScope {
+    FullDocument {
+        total_pages: u32,
+    },
+    Slice {
+        span: PageSpan,
+        source_total_pages: u32,
+    },
+}
+
 pub(super) struct PreparedPdfText {
     indexed_pages: u32,
     empty_pages: u32,
@@ -198,11 +209,15 @@ impl PreparedPdfText {
 
 pub(super) fn prepare_pdf_text_document(
     title: Option<&str>,
-    total_pages: u32,
+    scope: PdfTextScope,
     page_texts: &[ExtractedPdfPage],
 ) -> PreparedPdfText {
+    let scope_pages = match scope {
+        PdfTextScope::FullDocument { total_pages } => total_pages,
+        PdfTextScope::Slice { span, .. } => span.page_count(),
+    };
     let indexed_pages = u32::try_from(page_texts.len()).unwrap_or(u32::MAX);
-    let unindexed_pages = total_pages.saturating_sub(indexed_pages);
+    let unindexed_pages = scope_pages.saturating_sub(indexed_pages);
     let mut non_empty_count: u32 = 0;
     let mut readable_pages: u32 = 0;
     for page in page_texts {
@@ -224,18 +239,7 @@ pub(super) fn prepare_pdf_text_document(
         };
     };
 
-    let clean_title = title
-        .map(sanitize_inline_text)
-        .filter(|val| !val.is_empty());
-    let scope_label = if total_pages == 1 {
-        "1 page".to_owned()
-    } else {
-        format!("{total_pages} pages")
-    };
-    let heading = clean_title.as_ref().map_or_else(
-        || format!("# Extracted PDF Text ({scope_label})"),
-        |value| format!("# {value} — Extracted PDF Text ({scope_label})"),
-    );
+    let heading = format_pdf_text_heading(title, scope);
     let mut builder = LineBuilder::new();
     builder.push_line(&heading);
 
@@ -261,7 +265,9 @@ pub(super) fn prepare_pdf_text_document(
         );
     }
 
-    if indexed_pages < total_pages {
+    if let PdfTextScope::FullDocument { total_pages } = scope
+        && indexed_pages < total_pages
+    {
         let tail_start = indexed_pages.saturating_add(1);
         builder.push_line("");
         builder.push_line("---");
@@ -296,12 +302,21 @@ pub(super) fn prepare_pdf_text_document(
     }
 }
 
-pub(super) fn build_slice_filename(canonical_pdf_path: &Path, span: PageSpan) -> String {
+pub(super) struct SliceFilenames {
+    pub(super) pdf: String,
+    pub(super) extracted_text: String,
+}
+
+pub(super) fn build_slice_filenames(canonical_pdf_path: &Path, span: PageSpan) -> SliceFilenames {
     let stem = build_slice_stem(canonical_pdf_path);
-    if span.start() == span.end() {
-        format!("{stem}_p{}.pdf", span.start())
+    let base = if span.start() == span.end() {
+        format!("{stem}_p{}", span.start())
     } else {
-        format!("{stem}_p{}-{}.pdf", span.start(), span.end())
+        format!("{stem}_p{}-{}", span.start(), span.end())
+    };
+    SliceFilenames {
+        pdf: format!("{base}.pdf"),
+        extracted_text: format!("{base}{EXTRACTED_TEXT_SUFFIX}"),
     }
 }
 
@@ -311,6 +326,7 @@ pub(super) fn format_slice_summary(
     effective_span: PageSpan,
     total_pages: u32,
     byte_count: usize,
+    text_summary: &PdfTextSummary,
 ) -> String {
     let mut summary = String::new();
     let _ = writeln!(summary, "STATUS: OK");
@@ -324,11 +340,39 @@ pub(super) fn format_slice_summary(
         "SLICE_PDF: {}",
         sanitize_inline_text(&slice_pdf_path.display().to_string())
     );
+    if let Some(staged_text) = text_summary.staged_text() {
+        let _ = writeln!(
+            summary,
+            "SLICE_TEXT: {}",
+            sanitize_inline_text(&staged_text.path.display().to_string())
+        );
+    }
     let _ = writeln!(summary, "PAGES: {effective_span} (of {total_pages})");
     let _ = writeln!(summary, "BYTES: {byte_count}");
+    let _ = writeln!(summary, "{}", format_text_layer_line(text_summary));
+    if let Some(staged_text) = text_summary.staged_text() {
+        let mut entries = Vec::new();
+        for page_number in effective_span.start()..=effective_span.end() {
+            if let Some(page_nz) = NonZeroU32::new(page_number) {
+                if let Some(range) = staged_text.page_line_ranges.get(&page_nz) {
+                    entries.push(format!(
+                        "p.{page_number} (L{}-L{})",
+                        range.start_line.get(),
+                        range.end_line.get()
+                    ));
+                } else {
+                    entries.push(format!("p.{page_number} (scanned/visual)"));
+                }
+            }
+        }
+        if !entries.is_empty() {
+            let _ = writeln!(summary, "SLICE_PAGES: {}", entries.join(", "));
+        }
+    }
     let _ = write!(
         summary,
-        "NAVIGATION: Call read_file on SLICE_PDF to inspect these pages visually."
+        "NAVIGATION: {}",
+        format_slice_navigation(text_summary)
     );
     summary
 }
@@ -699,6 +743,30 @@ fn append_outcome_header(out: &mut String, outcome: &StagedOutcome) {
     }
 }
 
+fn format_pdf_text_heading(title: Option<&str>, scope: PdfTextScope) -> String {
+    let clean_title = title
+        .map(sanitize_inline_text)
+        .filter(|val| !val.is_empty());
+    let scope_label = match scope {
+        PdfTextScope::FullDocument { total_pages: 1 } => "1 page".to_owned(),
+        PdfTextScope::FullDocument { total_pages } => format!("{total_pages} pages"),
+        PdfTextScope::Slice {
+            span,
+            source_total_pages,
+        } => {
+            if span.start() == span.end() {
+                format!("page {span} of {source_total_pages}")
+            } else {
+                format!("pages {span} of {source_total_pages}")
+            }
+        }
+    };
+    clean_title.as_ref().map_or_else(
+        || format!("# Extracted PDF Text ({scope_label})"),
+        |value| format!("# {value} — Extracted PDF Text ({scope_label})"),
+    )
+}
+
 fn format_text_layer_line(summary: &PdfTextSummary) -> String {
     let label = summary.coverage().as_label();
     let unindexed = summary.unindexed_pages();
@@ -782,6 +850,20 @@ fn format_pdf_navigation(text_summary: &PdfTextSummary) -> String {
                 "No usable text layer (text-only readers cannot read this scanned PDF); multimodal readers should call slice_pdf on STAGED_PDF (> {DIRECT_PDF_READ_MAX_PAGES} pages) before read_file."
             ),
         },
+    }
+}
+
+const fn format_slice_navigation(text_summary: &PdfTextSummary) -> &'static str {
+    match text_summary.coverage() {
+        PdfTextCoverage::Full => {
+            "Read SLICE_TEXT with read_file (StartLine/EndLine) for prose/text; call read_file on SLICE_PDF to inspect equations, figures, or tables visually."
+        }
+        PdfTextCoverage::Partial => {
+            "Read SLICE_TEXT with read_file (StartLine/EndLine) for extracted pages; call read_file on SLICE_PDF to inspect visual/scanned pages, equations, or figures."
+        }
+        PdfTextCoverage::None => {
+            "No usable text layer in this slice (text-only readers cannot read scanned pages); multimodal readers may call read_file on SLICE_PDF to inspect these pages visually."
+        }
     }
 }
 
@@ -1484,7 +1566,11 @@ mod tests {
             ExtractedPdfPage::new(NonZeroU32::new(2).unwrap(), String::new()),
             ExtractedPdfPage::new(NonZeroU32::new(3).unwrap(), page3_text.to_owned()),
         ];
-        let prepared = prepare_pdf_text_document(Some("My Paper\nInjected Line"), 5, &pages);
+        let prepared = prepare_pdf_text_document(
+            Some("My Paper\nInjected Line"),
+            PdfTextScope::FullDocument { total_pages: 5 },
+            &pages,
+        );
         let mut captured = String::new();
         let summary = prepared
             .persist_with(
@@ -1520,7 +1606,11 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
             page_text.to_owned(),
         )];
-        let prepared = prepare_pdf_text_document(Some("My Paper\nInjected Line"), 5, &pages);
+        let prepared = prepare_pdf_text_document(
+            Some("My Paper\nInjected Line"),
+            PdfTextScope::FullDocument { total_pages: 5 },
+            &pages,
+        );
         let mut captured = String::new();
         let summary = prepared
             .persist_with(
@@ -1549,7 +1639,11 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
             String::new(),
         )];
-        let prepared = prepare_pdf_text_document(Some("Scanned Monograph"), 1, &pages);
+        let prepared = prepare_pdf_text_document(
+            Some("Scanned Monograph"),
+            PdfTextScope::FullDocument { total_pages: 1 },
+            &pages,
+        );
         let mut wrote_file = false;
         let summary = prepared
             .persist_with(
@@ -1600,24 +1694,32 @@ mod tests {
         let mut cleaned_for_none = false;
         let mut cleaned_for_extracted = false;
 
-        let _ = prepare_pdf_text_document(None, 1, &empty_pages)
-            .persist_with(
-                |_| Ok(PathBuf::from("/tmp/unused.extracted.md")),
-                || {
-                    cleaned_for_none = true;
-                    Ok(())
-                },
-            )
-            .unwrap();
-        let _ = prepare_pdf_text_document(None, 1, &readable_pages)
-            .persist_with(
-                |_| Ok(PathBuf::from("/tmp/used.extracted.md")),
-                || {
-                    cleaned_for_extracted = true;
-                    Ok(())
-                },
-            )
-            .unwrap();
+        let _ = prepare_pdf_text_document(
+            None,
+            PdfTextScope::FullDocument { total_pages: 1 },
+            &empty_pages,
+        )
+        .persist_with(
+            |_| Ok(PathBuf::from("/tmp/unused.extracted.md")),
+            || {
+                cleaned_for_none = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        let _ = prepare_pdf_text_document(
+            None,
+            PdfTextScope::FullDocument { total_pages: 1 },
+            &readable_pages,
+        )
+        .persist_with(
+            |_| Ok(PathBuf::from("/tmp/used.extracted.md")),
+            || {
+                cleaned_for_extracted = true;
+                Ok(())
+            },
+        )
+        .unwrap();
 
         assert!(cleaned_for_none);
         assert!(!cleaned_for_extracted);
@@ -1743,6 +1845,50 @@ mod tests {
         assert!(compact.contains("EXTRACTED_TEXT_PATH:"));
         assert!(compact.contains("TEXT_LAYER: READABLE (120/120 pages extracted;"));
         assert!(compact.contains("L40-L75, 1850 chars)"));
+    }
+
+    #[test]
+    fn slice_text_document_and_summary_preserve_source_pages_without_tail_footer() {
+        let span = PageSpan::new(310, 311).unwrap();
+        let page_310 =
+            "Chapter 11 Posterior simulation via Hamiltonian Monte Carlo across manifolds.";
+        let page_311 =
+            "Section 11.4 Adaptive step size tuning and leapfrog integrator convergence.";
+        let pages = vec![
+            ExtractedPdfPage::new(NonZeroU32::new(310).unwrap(), page_310.to_owned()),
+            ExtractedPdfPage::new(NonZeroU32::new(311).unwrap(), page_311.to_owned()),
+        ];
+        let prepared = prepare_pdf_text_document(
+            None,
+            PdfTextScope::Slice {
+                span,
+                source_total_pages: 600,
+            },
+            &pages,
+        );
+        let mut content = String::new();
+        let text_summary = prepared
+            .persist_with(
+                |text| {
+                    content.push_str(text);
+                    Ok(PathBuf::from("/tmp/book_p310-311.extracted.md"))
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        let summary = format_slice_summary(
+            Path::new("/tmp/book.pdf"),
+            Path::new("/tmp/book_p310-311.pdf"),
+            span,
+            600,
+            14_000,
+            &text_summary,
+        );
+
+        assert!(content.starts_with("# Extracted PDF Text (pages 310-311 of 600)\n"));
+        assert!(!content.contains("were not pre-extracted"));
+        assert!(summary.contains("SLICE_TEXT: /tmp/book_p310-311.extracted.md\n"));
+        assert!(summary.contains("SLICE_PAGES: p.310 (L3-L5), p.311 (L7-L9)\n"));
     }
 
     #[test]
